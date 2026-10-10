@@ -34,22 +34,25 @@ compete with Windows 11.
 - [Platform constraints](#platform-constraints)
 - [Security](#security)
 - [Roadmap](#roadmap)
-- [Project tree](#project-tree)
 - [License](#license)
 
 ## Boot it in QEMU
 
-You build and run **inside WSL2** (Ubuntu). PowerShell can't build this.
+This OS is made on **Windows 11**. You build and run it in the **WSL2**
+terminal (Ubuntu runs *inside* WSL on your Windows machine — PowerShell
+can't build this).
 
 ```bash
-# 1. Clone and enter:
+# 1. On Windows 11, open the WSL terminal (search "Ubuntu" in Start),
+#    then download the source code:
 git clone https://github.com/greenlimeos/GreenLime-OS.git
 cd GreenLime-OS
 
-# 2. One-time setup (Rust nightly, QEMU, xorriso, mtools, Limine):
+# 2. One-time setup — downloads and installs everything automatically
+#    (Rust nightly, QEMU, xorriso, mtools, Limine):
 bash scripts/setup-wsl.sh
 
-# 3. Build + make ISO + boot:
+# 3. Build + make the ISO + boot it in QEMU (one command):
 make run-release
 ```
 
@@ -275,7 +278,7 @@ assertions; `docs/GUI.md` lists what each test proves.
 | Rust | 1.101.0-nightly (via `cargo +nightly`) |
 | xorriso | 1.5.6 (libburnia) |
 | Limine | 12.9.3 (binaries in `~/limine`, via `setup-wsl.sh`) |
-| Host | WSL2 + Ubuntu 22.04/24.04, plus `mtools`, `git`, `curl` |
+| Host | Windows 11 with WSL2 (Ubuntu 22.04/24.04 runs inside WSL), plus `mtools`, `git`, `curl` |
 | Guest | `-m 512M`, 1280×800×32 framebuffer, ~492 MiB usable RAM |
 
 ## Platform constraints
@@ -308,39 +311,6 @@ nonetheless: no sandboxing or user model yet — don't put secrets in it.
 - [ ] v1.0 driver model, SMP, network, storage
 
 See `docs/ROADMAP.md`. Milestones ship one at a time, each verified in QEMU.
-
-## Project tree
-
-```
-GreenLime-OS/
-  kernel/            # hybrid kernel (no_std) — the privileged side
-    src/
-      boot.rs        # Limine requests: framebuffer, memmap, hhdm, stack
-      arch/x86_64/   # gdt, idt, paging, pic, syscall, usermode, switch
-      mm/            # pmm, vmm, heap (16 MiB static)
-      sched/         # cooperative scheduler (max 8 tasks)
-      ipc/           # ports, queues, user-copy with STAC/SMAP
-      syscall/       # dispatch (7 numbers) + Log/Exit/Yield/Send/Recv/Kill/GetPid
-      servers/       # vfs, dev, winsrv (compositor), net stub
-      drivers/       # serial, input, pci, fb, virtio-blk, virtio-tablet, storage
-      fs/            # fat32 reader
-      userspace/     # ELF loader + ring-3 entry
-      kprint.rs      # kernel console
-    build.rs         # linker script + embedded userland/font paths
-    linker.ld
-  libs/
-    greenlime-abi/   # syscall numbers, IPC wire format, vfs + win opcodes
-    greenlime-font/  # TTF rasterization + glyph cache (fontdue)
-  userland/
-    init/            # PID 1
-    shell/           # interactive shell (help echo cat ps kill ls exit)
-    demo/            # window-protocol demo client
-  assets/fonts/      # default-font.ttf + Roboto-full.ttf
-  bootloader/        # limine.conf
-  iso_root/ dist/    # staging + ISOs, disk.img, logs (build outputs)
-  docs/              # ARCHITECTURE.md, ROADMAP.md, HYBRID_KERNEL.md, GUI.md
-  scripts/           # setup, QEMU runner, tablet helper, disk, tests
-```
 
 ## License
 

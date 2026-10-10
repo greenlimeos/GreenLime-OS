@@ -1,0 +1,12 @@
+[package]
+name = "greenlime-init"
+version.workspace = true
+edition.workspace = true
+description = "GreenLime PID 1 — first ring-3 program (static, no_std)"
+
+[[bin]]
+name = "greenlime-init"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-abi = { workspace = true }

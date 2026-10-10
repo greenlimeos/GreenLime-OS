@@ -1,0 +1,2 @@
+Hello from GreenLime disk!
+This file lives on a FAT32 image read through virtio-blk.

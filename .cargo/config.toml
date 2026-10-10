@@ -1,0 +1,11 @@
+[build]
+target = "x86_64-unknown-none"
+# Linker scripts are per-crate (kernel/build.rs, userland/init/build.rs);
+# only shared codegen opts live here.
+rustflags = [
+  "-C", "relocation-model=static",
+]
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

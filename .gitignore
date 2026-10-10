@@ -1,0 +1,6 @@
+/target
+/iso_root
+/dist
+# User-supplied fonts (licensed, bulky) — see assets/fonts/README.md
+assets/fonts/*.ttf
+assets/fonts/*.otf

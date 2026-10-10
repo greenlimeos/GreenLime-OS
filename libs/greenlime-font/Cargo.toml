@@ -1,0 +1,8 @@
+[package]
+name = "greenlime-font"
+version.workspace = true
+edition.workspace = true
+description = "GreenLime OS font system: TTF load, glyph cache, framebuffer text (no_std)"
+
+[dependencies]
+fontdue = { workspace = true }

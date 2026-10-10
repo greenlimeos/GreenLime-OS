@@ -1,0 +1,20 @@
+[package]
+name = "greenlime-kernel"
+version.workspace = true
+edition.workspace = true
+description = "GreenLime OS hybrid kernel (x86_64, Limine, no_std)"
+
+[[bin]]
+name = "greenlime-kernel"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-abi = { workspace = true }
+greenlime-font = { workspace = true }
+limine = { workspace = true }
+spin = { workspace = true }
+uart_16550 = { workspace = true }
+x86_64 = { workspace = true }
+bitflags = { workspace = true }
+linked_list_allocator = { workspace = true }
+pic8259 = { workspace = true }

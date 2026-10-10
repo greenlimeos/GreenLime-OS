@@ -1,0 +1,12 @@
+[package]
+name = "greenlime-shell"
+version.workspace = true
+edition.workspace = true
+description = "GreenLime shell — scripted builtin demo over IPC (static, no_std)"
+
+[[bin]]
+name = "greenlime-shell"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-abi = { workspace = true }

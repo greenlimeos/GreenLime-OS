@@ -1,0 +1,12 @@
+[package]
+name = "greenlime-demo"
+version.workspace = true
+edition.workspace = true
+description = "GreenLime demo window client — second client, focus proof (static, no_std)"
+
+[[bin]]
+name = "greenlime-demo"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-abi = { workspace = true }

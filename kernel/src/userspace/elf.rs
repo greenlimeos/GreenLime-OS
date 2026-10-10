@@ -49,12 +49,26 @@ pub fn load(image: &[u8], hhdm: u64) -> LoadedInit {
     let phentsize = u16le(image, 54) as usize;
     let phnum = u16le(image, 56) as usize;
     assert!(phentsize == 56, "[elf] bad phentsize");
+    // GLS-008: the header table itself must lie inside the image, or the
+    // per-segment reads below index out of bounds (boot-time panic).
+    // Cap the count too: each entry costs mappings, and thousands of
+    // headers are never legitimate here.
+    assert!(phnum <= 32, "[elf] too many phdrs");
+    let ph_end = phoff
+        .checked_add(phnum * phentsize)
+        .filter(|&e| e <= image.len())
+        .expect("[elf] phdr table beyond image");
 
     let cr3 = vmm::new_user_table(hhdm);
     let mut segments = 0u32;
+    // GLS-008: jump_to_user trusts `entry` blindly — an entry outside any
+    // executable mapping faults on first schedule (whole-machine halt via
+    // GLS-003's old path; task death via the new one). Demand membership.
+    let mut entry_ok = false;
 
     for i in 0..phnum {
         let p = phoff + i * phentsize;
+        assert!(p + phentsize <= ph_end, "[elf] phdr overruns table");
         let p_type = u32le(image, p);
         if p_type != PT_LOAD {
             continue;
@@ -73,9 +87,19 @@ pub fn load(image: &[u8], hhdm: u64) -> LoadedInit {
 
         let writable = p_flags & 0x2 != 0;
         let executable = p_flags & 0x1 != 0;
-        let first_page = (p_vaddr / 4096) * 4096;
-        let last_byte = p_vaddr + p_memsz;
+        // GLS-008: wraparound here maps the wrong pages (release wraps).
+        let last_byte = if p_memsz == 0 {
+            p_vaddr // empty segment: maps nothing, loop below is empty
+        } else {
+            p_vaddr
+                .checked_add(p_memsz)
+                .expect("[elf] segment end wraps")
+        };
         let last_page = ((last_byte + 4095) / 4096) * 4096;
+        let first_page = (p_vaddr / 4096) * 4096;
+        if executable && entry >= p_vaddr && entry < last_byte {
+            entry_ok = true;
+        }
 
         let mut page = first_page;
         while page < last_page {
@@ -101,5 +125,6 @@ pub fn load(image: &[u8], hhdm: u64) -> LoadedInit {
     }
 
     assert!(segments > 0, "[elf] no LOAD segments");
+    assert!(entry_ok, "[elf] entry outside executable segments");
     LoadedInit { entry, cr3 }
 }

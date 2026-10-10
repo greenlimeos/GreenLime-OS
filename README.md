@@ -4,9 +4,9 @@ A from-scratch operating system in Rust — custom x86-64 hybrid kernel,
 composited GUI desktop (LimeDE), IPC, and ring-3 userland. Long-term goal:
 compete with Windows 11.
 
-> Status: **v0.8** — boots via Limine into the LimeDE desktop: Win11-style
-> centered taskbar, full Start menu with search, wallpaper, draggable
-> windows, terminal + demo apps, interactive shell.
+> Status: **v0.9** ✅ — boots via Limine into the LimeDE desktop:
+> left-aligned taskbar with G start mark, left-docked launcher menu,
+> on-demand terminal, wallpaper, draggable windows, demo app.
 
 > 🤖 **Built with AI:** every line of this OS — kernel, servers, userland,
 > docs — was written with AI assistance using
@@ -78,17 +78,19 @@ full serial log prints at the end for copy-paste bug reports.
 
 - **Mouse:** point, click, drag window titlebars (or the 16px grip). No
   pointer grab, no `Ctrl+Alt+G` — it just works.
-- **Taskbar:** centered Start, Search, and one slot per window; accent
+- **Taskbar:** left-aligned G mark and one slot per window; accent
   underline marks the focused app; right-side tray shows an uptime clock
   (`HH:MM` + `Day N`).
-- **Start menu:** click Start → 640×560 panel with search box (type to
-  filter, Enter launches, Esc closes), 4 pinned tiles, Recent list (last 3,
-  deduplicated), footer avatar. Clicks outside the panel dismiss it.
-- **Terminal:** click it, type `help`. Builtins:
-  `help echo cat ps kill ls exit`. Full line editing.
+- **Start menu:** click the G → 400×540 launcher with search box (type to
+  filter, Enter launches, Esc closes), vertical app rows, footer account.
+  Clicks outside the panel dismiss it.
+- **Terminal:** launch it from the menu (it never opens at boot), then
+  type `help`. Builtins: `help echo cat ps kill ls exit`. Full line
+  editing. Its ✕ button closes it; reopening restores buffered text.
 - **Windows:** focus follows clicks, `WIN_CREATE` never steals focus,
-  ✕ button closes. The demo app opens a second window by itself.
-- **Popups:** About and Settings dialogs, centered 460×210.
+  ✕ button closes. The demo app opens a window by itself at boot.
+- **Popups:** About and Settings dialogs (X mark, any click dismisses),
+  centered 460×210.
 
 ## Architecture
 
@@ -200,7 +202,7 @@ the byte cap. Test disk (`dist/disk.img`, 32 MiB) is made by
 Ring 3, built static for the ELF loader, syscalls/IPC only:
 
 - **init** — PID 1 (task 3): first user program, says hello, yields, exits.
-- **shell** (task 4) — v0.8 interactive shell: line editing with history
+- **shell** (task 4) — v0.9 interactive shell: line editing with history
   buffer, `help echo cat ps kill ls exit`, reads via dev `term0`,
   mirrors output to serial (the harness ground truth), checks reply
   senders and refuses forged messages.
@@ -221,7 +223,7 @@ documented in `docs/GUI.md`):
   target has no SSE (see constraints).
 - **Theme** (no green — deliberately un-hacker): accent `(76,194,255)`,
   focused titlebar `(38,44,58)`, body `(16,18,24)`, taskbar `(23,26,34)`,
-  menu `(24,27,35)`, tiles `(34,38,49)`, console `(214,222,235)` on
+  menu `(24,27,35)`, rows `(34,38,49)`, console `(214,222,235)` on
   `(10,14,28)`.
 - **Input pipeline**: virtio-tablet owns the pointer; PS/2 bytes are
   swallowed when the tablet exists; focus follows clicks; titlebar drag,
@@ -274,9 +276,9 @@ assertions; `docs/GUI.md` lists what each test proves.
 
 | Tool | Version used |
 |---|---|
-| QEMU | 10.2.1 (Debian `1:10.2.1+ds-1ubuntu3.2`) |
+| QEMU | 11.1.2 (built from source into `~/.local`) |
 | Rust | 1.101.0-nightly (via `cargo +nightly`) |
-| xorriso | 1.5.6 (libburnia) |
+| xorriso | 1.5.8.pl02 (libburnia, built from source into `~/.local`) |
 | Limine | 12.9.3 (binaries in `~/limine`, via `setup-wsl.sh`) |
 | Host | Windows 11 with WSL2 (Ubuntu 22.04/24.04 runs inside WSL), plus `mtools`, `git`, `curl` |
 | Guest | `-m 512M`, 1280×800×32 framebuffer, ~492 MiB usable RAM |
@@ -290,11 +292,11 @@ assertions; `docs/GUI.md` lists what each test proves.
 
 ## Security
 
-v0.8 passed an internal AI-assisted audit: 9 findings from Critical
-(shell command injection via an unchecked server relay) down to Info,
-plus cleared components (FAT32 parser, sender stamping, payload clamping).
-Fixed in order of severity with rebuild + test verification. Hobby-grade
-nonetheless: no sandboxing or user model yet — don't put secrets in it.
+v0.9 closed an internal AI-assisted audit (10 findings, Critical down to
+Info — relay check, kill gate, handle/window owners, fault isolation, ELF
+and disk hardening; one Medium deferred). Full ledger in
+`docs/SECURITY.md`. Hobby-grade nonetheless: no sandboxing or user model
+yet — don't put secrets in it.
 
 ## Roadmap
 
@@ -307,7 +309,8 @@ nonetheless: no sandboxing or user model yet — don't put secrets in it.
 - [x] v0.7 fonts — TTF rasterization + shell editing
 - [x] v0.8 GUI — LimeDE: taskbar, Start menu, wallpaper, compositor,
   multi-window focus/drag/close
-- [ ] v0.9 security fixes + hardening
+- [x] v0.9 own identity + hardening — G mark, launcher menu, on-demand
+  terminal, new toolchain, security fixes
 - [ ] v1.0 driver model, SMP, network, storage
 
 See `docs/ROADMAP.md`. Milestones ship one at a time, each verified in QEMU.

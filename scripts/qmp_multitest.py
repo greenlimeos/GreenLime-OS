@@ -5,14 +5,15 @@ buttons, window drag + resize + close — one boot, virtio-tablet pointer.
 Usage: python3 scripts/qmp_multitest.py [iso]
 
 Geometry (asserted from the server's own serial log first):
-  demo window opens at 700,120 540x330 (id 1, taskbar slot center 712,776).
+  demo window opens at 700,120 540x330 (id 1, taskbar slot center 124,776
+  once the terminal is open: slots Start, terminal, demo).
 
 Checks (serial unless marked "screen"):
   1. demo client spawned + window created
   2. screen: demo titlebar pixels at the expected geometry
   3. keys land in demo when focused:      [demo] got: hi
-  4. click terminal -> keys go there:     focus win 0 + focusok on serial
-     AND demo's input count stays 1 (keys did NOT leak)
+  4. launch Terminal from the menu, then click back and forth:
+     focus win 0 + focusok on serial AND demo's input count stays 1
   5. taskbar icon refocuses demo:       focus win 1 + [demo] got: q
   6. titlebar drag moves the window:      win 1 moved to 600,80 (+ screen)
   7. corner grip resizes:                 win 1 resized 580x370
@@ -207,7 +208,8 @@ def main():
         x0, x1, y0, y1 = (int(m.group(i)) for i in range(3, 7))
 
         # --- Screen: demo window is on the desktop ------------------------
-        # Boot: terminal keeps focus, so the demo titlebar is the dark one.
+        # Boot: clean desktop (terminal opens on demand, never at boot),
+        # so nothing is focused and the demo titlebar is the dark one.
         shot("dist/fb-multi-open.ppm")
         n_open = color_px("dist/fb-multi-open.ppm", (710, 126, 1230, 146),
                           TITLE_BG2)
@@ -257,7 +259,19 @@ def main():
         check("keys -> demo window ([demo] got: hi)",
               wait_for("[demo] got: hi", timeout=45))
 
-        # --- Click terminal, type there: must NOT reach the demo ----------
+        # --- Launch Terminal from the menu, then click back and forth ----
+        # Start mark (28, 776), Terminal row 0 (208, 313): the launcher
+        # opens the terminal on demand (it never opens at boot).
+        click_at(28, 776)
+        click_at(208, 313)
+        check("menu launched the terminal",
+              wait_for("[winsrv] launch Terminal", timeout=30))
+        check("terminal opened + focused (focus win 0)",
+              wait_for("[winsrv] focus win 0", timeout=30))
+        # --- Click demo, then terminal: keys must follow focus ------------
+        click_at(970, 290)  # demo window content
+        check("click focuses demo (focus win 1)",
+              wait_for("[winsrv] focus win 1", timeout=30))
         click_at(400, 400)  # terminal content
         check("click focuses terminal (focus win 0)",
               wait_for("[winsrv] focus win 0", timeout=30))
@@ -269,9 +283,9 @@ def main():
         check("demo input count still 1 (no key leak)", n1 == 1)
 
         # --- Taskbar icon refocuses the demo ------------------------------
-        # Centered slot group (Start, Search, terminal, demo): n=4 ->
-        # group x=548, demo slot 3 = 692..732, center (712, 776).
-        click_at(712, 776)
+        # Left-aligned slots (Start, terminal, demo) -> demo slot 2
+        # = 104..144, center (124, 776).
+        click_at(124, 776)
         check("taskbar icon focuses demo (focus win 1)",
               wait_for("[winsrv] focus win 1", timeout=30))
         type_keys(["q", "ret"])

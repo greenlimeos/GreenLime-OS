@@ -38,6 +38,9 @@ enum OpenTarget {
 struct OpenFile {
     handle: u64,
     target: OpenTarget,
+    /// Opener's kernel-stamped task id (GLS-004). Handles are sequential
+    /// and guessable, so every op re-checks sender == owner.
+    owner: u32,
 }
 
 static OPEN: Mutex<Vec<OpenFile>> = Mutex::new(Vec::new());
@@ -136,7 +139,11 @@ fn handle(req: Message) {
                         1,
                         core::sync::atomic::Ordering::SeqCst,
                     );
-                    OPEN.lock().push(OpenFile { handle: h, target: t });
+                    OPEN.lock().push(OpenFile {
+                        handle: h,
+                        target: t,
+                        owner: from,
+                    });
                     reply(from, REPLY_OK, h, &[]);
                 }
                 None => err(from),
@@ -145,7 +152,12 @@ fn handle(req: Message) {
         OP_READ => {
             let data: Option<Vec<u8>> = {
                 let open = OPEN.lock();
-                let entry = match open.iter().find(|o| o.handle == req.arg0) {
+                // GLS-004: handles are guessable (1, 2, 3, …) — only the
+                // opener may read through one.
+                let entry = match open
+                    .iter()
+                    .find(|o| o.handle == req.arg0 && o.owner == from)
+                {
                     Some(e) => e,
                     None => {
                         drop(open);
@@ -209,7 +221,8 @@ fn handle(req: Message) {
         OP_CLOSE => {
             let mut open = OPEN.lock();
             let n = open.len();
-            open.retain(|o| o.handle != req.arg0);
+            // GLS-004: only the opener may close its handle.
+            open.retain(|o| !(o.handle == req.arg0 && o.owner == from));
             if open.len() < n {
                 reply(from, REPLY_OK, 0, &[]);
             } else {

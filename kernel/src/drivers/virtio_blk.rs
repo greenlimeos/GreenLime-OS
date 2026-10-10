@@ -138,8 +138,11 @@ impl VirtioBlk {
         (self.queue_phys + self.hhdm + self.used_offset as u64 + 2) as *const u16
     }
 
-    /// Read one 512-byte sector (polls used ring). Panics loudly on timeout.
-    pub fn read_block(&mut self, lba: u64, out: &mut [u8; SECTOR]) {
+    /// Read one 512-byte sector (polls used ring). False on timeout or
+    /// device error (GLS-010: these used to panic, so a bad disk image
+    /// halted the machine; a corrupt disk is now just a failed read).
+    /// The bounce frame is freed on every path.
+    pub fn read_block(&mut self, lba: u64, out: &mut [u8; SECTOR]) -> bool {
         assert!(self.blk_size == 512, "[drivers] virtio-blk: blk_size != 512");
         // One bounce frame: [header 16][data 512][status 1].
         let frame = pmm::alloc_frame().expect("[drivers] virtio-blk: no bounce frame");
@@ -185,14 +188,18 @@ impl VirtioBlk {
                 }
                 spins += 1;
                 if spins > TIMEOUT {
-                    panic!("[drivers] virtio-blk: I/O timeout");
+                    pmm::free_frame(frame);
+                    return false;
                 }
                 core::hint::spin_loop();
             }
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             self.last_used = self.last_used.wrapping_add(1);
             let st = core::ptr::read_volatile((status + hhdm) as *const u8);
-            assert!(st == BLK_S_OK, "[drivers] virtio-blk: bad status");
+            if st != BLK_S_OK {
+                pmm::free_frame(frame);
+                return false;
+            }
             core::ptr::copy_nonoverlapping(
                 (data + hhdm) as *const u8,
                 out.as_mut_ptr(),
@@ -200,6 +207,7 @@ impl VirtioBlk {
             );
         }
         pmm::free_frame(frame);
+        true
     }
 }
 
@@ -258,8 +266,7 @@ pub fn read_block(lba: u64, out: &mut [u8; SECTOR]) -> bool {
             if lba >= b.capacity_sectors {
                 return false;
             }
-            b.read_block(lba, out);
-            true
+            b.read_block(lba, out)
         }
         None => false,
     }

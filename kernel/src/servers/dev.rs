@@ -78,7 +78,18 @@ fn handle(req: Message) {
                 let mut m = Message::new(WIN_READ);
                 m.arg0 = req.arg0;
                 ipc::send(PORT_WINSRV, m, me);
-                let rep = ipc::recv(me);
+                // GLS-001: only winsrv (task 2) may answer a relayed read.
+                // Any task can send to any mailbox, so a forged "reply"
+                // planted here would be forwarded to the shell as trusted
+                // typed input (arbitrary command execution). Drop foreign
+                // messages and keep waiting: the queue is FIFO, attacker
+                // refills land BEHIND the real reply, so this terminates.
+                let rep = loop {
+                    let r = ipc::recv(me);
+                    if r.sender == 2 {
+                        break r;
+                    }
+                };
                 reply(from, rep.kind, rep.arg0, rep.payload_bytes());
             } else {
                 // serial0 has no input path: EOF.

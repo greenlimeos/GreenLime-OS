@@ -102,7 +102,7 @@ def main():
         return read_until(sock, PROMPT)
 
     mice = hmp("info mice")
-    # HMP (verified on QEMU 10.2.1) prints one line per pointer, e.g.:
+    # HMP (verified on QEMU 10.2.1 and 11.1.2) prints one line per pointer, e.g.:
     #     Mouse #3: QEMU Virtio Tablet (absolute)
     #   * Mouse #2: QEMU PS/2 Mouse
     # "*" marks current; only the tablet's line carries "(absolute)". So the

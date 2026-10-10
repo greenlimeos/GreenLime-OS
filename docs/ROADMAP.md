@@ -47,7 +47,7 @@ You beat it by starting tiny and never rewriting. Each milestone is bootable in 
 - [x] AHCI: detected + reported (full driver later); virtio-input shipped in v0.8
 - Exit: `ls` lists disk files in QEMU `-drive` image.
 
-## v0.8 — GUI: window server + compositor + LimeDE desktop (IN PROGRESS)
+## v0.8 — GUI: window server + compositor + LimeDE desktop ✅ DONE
 - [x] Window server task + terminal window + taskbar + clock (`servers/winsrv.rs`)
 - [x] Shell output routed to window (`term0` device, WIN_WRITE protocol)
 - [x] Keyboard scancodes to status line (lock-free rings, QMP-verified `0x1e`)
@@ -60,6 +60,15 @@ You beat it by starting tiny and never rewriting. Each milestone is bootable in 
 - [x] LimeDE chrome: taskbar app buttons (id order, focused = bright), titlebar drag-move, corner-grip resize, titlebar X close
 - [x] Visual rework: no green — dark neutral + blue accent palette, procedural wallpaper (integer one-shot render), Win11 centered taskbar + tray, full Start menu (search filter / pinned tiles / recent), Settings + About popups (`qmp_desktop_test.py` exact-color asserts)
 - Exit: ✅ met — boot to GUI, open terminal, type `echo` (`qmp_type_test.py` 5/5); multi-window proof 15/15 (`qmp_multitest.py`); tablet/splash, desktop, input regressions all green.
+
+## v0.9 — Own identity + hardening ✅ DONE
+- [x] G start mark replaces the four-square logo; left-aligned taskbar, no Search slot
+- [x] Launcher menu: left-docked vertical app rows (no centered grid, no Recent, no "All apps")
+- [x] Terminal opens on demand from the launcher (never at boot), buffered early text, X button closes it; popups get X marks
+- [x] Terminal line-length cap (heap-exhaustion guard)
+- [x] Toolchain: QEMU 11.1.2 + xorriso 1.5.8.pl02 (source-built), full suite re-verified green
+- [x] Security fixes (audit GLS-001…010: relay check, kill gate, handle/window owners, fault isolation, ELF + disk hardening)
+- Exit: ✅ met — clean desktop at boot, suite 7/7 on the new toolchain, findings closed (GLS-007 deferred, documented in `docs/SECURITY.md`).
 
 ## v1.0 — SMP + net + hardening
 - [ ] AP startup (Limine MP), per-CPU scheduler, IPIs

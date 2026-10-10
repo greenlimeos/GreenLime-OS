@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""v0.8 interactive stdin proof: type into the GUI terminal via QMP sendkey.
+"""v0.9 interactive stdin proof: launch the terminal from the menu, then
+type into it via QMP sendkey.
 
 Usage: python3 scripts/qmp_type_test.py [iso]
 
-Types two commands:
+The terminal no longer opens at boot — it opens on demand from the
+launcher, so this test clicks Start (28,776) + the Terminal row (208,313)
+first (also proving the launch flow), then types two commands:
   1. "echo greenlime works"      -> output must appear (round trip works)
   2. "echo abd" + backspace + "c" -> "abc" (backspace edits the line)
 
@@ -82,6 +85,7 @@ def main():
             "-no-reboot",
             "-boot", "order=d",
             "-drive", "file=dist/disk.img,if=virtio,format=raw",
+            "-device", "virtio-tablet-pci",
             "-serial", "stdio",
             "-display", "none",
             "-qmp", f"unix:{QSOCK},server,nowait",
@@ -107,8 +111,30 @@ def main():
                 hmp(f"sendkey {k}")
                 time.sleep(0.6)
 
+        def to_dev(px, dim):
+            # virtio-tablet exposes 0..32767 over the screen dimension.
+            return px * 32767 // (dim - 1)
+
+        def click_at(gx, gy):
+            qmp(s, {"execute": "input-send-event", "arguments": {"events": [
+                {"type": "abs", "data": {"axis": "x", "value": to_dev(gx, 1280)}},
+                {"type": "abs", "data": {"axis": "y", "value": to_dev(gy, 800)}},
+            ]}})
+            time.sleep(2)
+            qmp(s, {"execute": "input-send-event", "arguments": {"events": [
+                {"type": "btn", "data": {"button": "left", "down": True}}]}})
+            time.sleep(1)
+            qmp(s, {"execute": "input-send-event", "arguments": {"events": [
+                {"type": "btn", "data": {"button": "left", "down": False}}]}})
+            time.sleep(2)
+
         def shot(path):
             qmp(s, {"execute": "screendump", "arguments": {"filename": path}})
+
+        # Terminal opens on demand: Start mark (28,776), Terminal row (208,313).
+        click_at(28, 776)
+        click_at(208, 313)
+        wait_marker(SER, "[winsrv] launch Terminal")
 
         shot("dist/fb-before-type.ppm")
         type_keys(KEYS_CMD1)

@@ -361,7 +361,7 @@ fn interactive(me: u32, fd: u64) -> ! {
     let rep = rpc(PORT_DEV, me, &req, 1);
     let ser = (rep.kind == REPLY_OK).then_some(rep.arg0);
 
-    out(me, fd, ser, b"GreenLime shell v0.8 (interactive) - type help\n");
+    out(me, fd, ser, b"GreenLime shell v0.9 (interactive) - type help\n");
     if let Some(s) = ser {
         dev_write(me, s, b"[shell] interactive ready\n");
     }

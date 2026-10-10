@@ -68,7 +68,21 @@ extern "x86-interrupt" fn breakpoint_handler(_frame: InterruptStackFrame) {
     kprintln!("[idt] breakpoint ok");
 }
 
+/// GLS-003: a ring-3 fault retires the task instead of halting the
+/// machine. Supervisor faults still halt (kernel bug = fail loud).
+/// Safe: exit_current abandons this kernel stack exactly like the Exit
+/// syscall path, and no locks are held this early in any handler below.
+fn kill_user_task(id: crate::sched::TaskId, what: &str, code: u64) -> ! {
+    kprintln!("[FAULT] {} from ring 3 — killing task {}", what, id);
+    crate::sched::exit_current(code);
+}
+
 extern "x86-interrupt" fn ud_handler(frame: InterruptStackFrame) {
+    if frame.code_segment.0 & 3 == 3 {
+        if let Some(id) = crate::sched::current_id() {
+            kill_user_task(id, "UD", 132); // 128 + SIGILL
+        }
+    }
     kprintln!("[FAULT] #UD invalid opcode (missing CPU feature?)");
     kprintln!("[FAULT] {:#?}", frame);
     halt();
@@ -83,6 +97,11 @@ extern "x86-interrupt" fn page_fault_handler(
         Cr2::read_raw(),
         error
     );
+    if frame.code_segment.0 & 3 == 3 {
+        if let Some(id) = crate::sched::current_id() {
+            kill_user_task(id, "page fault", 139); // 128 + SIGSEGV
+        }
+    }
     // Raw fields: always printable, even mid-deadlock (no deep formatting).
     let (cr3f, _) = x86_64::registers::control::Cr3::read();
     kprintln!(
@@ -101,6 +120,11 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn gp_handler(frame: InterruptStackFrame, code: u64) {
+    if frame.code_segment.0 & 3 == 3 {
+        if let Some(id) = crate::sched::current_id() {
+            kill_user_task(id, "GP", 139);
+        }
+    }
     kprintln!("[FAULT] #GP code={:#x}", code);
     kprintln!("[FAULT] {:#?}", frame);
     halt();

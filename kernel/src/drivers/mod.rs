@@ -24,7 +24,7 @@ pub fn init_framebuffer() {
     match fb::init() {
         Some((w, h)) => {
             kprintln!("[drivers] fb console: {}x{} TTF", w, h);
-            fb::splash("GreenLime OS", "v0.8 \u{2014} booting");
+            fb::splash("GreenLime OS", "v0.9 \u{2014} booting");
         }
         None => kprintln!("[drivers] fb console: off (serial only)"),
     }

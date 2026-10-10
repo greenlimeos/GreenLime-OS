@@ -108,21 +108,22 @@ def main():
         print("waiting for idle...", flush=True)
         wait_idle(SER)
         print("idle. cursor starts at screen center (640,400).", flush=True)
-        # Start icon center = (568, 776): centered slot group of 4
-        # (Start, Search, terminal, demo) -> group x=548, slot0 = 548..588.
-        move(-72, 376)
+        # Start mark center = (28, 776): left-aligned slots ->
+        # slot0 = 8..48. Cursor starts at (640, 400).
+        move(-612, 376)
         time.sleep(2)
         click()  # open menu
         shot("dist/fb-menu.ppm")
         print("menu shot taken", flush=True)
-        # About tile center = (874, 338): tile 3 at x=812..936, y=288..388.
-        move(306, -438)
+        # About row center = (208, 487): left-docked panel (8,196,400,540),
+        # app row 3 at y=462..512, full-width row x=24..392.
+        move(180, -289)
         time.sleep(2)
         click()  # open About
         shot("dist/fb-about.ppm")
         print("about shot taken", flush=True)
-        # Dismiss: click terminal at (200, 300) — left of the menu panel.
-        move(-674, -38)
+        # Dismiss: click desktop at (900, 300) — right of the panel.
+        move(692, -187)
         time.sleep(2)
         click()
         shot("dist/fb-dismissed.ppm")
@@ -183,10 +184,10 @@ def main():
         return n
 
     # Start-menu panel: exact MENU_BG (24, 27, 35) inside the panel rect
-    # (320,176)-(960,736). The wallpaper's blue channel stays >= 42 and
+    # (8,196)-(408,736). The wallpaper's blue channel stays >= 42 and
     # window text never blends to (24,27,35), so only the panel matches.
     def panel_px(path):
-        return count_color(path, (320, 176, 960, 736), (24, 27, 35))
+        return count_color(path, (8, 196, 408, 736), (24, 27, 35))
 
     # Popup titlebar strip: exact TITLE_BG (38, 44, 58) at
     # (412,297)-(868,325) — only the About/Settings dialog draws there.

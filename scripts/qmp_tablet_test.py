@@ -101,13 +101,13 @@ def splash_check(path):
 
 def menu_px(path):
     """Start-menu panel pixels: exact MENU_BG (24,27,35) in the panel
-    rect (320,176)-(960,736). Wallpaper blue stays >= 42, so it can never
+    rect (8,196)-(408,736). Wallpaper blue stays >= 42, so it can never
     match; window text blends never land on the triple either."""
     w, h, px = read_ppm(path)
     n = 0
-    for y in range(176, 736):
+    for y in range(196, 736):
         row = y * w * 3
-        for x in range(320, 960):
+        for x in range(8, 408):
             o = row + x * 3
             if (px[o], px[o + 1], px[o + 2]) == (24, 27, 35):
                 n += 1
@@ -270,10 +270,10 @@ def main():
             shot(f"dist/fb-tablet-{tag}.ppm")
             time.sleep(2)
 
-        # Start icon: centered slot group of 4 -> slot0 center (568, 776).
-        click_at(568, 776, "menu")
-        # Dismiss: click terminal at (200, 300) — left of the menu panel.
-        click_at(200, 300, "dismiss")
+        # Start mark: left-aligned slots -> slot0 center (28, 776).
+        click_at(28, 776, "menu")
+        # Dismiss: click desktop at (900, 300) — right of the panel.
+        click_at(900, 300, "dismiss")
         m_menu = menu_px("dist/fb-tablet-menu.ppm")
         m_gone = menu_px("dist/fb-tablet-dismiss.ppm")
         print(f"tablet click: menu_px={m_menu} dismissed_px={m_gone}")

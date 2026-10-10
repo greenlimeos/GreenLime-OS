@@ -1,6 +1,6 @@
-# GreenLime GUI (v0.8): window server + desktop + terminal + taskbar.
+# GreenLime GUI (v0.9): window server + desktop + terminal + taskbar.
 
-## Theme (v0.8 rework: no green, Win11-style chrome)
+## Theme (v0.9 rework: no green, GreenLime's own chrome)
 
 Dark neutral + blue accent everywhere (`winsrv.rs` palette consts):
 
@@ -9,26 +9,33 @@ Dark neutral + blue accent everywhere (`winsrv.rs` palette consts):
 | accent / focus underline | `(76,194,255)` | focused titlebar | `(38,44,58)` |
 | window body / text | `(16,18,24)` / `(214,222,235)` | unfocused titlebar | `(26,30,40)` |
 | taskbar | `(23,26,34)` | Start panel | `(24,27,35)` |
-| tiles / search / popup body | `(34,38,49)` | hover | `(46,52,66)` |
+| rows / search / popup body | `(34,38,49)` | hover | `(46,52,66)` |
 
 * **Wallpaper**: deep-blue vertical gradient + 4 soft radial glows, rendered
   **once** into a cached `Vec<u32>` (`render_wallpaper`, Q16 fixed-point) and
   row-copied into the damage during compose. See the soft-float gotcha below
   before ever making this per-pixel float.
-* **Taskbar (Win11)**: 48px, *centered* slot group [Start logo, magnifier,
+* **Taskbar**: 48px, *left-aligned* slots [G start mark,
   one icon per window in id order], accent underline under the focused app,
   hover fill, right-aligned two-line uptime tray (no key display).
-* **Start menu**: 640x520 panel centered above the taskbar — search box
-  (keys go to the search filter whenever the menu is open; Enter launches
-  the first match), Pinned row of 4 tiles (Terminal/Demo/Settings/About),
-  Recent list (last 3 launches, deduped), account footer. Only clicks
-  outside the panel (or empty taskbar / Esc) dismiss it.
-* **Popups**: `Popup::{About, Settings}` — centered dialog, any click
-  dismisses; Settings shows display size / uptime / window count / build.
+* **Start menu**: 400x540 launcher panel docked bottom-left above the
+  taskbar — search box (keys go to the search filter whenever the menu is
+  open; Enter launches the first match), vertical app rows with icon +
+  name + chevron (Terminal/Demo/Settings/About), account footer. Only
+  clicks outside the panel (or empty taskbar / Esc) dismiss it.
+  Deliberately not a centered grid.
+* **Terminal**: the shell console opens on demand from the launcher —
+  never at boot. Early shell output is buffered and shown when it opens;
+  the serial mirror stays live regardless. The terminal has an X button
+  like every window (its IPC handle stays protected); closing it just
+  hides it — reopening restores the buffered text.
+* **Popups**: `Popup::{About, Settings}` — centered dialog with an X
+  mark, any click dismisses; Settings shows display size / uptime /
+  window count / build.
 * Splash + console palette match: title `(243,245,248)`, console
   `(214,222,235)` on `(10,14,28)` — no green anywhere.
 
-## What runs where (v0.8 demo)
+## What runs where (v0.9 demo)
 
 ```
 shell ──write──▶ DEV "term0" ──WIN_WRITE──▶ winsrv (kernel task)
@@ -52,7 +59,7 @@ title, then sets `quiet` so kprint mirrors serial only (every diagnostic
 still lands on the serial log). winsrv's first paint covers the splash;
 the panic path calls `fb::wake_console()` so a panic is never hidden.
 
-The window server lives in-kernel for v0.8, exactly like vfs/dev did in
+The window server lives in-kernel for v0.9, exactly like vfs/dev did in
 v0.6: same IPC protocol (`PORT_WINSRV`), so it migrates to userspace later
 without changing clients.
 
@@ -92,16 +99,16 @@ without changing clients.
 * **Drag**: press the titlebar and move — the window follows the cursor
   live (damage = old ∪ new). **Resize**: the bottom-right 16px grip,
   min 200x120. Release logs `moved to x,y` / `resized WxH` to serial.
-* **Close**: the titlebar X (client windows only; red on hover) destroys
+* **Close**: the titlebar X (every window, red on hover) destroys
   the window, EOFs any pending WIN_CLIENT_READ (client sees
   `REPLY_ERR`), and drops its taskbar icon. `WIN_DESTROY` is the
   message-side equivalent.
-* **Taskbar**: centered [Start | Search | one icon per window, id
+* **Taskbar**: left-aligned [Start | one icon per window, id
   order] + right-aligned uptime tray (HH:MM over "Day N"). Clicking
-  Start/Search toggles-opens the menu; clicking an icon focuses that
+  Start toggles-opens the menu; clicking an icon focuses that
   window (closing the menu first); empty taskbar space closes the menu.
 
-## Interactive stdin (the v0.8 line discipline)
+## Interactive stdin (the v0.9 line discipline)
 
 * **Decode**: set-1 scancodes → ASCII in `winsrv::scancode_ascii`
   (US layout, shift + caps, E0-prefixed keys swallowed, break codes
@@ -121,7 +128,7 @@ without changing clients.
   and the demo client logs `[demo] got: …` lines, so tests assert on
   what actually ran, not on pixel guesses.
 
-## Deliberate simplifications (v0.8 demo scope)
+## Deliberate simplifications (v0.9 demo scope)
 
 * **Pointer: virtio-tablet when present, PS/2 fallback.** The event model
   (polled by the server) is transport-agnostic; with a tablet attached the
@@ -172,13 +179,13 @@ without changing clients.
 * `scripts/verify_tablet_pointer.py` — runs the helper against a live
   headless QEMU, then independently QMP-queries `query-mice` to assert the
   tablet ended up `current=True, absolute=True`. Exits non-zero otherwise.
-* `scripts/qmp_type_test.py` — types `echo greenlime works` and an
-  editing session (`abd` + backspace + `c`) via HMP `sendkey`; asserts the
-  mirrored output on serial (`greenlime works`, `abc`, no `abd`) and
-  saves before/after screenshots. (Boot keeps terminal focus, so blind
-  typing works even with the demo window present.)
-* `scripts/qmp_desktop_test.py` — clicks Start (568,776) → menu opens
-  (exact `MENU_BG` count in the panel rect ≥50000), About tile (874,338)
+* `scripts/qmp_type_test.py` — launches the terminal from the menu
+  (Start + Terminal row via absolute clicks), then types
+  `echo greenlime works` and an editing session (`abd` + backspace + `c`)
+  via HMP `sendkey`; asserts the mirrored output on serial
+  (`greenlime works`, `abc`, no `abd`) and saves before/after screenshots.
+* `scripts/qmp_desktop_test.py` — clicks Start (28,776) → menu opens
+  (exact `MENU_BG` count in the panel rect ≥50000), About row (208,487)
   → popup opens (`TITLE_BG` in its titlebar ≥5000, menu count drops to
   0), click away → both dismiss (counts back to 0).
 * `scripts/qmp_tablet_test.py` — one boot proves splash + tablet: shot

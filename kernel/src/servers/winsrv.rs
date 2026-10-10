@@ -6,11 +6,12 @@
 //! buffer: it is undrawn before present and redrawn on top after, so
 //! compositing can never stomp it.
 //!
-//! UI theme (v0.8 rework): dark neutral + Win11-style chrome — procedural
-//! blue wallpaper, centered icon taskbar (Start/logo, magnifier, window
-//! icons with accent underline, right uptime tray), full Start menu
-//! (search filter, pinned tiles, recent), Settings/About popups. Window
-//! content stays text-only: terminal (id 0, line discipline) + client
+//! UI theme (v0.9 rework): dark neutral, GreenLime's own look — procedural
+//! blue wallpaper, left-aligned taskbar (G start mark, magnifier, window
+//! icons with accent underline, right uptime tray), left-docked launcher
+//! (search filter, app rows, recent), Settings/About popups. Window
+//! content stays text-only: terminal (id 0, line discipline, opens on
+//! demand from the launcher — never at boot) + client
 //! windows (WIN_CREATE, raw keys while focused), focus follows clicks,
 //! titlebar drag moves, corner grip resizes, taskbar icons focus/raise.
 //! Keys arrive via PS/2 or virtio-tablet pointer; while the Start menu
@@ -30,7 +31,7 @@ use crate::drivers::{fb, input, virtio_input};
 use crate::{ipc, kprintln, sched};
 
 const FONT_PX: f32 = 16.0;
-// ---- Palette: dark neutral + Win11-ish blue accent (no green) -----------
+// ---- Palette: dark neutral + blue accent (no green) -----------
 const BG: Rgb = Rgb(16, 18, 24); // window body
 const FG: Rgb = Rgb(214, 222, 235); // window text
 const TITLE_BG: Rgb = Rgb(38, 44, 58); // focused titlebar
@@ -45,7 +46,7 @@ const HOVER: Rgb = Rgb(46, 52, 66);
 const ACCENT: Rgb = Rgb(76, 194, 255); // blue accent
 const ACCENT_DIM: Rgb = Rgb(30, 84, 120);
 const MENU_BG: Rgb = Rgb(24, 27, 35); // start panel (tests exact-count it)
-const MENU_BG2: Rgb = Rgb(34, 38, 49); // tiles / search / popup body
+const MENU_BG2: Rgb = Rgb(34, 38, 49); // launcher rows / search / popup body
 const MENU_FG: Rgb = Rgb(230, 236, 244);
 const SUB_FG: Rgb = Rgb(130, 140, 155); // hints / dim labels
 const POPUP_BG: Rgb = Rgb(20, 23, 30); // menu footer band
@@ -65,14 +66,21 @@ const TERM_X0: u32 = 150;
 const TERM_Y0: u32 = 100;
 const TERM_X1: u32 = 1130;
 const TERM_Y1: u32 = 640;
-// Start menu panel (centered above the taskbar, Win11 style).
-const MENU_W: u32 = 640;
-const MENU_H: u32 = 560;
-const TILE_W: u32 = 124;
-const TILE_H: u32 = 100;
-const TILE_PITCH: u32 = 156;
+// Start menu: left-docked launcher panel above the taskbar (GreenLime's
+// own layout — a vertical list, not a centered grid).
+const MENU_W: u32 = 400;
+const MENU_H: u32 = 540;
+/// App row geometry (relative to the panel top).
+const ROW_Y0: u32 = 92;
+const ROW_H: u32 = 50;
+const ROW_PITCH: u32 = 58;
 
 const TERM_ID: u32 = 0;
+/// No window focused (clean desktop: terminal opens on demand, never at boot).
+const NO_FOCUS: u32 = u32::MAX;
+/// Longest single terminal line (heap guard: the open line is uncapped by
+/// SCROLLBACK, which only limits the line *count*).
+const MAX_LINE: usize = 4096;
 const MAX_WINS: usize = 8;
 const GRIP: u32 = 16;
 const MIN_W: u32 = 200;
@@ -189,7 +197,10 @@ fn name_matches(name: &str, q: &[u8]) -> bool {
 /// One window's geometry + state. Z-order = position in WinSrv::windows.
 struct Window {
     id: u32,
-    client: bool, // false = the terminal (never closable)
+    client: bool, // false = the terminal (system window, no X button)
+    /// Creating task (kernel-stamped sender at WIN_CREATE; u32::MAX for
+    /// the terminal). Client ops require sender == owner (GLS-006).
+    owner: u32,
     x: u32,
     y: u32,
     w: u32,
@@ -255,8 +266,10 @@ struct WinSrv {
     wallpaper: Vec<u32>,
     font: FontSystem,
     line_h: u32,
-    /// Windows, bottom-to-top. Index 0 is the terminal (id 0).
+    /// Windows, bottom-to-top. The terminal (id 0) is NOT here at boot —
+    /// it is created on demand by ensure_terminal() (see menu_launch).
     windows: Vec<Window>,
+    /// Focused window id, or NO_FOCUS on a clean desktop.
     focus: u32,
     /// Damage to compose+blit this lap (union of invalidated rects).
     dirty: Option<Rect>,
@@ -284,6 +297,9 @@ struct WinSrv {
     in_ring: [u8; 128],
     in_head: usize,
     in_len: usize,
+    /// Terminal text buffered while its window is closed (early boot
+    /// output before the user opens it): capped like window scrollback.
+    term_hist: VecDeque<String>,
     /// Terminal reader waiting for input (dev server: at most one).
     pending_reader: Option<u32>,
     shift: bool,
@@ -308,20 +324,10 @@ impl WinSrv {
         // Wallpaper: fixed-point, rendered once (heap: 4 MiB back + 4 MiB
         // wallpaper of the 16 MiB kernel heap).
         let wallpaper = render_wallpaper(w, h);
-        let term = Window {
-            id: TERM_ID,
-            client: false,
-            x: TERM_X0,
-            y: TERM_Y0,
-            w: TERM_X1 - TERM_X0,
-            h: TERM_Y1 - TERM_Y0,
-            title: String::from("Terminal - greenlime-shell"),
-            lines: VecDeque::new(),
-            ring: [0; 128],
-            head: 0,
-            len: 0,
-            pending: None,
-        };
+        // Clean desktop: NO windows at boot. The terminal (shell console)
+        // opens on demand from the launcher; the demo client opens its own
+        // window when it starts. Early terminal text is buffered in
+        // term_hist until then (serial mirror stays live regardless).
         let mut srv = Self {
             fb,
             back_buf,
@@ -329,8 +335,8 @@ impl WinSrv {
             wallpaper,
             font,
             line_h: 20,
-            windows: alloc::vec![term],
-            focus: TERM_ID,
+            windows: alloc::vec![],
+            focus: NO_FOCUS,
             dirty: Some((0, 0, w, h)),
             drag: None,
             last_clock: u64::MAX,
@@ -351,6 +357,7 @@ impl WinSrv {
             in_ring: [0; 128],
             in_head: 0,
             in_len: 0,
+            term_hist: VecDeque::new(),
             pending_reader: None,
             shift: false,
             caps: false,
@@ -427,7 +434,7 @@ impl WinSrv {
                 &mut self.font,
                 wm.0,
                 wm.1,
-                "GreenLime OS v0.8",
+                "GreenLime OS v0.9",
                 FONT_PX,
                 DESK_FG,
             );
@@ -450,7 +457,7 @@ impl WinSrv {
                 );
             }
         }
-        // 3. Taskbar (centered icon slots + right tray).
+        // 3. Taskbar (left-aligned icon slots + right tray).
         let tb = (0u32, sh.saturating_sub(TASKBAR_H), sw, TASKBAR_H);
         if r_inter(r, tb) {
             let secs = idt::ticks() / 100;
@@ -546,9 +553,6 @@ impl WinSrv {
     }
 
     fn destroy_window(&mut self, id: u32) {
-        if id == TERM_ID {
-            return;
-        }
         let Some(idx) = self.idx_of(id) else {
             return;
         };
@@ -559,8 +563,10 @@ impl WinSrv {
         }
         let rect = self.windows[idx].rect();
         self.windows.remove(idx);
+        // Focus falls back to the topmost remaining window (terminal if it
+        // exists), or nowhere on an empty desktop.
         if self.focus == id {
-            self.focus = TERM_ID;
+            self.focus = self.windows.last().map(|w| w.id).unwrap_or(NO_FOCUS);
         }
         if self.drag.as_ref().map(|d| d.id) == Some(id) {
             self.drag = None;
@@ -688,7 +694,7 @@ impl WinSrv {
     }
 
     /// Hover feedback: entering/leaving the taskbar or an open menu panel
-    /// marks them stale (icons/tiles highlight under the cursor).
+    /// marks them stale (icons/rows highlight under the cursor).
     fn hover_invalidate(&mut self, ox: u32, oy: u32, nx: u32, ny: u32) {
         let (sw, sh) = (self.fb.width, self.fb.height);
         let ty = sh - TASKBAR_H;
@@ -712,7 +718,7 @@ impl WinSrv {
             self.invalidate(popup_rect(sw, sh));
             return;
         }
-        // Taskbar slots (usable with the menu open too, Win11 style).
+        // Taskbar slots (usable with the menu open too).
         if y >= sh - TASKBAR_H {
             let n = slot_count(self.windows.len());
             for i in 0..n {
@@ -728,27 +734,18 @@ impl WinSrv {
         // Menu open: panel interactions, else dismiss (click consumed).
         if self.menu_open {
             let (mx0, my0, mw, mh) = menu_rect(sw, sh);
-            // Pinned tiles (filtered order must match draw_menu).
-            let mut tile = 0u32;
+            // App rows (filtered order must match draw_menu).
+            let mut row = 0u32;
             for (name, app) in APPS {
                 if !name_matches(name, &self.search[..self.search_len]) {
                     continue;
                 }
-                let t = tile_rect(tile, sw, sh);
+                let t = row_rect(row, sw, sh);
                 if point_in(x, y, t) {
                     self.menu_launch(app);
                     return;
                 }
-                tile += 1;
-            }
-            // Recent rows.
-            for i in 0..self.recent.len() as u32 {
-                let rr = recent_rect(i, sw, sh);
-                if point_in(x, y, rr) {
-                    let app = self.recent[i as usize];
-                    self.menu_launch(app);
-                    return;
-                }
+                row += 1;
             }
             if point_in(x, y, (mx0, my0, mw, mh)) {
                 return; // inside panel (incl. search box): keep it open
@@ -768,9 +765,8 @@ impl WinSrv {
                 continue;
             }
             let id = self.windows[i].id;
-            let client = self.windows[i].client;
-            // Close button (client windows).
-            if client {
+            // Close button (every window has one now, terminal included).
+            {
                 let c = self.windows[i].close_rect();
                 if x >= c.0 && x < c.0 + c.2 && y >= c.1 && y < c.1 + c.3 {
                     self.destroy_window(id);
@@ -807,7 +803,7 @@ impl WinSrv {
         // Desktop click: nothing.
     }
 
-    /// Taskbar slot i: 0 = Start, 1 = Search, 2.. = window (id order).
+    /// Taskbar slot i: 0 = Start, 1.. = window (id order).
     fn taskbar_slot(&mut self, i: u32) {
         let (sw, sh) = (self.fb.width, self.fb.height);
         let open = |s: &mut Self| {
@@ -824,14 +820,9 @@ impl WinSrv {
                     open(self);
                 }
             }
-            1 => {
-                if !self.menu_open {
-                    open(self); // typing goes straight to the search box
-                }
-            }
-            _ => {
+            1.. => {
                 self.close_menu();
-                let target = (i - 2) as usize;
+                let target = (i - 1) as usize;
                 let mut k = 0;
                 for id in 0..self.next_id {
                     if self.idx_of(id).is_none() {
@@ -861,14 +852,13 @@ impl WinSrv {
 
     /// Launch a Start-menu app: record it in Recent, close the menu,
     /// then perform its action.
-    fn menu_launch(&mut self, app: App) {
-        self.recent.retain(|a| *a != app);
+    fn menu_launch(&mut self, app: App) {        self.recent.retain(|a| *a != app);
         self.recent.insert(0, app);
         self.recent.truncate(3);
         self.close_menu();
         let (sw, sh) = (self.fb.width, self.fb.height);
         match app {
-            App::Terminal => self.focus_window(TERM_ID),
+            App::Terminal => self.ensure_terminal(),
             App::Demo => {
                 let demo = self.windows.iter().find(|w| w.client).map(|w| w.id);
                 if let Some(id) = demo {
@@ -885,6 +875,38 @@ impl WinSrv {
             }
         }
         kprintln!("[winsrv] launch {}", app.name());
+    }
+
+    /// Open the terminal on demand (it never opens at boot): create the
+    /// system window, prefilled with whatever was buffered while it was
+    /// closed (early shell banner), or just focus it if already open.
+    fn ensure_terminal(&mut self) {
+        if self.idx_of(TERM_ID).is_none() {
+            let mut lines = core::mem::take(&mut self.term_hist);
+            while lines.len() > SCROLLBACK {
+                lines.pop_front();
+            }
+            self.windows.push(Window {
+                id: TERM_ID,
+                client: false,
+                owner: u32::MAX, // system window: no IPC client owns it
+                x: TERM_X0,
+                y: TERM_Y0,
+                w: TERM_X1 - TERM_X0,
+                h: TERM_Y1 - TERM_Y0,
+                title: String::from("Terminal - greenlime-shell"),
+                lines,
+                ring: [0; 128],
+                head: 0,
+                len: 0,
+                pending: None,
+            });
+            kprintln!("[winsrv] terminal open");
+            self.invalidate((TERM_X0, TERM_Y0, TERM_X1 - TERM_X0, TERM_Y1 - TERM_Y0));
+            let (sw, sh) = (self.fb.width, self.fb.height);
+            self.invalidate((0, sh - TASKBAR_H, sw, TASKBAR_H));
+        }
+        self.focus_window(TERM_ID);
     }
 
     fn menu_enter(&mut self) {
@@ -1059,8 +1081,13 @@ impl WinSrv {
             return; // never eat past the prompt/current line start
         }
         self.line_len -= 1;
+        // The terminal is index 0 only by convention — look it up, since it
+        // may not exist at all (opens on demand, never at boot).
+        let Some(ti) = self.idx_of(TERM_ID) else {
+            return;
+        };
         let cr = {
-            let t = &mut self.windows[0];
+            let t = &mut self.windows[ti];
             if let Some(last) = t.lines.back_mut() {
                 last.pop();
             }
@@ -1072,32 +1099,16 @@ impl WinSrv {
     // ---- terminal line discipline ----------------------------------------
 
     /// Append console text to window `id` (state only; invalidate follows).
+    /// Terminal text with no terminal window is buffered in term_hist so
+    /// early boot output survives until the user opens it.
     fn append_text_to(&mut self, id: u32, text: &str) {
         let Some(idx) = self.idx_of(id) else {
+            if id == TERM_ID {
+                push_text(&mut self.term_hist, text);
+            }
             return;
         };
-        {
-            let win = &mut self.windows[idx];
-            // Console rules: a write continues the open line; only '\n'
-            // breaks (treating every write as a fresh line would shred
-            // "$ help" into two rows).
-            if win.lines.back().is_none() {
-                win.lines.push_back(String::new());
-            }
-            let mut parts = text.split('\n');
-            let head = parts.next().unwrap_or("");
-            if !head.is_empty() {
-                if let Some(last) = win.lines.back_mut() {
-                    last.push_str(head);
-                }
-            }
-            for part in parts {
-                win.lines.push_back(String::from(part));
-                while win.lines.len() > SCROLLBACK {
-                    win.lines.pop_front();
-                }
-            }
-        }
+        push_text(&mut self.windows[idx].lines, text);
         let cr = self.windows[idx].content_rect();
         self.invalidate(cr);
     }
@@ -1197,6 +1208,14 @@ impl WinSrv {
             WIN_READ => {
                 // Canonical read: hold the request until Enter commits a
                 // line. flush_reader replies the moment input lands.
+                // GLS-006: only DEV (task 1) relays terminal reads. Anyone
+                // else claiming this slot would steal the shell's next
+                // typed line AND wedge dev's relay forever (it waits for a
+                // reply that now goes to the thief). Drop silently: no
+                // reply owed, nothing overwritten.
+                if msg.sender != 1 {
+                    return;
+                }
                 self.pending_reader = Some(msg.sender);
                 self.flush_reader();
             }
@@ -1221,6 +1240,10 @@ impl WinSrv {
                 self.windows.push(Window {
                     id,
                     client: true,
+                    // GLS-006: stamped creator owns this window. Only the
+                    // owner may read its keys, write its text, or destroy
+                    // it over IPC (the titlebar X uses the direct path).
+                    owner: msg.sender,
                     x,
                     y,
                     w,
@@ -1241,6 +1264,12 @@ impl WinSrv {
             }
             WIN_CLIENT_WRITE => {
                 let id = msg.arg0 as u32;
+                // GLS-006: only the owning client may scribble here.
+                // Fire-and-forget: nothing to reply, just drop it.
+                match self.idx_of(id) {
+                    Some(idx) if self.windows[idx].owner == msg.sender => {}
+                    _ => return,
+                }
                 if let Ok(text) = core::str::from_utf8(msg.payload_bytes()) {
                     self.append_text_to(id, text);
                 }
@@ -1248,16 +1277,25 @@ impl WinSrv {
             WIN_CLIENT_READ => {
                 let id = msg.arg0 as u32;
                 match self.idx_of(id) {
-                    Some(idx) => {
+                    // GLS-006: only the owner may claim the key stream.
+                    Some(idx) if self.windows[idx].owner == msg.sender => {
                         self.windows[idx].pending = Some(msg.sender);
                         self.flush_client(idx);
                     }
+                    Some(_) => self.reply(msg.sender, REPLY_ERR, 0, &[]),
                     None => self.reply(msg.sender, REPLY_ERR, 0, &[]),
                 }
             }
             WIN_DESTROY => {
                 let id = msg.arg0 as u32;
-                if id != TERM_ID && self.idx_of(id).is_some() {
+                // IPC clients can't kill the terminal (only its own X
+                // button can, via the direct destroy path in click()),
+                // and GLS-006: only the owning client may destroy its
+                // window over IPC.
+                let owned = self.idx_of(id).is_some_and(|i| {
+                    id != TERM_ID && self.windows[i].owner == msg.sender
+                });
+                if owned {
                     self.destroy_window(id);
                     self.reply(msg.sender, REPLY_OK, 0, &[]);
                 } else {
@@ -1275,42 +1313,67 @@ fn unpack(v: u32) -> Rgb {
 
 // ---- geometry shared by draw + hit-testing -------------------------------
 
-/// Taskbar slot count: Start + Search + one per window.
+/// Taskbar slot count: Start + one per window.
 fn slot_count(nwin: usize) -> u32 {
-    2 + nwin as u32
+    1 + nwin as u32
 }
 
-/// Left edge of slot `i` in a centered group of `n` slots.
-fn slot_x(i: u32, n: u32, sw: u32) -> u32 {
-    let gw = n * SLOT + (n - 1) * SLOT_GAP;
-    (sw - gw) / 2 + i * (SLOT + SLOT_GAP)
+/// Left edge of slot `i`: slots run left-to-right from the screen edge
+/// (GreenLime taskbar is left-aligned, not centered).
+fn slot_x(i: u32, _n: u32, _sw: u32) -> u32 {
+    8 + i * (SLOT + SLOT_GAP)
 }
 
-/// Start menu panel: centered above the taskbar.
-fn menu_rect(sw: u32, sh: u32) -> Rect {
+/// Start menu: left-docked launcher above the taskbar.
+fn menu_rect(_sw: u32, sh: u32) -> Rect {
     (
-        (sw - MENU_W) / 2,
+        8,
         sh - TASKBAR_H - 16 - MENU_H,
         MENU_W,
         MENU_H,
     )
 }
 
-fn search_rect(sw: u32, sh: u32) -> Rect {
-    let (mx0, my0, _, _) = menu_rect(sw, sh);
-    (mx0 + 24, my0 + 24, MENU_W - 48, 40)
+fn search_rect(_sw: u32, sh: u32) -> Rect {
+    let (mx0, my0, _, _) = menu_rect(_sw, sh);
+    (mx0 + 16, my0 + 16, MENU_W - 32, 40)
 }
 
-/// Pinned tile `i` (index in the *filtered* app list).
-fn tile_rect(i: u32, sw: u32, sh: u32) -> Rect {
-    let (mx0, my0, _, _) = menu_rect(sw, sh);
-    (mx0 + 24 + i * TILE_PITCH, my0 + 112, TILE_W, TILE_H)
+/// App row `i` (index in the *filtered* app list): full-width row with
+/// icon + name, not a tile.
+fn row_rect(i: u32, _sw: u32, sh: u32) -> Rect {
+    let (mx0, my0, _, _) = menu_rect(_sw, sh);
+    (mx0 + 16, my0 + ROW_Y0 + i * ROW_PITCH, MENU_W - 32, ROW_H)
 }
 
-/// Recent row `i`.
-fn recent_rect(i: u32, sw: u32, sh: u32) -> Rect {
-    let (mx0, my0, _, _) = menu_rect(sw, sh);
-    (mx0 + 24, my0 + 264 + i * 52, MENU_W - 48, 44)
+/// Console-rules append into a line deque (shared by window lines and the
+/// buffered terminal history): a write continues the open line, only '\n'
+/// breaks (treating every write as a fresh line would shred "$ help" into
+/// two rows). Caps line count (SCROLLBACK) AND line length (MAX_LINE — the
+/// open line is uncapped by the count, so without this any client could
+/// grow one String until the heap dies).
+fn push_text(lines: &mut VecDeque<String>, text: &str) {
+    if lines.back().is_none() {
+        lines.push_back(String::new());
+    }
+    let mut parts = text.split('\n');
+    let head = parts.next().unwrap_or("");
+    if !head.is_empty() {
+        if let Some(last) = lines.back_mut() {
+            let room = MAX_LINE.saturating_sub(last.len());
+            last.push_str(&head[..head.len().min(room)]);
+        }
+    }
+    for part in parts {
+        let mut s = String::from(part);
+        if s.len() > MAX_LINE {
+            s.truncate(MAX_LINE);
+        }
+        lines.push_back(s);
+        while lines.len() > SCROLLBACK {
+            lines.pop_front();
+        }
+    }
 }
 
 fn popup_rect(sw: u32, sh: u32) -> Rect {
@@ -1327,7 +1390,7 @@ fn popup_rect(sw: u32, sh: u32) -> Rect {
 /// sends, which stalled every userland client. Integer ops are native.
 ///
 /// Visual: deep-blue vertical gradient + horizontal tint + 4 soft radial
-/// glows ((1-d²)² falloff) — Win11-bloom vibe. The blue channel stays
+/// glows ((1-d²)² falloff) — soft bloom vibe. The blue channel stays
 /// >= 42 everywhere so the exact-count menu color (24,27,35) and any
 /// cursor-like pixel (>=239 in all channels) can never occur here.
 fn render_wallpaper(w: u32, h: u32) -> Vec<u32> {
@@ -1426,14 +1489,19 @@ fn draw_magnifier(back: &mut Framebuffer, cx: u32, cy: u32, fg: Rgb, bg: Rgb) {
     }
 }
 
-/// Windows-style logo: four squares.
-fn draw_win_logo(back: &mut Framebuffer, x: u32, y: u32, c: Rgb) {
-    for (dx, dy) in [(0u32, 0u32), (11, 0), (0, 11), (11, 11)] {
-        back.fill_rect(x + dx, y + dy, 9, 9, c);
-    }
+/// Start mark: a bold "G" for GreenLime — our own mark.
+fn draw_start_mark(
+    back: &mut Framebuffer,
+    font: &mut FontSystem,
+    sx: u32,
+    sy: u32,
+) {
+    let s = 22.0f32;
+    let tw = font.char_advance('G', s);
+    draw_text_blended(back, font, sx + (SLOT - tw) / 2, sy + 8, "G", s, ACCENT);
 }
 
-/// 40x40 app icon at (x, y): glyph only, no box (tiles draw their own bg).
+/// 40x40 app icon at (x, y): glyph only, no box (rows draw their own bg).
 fn draw_app_icon(back: &mut Framebuffer, font: &mut FontSystem, app: App, x: u32, y: u32) {
     match app {
         App::Terminal => {
@@ -1489,14 +1557,16 @@ fn draw_window(
     let tb = win.title_rect();
     fill_clip(back, r, tb, tbg);
     if focused {
-        // Accent underline (Win11 active-window hint).
+        // Accent underline marks the active window.
         fill_clip(back, r, (tb.0, tb.1 + tb.3 - 2, tb.2, 2), ACCENT);
     }
     if r_inter(r, tb) {
         draw_text(back, font, x + 12, y + 7, &win.title, FONT_PX, TITLE_FG, tbg);
     }
-    // Close button (client windows): neutral, red while hovered.
-    if win.client {
+    // Close button (every window, terminal included): neutral, red while
+    // hovered. The terminal is a system window but closable — the shell
+    // keeps running and it reopens from the launcher with buffered text.
+    {
         let c = win.close_rect();
         let hover = point_in(mx, my, c);
         let cbg = if hover { CLOSE_HOVER } else { CLOSE_BG };
@@ -1562,9 +1632,9 @@ fn draw_lines(
     }
 }
 
-/// Taskbar (Win11 style): centered icon slots — Start logo, magnifier,
-/// one window icon per app (focused = accent underline) — hover fills,
-/// right-aligned two-line tray (uptime clock).
+/// Taskbar (GreenLime style): left-aligned icon slots — G start mark,
+/// magnifier, one window icon per app (focused = accent underline) —
+/// hover fills, right-aligned two-line tray (uptime clock).
 #[allow(clippy::too_many_arguments)]
 fn draw_taskbar(
     back: &mut Framebuffer,
@@ -1603,11 +1673,10 @@ fn draw_taskbar(
             fill_clip(back, r, (sx, sy, SLOT, SLOT), slot_bg);
         }
         match i {
-            0 => draw_win_logo(back, sx + 10, sy + 10, ACCENT),
-            1 => draw_magnifier(back, sx + 17, sy + 16, Rgb(210, 218, 230), slot_bg),
+            0 => draw_start_mark(back, font, sx, sy),
             _ => {
                 // nth window in id order (same mapping as click handling).
-                let target = (i - 2) as usize;
+                let target = (i - 1) as usize;
                 let mut k = 0;
                 let mut wid = None;
                 for id in 0..next_id {
@@ -1629,14 +1698,14 @@ fn draw_taskbar(
                         fill_clip(back, r, (sx + 8, sy + 9, 24, 5), ACCENT_DIM);
                     }
                     if id == focus {
-                        // Win11-style underline under the running app.
+                        // Accent underline under the running app.
                         fill_clip(back, r, (sx + 10, sy + 35, 20, 3), ACCENT);
                     }
                 }
             }
         }
     }
-    // Right tray: two-line uptime clock (Win11 arrangement).
+    // Right tray: two-line uptime clock.
     let (h, m, d) = (secs / 3600, (secs % 3600) / 60, secs / 86400);
     let t1 = alloc::format!("{:02}:{:02}", h, m);
     let t2 = alloc::format!("Day {}", d);
@@ -1669,7 +1738,8 @@ fn draw_taskbar(
     }
 }
 
-/// Start menu: search box, Pinned tiles (filtered), Recent list, footer.
+/// Start menu (left-docked launcher): search box, app rows (filtered),
+/// Recent list, footer.
 #[allow(clippy::too_many_arguments)]
 fn draw_menu(
     back: &mut Framebuffer,
@@ -1678,7 +1748,7 @@ fn draw_menu(
     sw: u32,
     sh: u32,
     search: &[u8],
-    recent: &[App],
+    _recent: &[App],
     mx: u32,
     my: u32,
 ) {
@@ -1707,118 +1777,58 @@ fn draw_menu(
             draw_text_blended(back, font, sb.0 + 36, sb.1 + 10, q, FONT_PX, MENU_FG);
         }
     }
-    // "Pinned" header + static "All apps" hint.
-    if r_inter(r, (mx0 + 24, my0 + 80, 200, 24)) {
+    // "Apps" header.
+    if r_inter(r, (mx0 + 16, my0 + 64, 220, 24)) {
         draw_text(
             back,
             font,
-            mx0 + 24,
-            my0 + 80,
-            "Pinned",
+            mx0 + 16,
+            my0 + 64,
+            "Apps",
             FONT_PX,
             MENU_FG,
             MENU_BG,
         );
-        let hint = "All apps >";
-        let hw: u32 = hint.chars().map(|c| font.char_advance(c, FONT_PX)).sum();
-        draw_text(
-            back,
-            font,
-            mx0 + mw - 24 - hw,
-            my0 + 80,
-            hint,
-            FONT_PX,
-            SUB_FG,
-            MENU_BG,
-        );
     }
-    // Pinned tiles (filtered by the search query, contiguous indices).
-    let mut tile = 0u32;
+    // App rows (filtered by the search query, contiguous indices): icon +
+    // name + chevron. Same order as the click handler's row_rect walk.
+    let mut row = 0u32;
     for (name, app) in APPS {
         if !name_matches(name, search) {
             continue;
         }
-        let t = tile_rect(tile, sw, sh);
-        tile += 1;
+        let t = row_rect(row, sw, sh);
+        row += 1;
         if !r_inter(r, t) {
             continue;
         }
         let hover = point_in(mx, my, t);
         let tbg = if hover { HOVER } else { MENU_BG2 };
         fill_clip(back, r, t, tbg);
-        draw_app_icon(back, font, app, t.0 + (TILE_W - 40) / 2, t.1 + 12);
-        let tw: u32 = name.chars().map(|c| font.char_advance(c, FONT_PX)).sum();
+        draw_app_icon(back, font, app, t.0 + 6, t.1 + 5);
         draw_text(
             back,
             font,
-            t.0 + (TILE_W - tw) / 2,
-            t.1 + 66,
+            t.0 + 56,
+            t.1 + 15,
             name,
             FONT_PX,
             MENU_FG,
             tbg,
         );
-    }
-    // "Recent" header.
-    if r_inter(r, (mx0 + 24, my0 + 236, 200, 24)) {
-        draw_text(
-            back,
-            font,
-            mx0 + 24,
-            my0 + 236,
-            "Recent",
-            FONT_PX,
-            MENU_FG,
-            MENU_BG,
-        );
-    }
-    if recent.is_empty() {
-        if r_inter(r, (mx0 + 24, my0 + 268, 300, 22)) {
-            draw_text(
-                back,
-                font,
-                mx0 + 24,
-                my0 + 268,
-                "No recent items yet",
-                FONT_PX,
-                SUB_FG,
-                MENU_BG,
-            );
-        }
-    } else {
-        for (i, app) in recent.iter().enumerate().take(3) {
-            let rr = recent_rect(i as u32, sw, sh);
-            if !r_inter(r, rr) {
-                continue;
-            }
-            let hover = point_in(mx, my, rr);
-            let rbg = if hover { HOVER } else { MENU_BG2 };
-            fill_clip(back, r, rr, rbg);
-            draw_app_icon(back, font, *app, rr.0 + 4, rr.1 + 2);
-            draw_text(
-                back,
-                font,
-                rr.0 + 56,
-                rr.1 + 13,
-                app.name(),
-                FONT_PX,
-                MENU_FG,
-                rbg,
-            );
-            draw_text(back, font, rr.0 + rr.2 - 24, rr.1 + 13, ">", FONT_PX, SUB_FG, rbg);
-        }
+        draw_text(back, font, t.0 + t.2 - 24, t.1 + 15, ">", FONT_PX, SUB_FG, tbg);
     }
     // Separator + footer (account row).
-    fill_clip(back, r, (mx0 + 24, my0 + 448, mw - 48, 1), Rgb(52, 58, 74));
-    let foot = (mx0, my0 + 464, mw, mh - 464);
+    fill_clip(back, r, (mx0 + 16, my0 + 472, mw - 32, 1), Rgb(52, 58, 74));
+    let foot = (mx0, my0 + 476, mw, mh - 476);
     if r_inter(r, foot) {
         fill_clip(back, r, foot, POPUP_BG);
-        fill_circle(back, mx0 + 48, my0 + 512, 18, Rgb(50, 60, 84));
-        draw_text_blended(back, font, mx0 + 41, my0 + 500, "G", 20.0, ACCENT);
+        fill_circle(back, mx0 + 44, my0 + 512, 14, Rgb(50, 60, 84));
+        draw_text_blended(back, font, mx0 + 37, my0 + 501, "G", 18.0, ACCENT);
         draw_text(
             back,
             font,
-            mx0 + 84,
+            mx0 + 72,
             my0 + 498,
             "GreenLime",
             FONT_PX,
@@ -1828,7 +1838,7 @@ fn draw_menu(
         draw_text(
             back,
             font,
-            mx0 + 84,
+            mx0 + 72,
             my0 + 518,
             "Local account",
             12.0,
@@ -1861,6 +1871,10 @@ fn draw_popup(
             Popup::Settings => "Settings",
         };
         draw_text(back, font, px + 12, py + 7, title, FONT_PX, TITLE_FG, TITLE_BG);
+        // X mark (any click dismisses the dialog; this says so visually).
+        let xb = (px + pw - 32, py + 6, 22, 18);
+        fill_clip(back, r, xb, CLOSE_BG);
+        draw_text(back, font, xb.0 + 6, xb.1 + 1, "X", FONT_PX, TITLE_FG, CLOSE_BG);
     }
     let body = (px + 2, py + 2 + TITLE_H, pw - 4, ph - 4 - TITLE_H);
     if r_inter(r, body) {
@@ -1868,7 +1882,7 @@ fn draw_popup(
         match kind {
             Popup::About => {
                 let lines = [
-                    "GreenLime OS v0.8",
+                    "GreenLime OS v0.9",
                     "modern hybrid kernel, Rust from scratch",
                     "click anywhere to dismiss",
                 ];
@@ -1896,8 +1910,8 @@ fn draw_popup(
                         secs % 60
                     ),
                     alloc::format!("Windows      {} open", nwin),
-                    alloc::format!("Taskbar      centered, {}px", TASKBAR_H),
-                    String::from("GreenLime OS v0.8"),
+                    alloc::format!("Taskbar      left, {}px", TASKBAR_H),
+                    String::from("GreenLime OS v0.9"),
                 ];
                 for (i, line) in lines.iter().enumerate() {
                     draw_text(

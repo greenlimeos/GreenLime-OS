@@ -45,6 +45,13 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, _a2: u64) -> u64 
             ipc::sys_recv(a0 as u32, a1, me)
         }
         Some(Syscall::Kill) => {
+            // GLS-002: kernel servers (pids 0..3) are immortal. No user
+            // task may kill them — VFS/DEV/WINSRV never restart, so this
+            // would be a permanent, shell-typable DoS. (Truncation is
+            // fail-closed: 0x1_0000_0002 still reads as pid 2.)
+            if (a0 as u32) < 3 {
+                return err(greenlime_abi::Error::Denied);
+            }
             if sched::kill_task(a0 as u32) {
                 0
             } else {

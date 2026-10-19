@@ -1,7 +1,7 @@
-//! GreenLime font system (v0.5): TrueType load, glyph cache, framebuffer text.
+//! GreenLime font system: TrueType load, glyph cache, framebuffer text.
 //! no_std + alloc. Glyph outlines via fontdue; layout, cache, blending, and
 //! the framebuffer console contract are ours. Shared by the kernel console
-//! now and the userspace compositor later (v0.7+).
+//! now and the userspace compositor later.
 
 #![no_std]
 

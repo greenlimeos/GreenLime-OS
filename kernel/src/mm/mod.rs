@@ -1,5 +1,5 @@
 //! Physical + virtual memory + kernel heap.
-//! v0.2: PMM from Limine memmap, paging inspection, heap + self-test.
+//! PMM from Limine memmap, paging inspection, heap + self-test.
 
 pub mod heap;
 pub mod pmm;

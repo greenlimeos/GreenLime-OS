@@ -1,6 +1,6 @@
 //! IDT: CPU exceptions (with register dumps) + hardware IRQs.
 //! int3 is self-tested at boot. Page faults print CR2 and halt —
-//! v0.4's VMM will turn those into demand paging instead.
+//! The VMM will turn those into demand paging instead.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Lazy;

@@ -1,7 +1,7 @@
 //! Hybrid servers: start in-kernel, migrate to userspace later.
 //! Each server = init() + handle(msg). Keep logic IPC-shaped from day one.
-//! v0.6: vfs + dev run as kernel tasks on private stacks, blocking in recv.
-//! v0.8: + winsrv (terminal + taskbar, owns the screen after takeover).
+//! vfs + dev run as kernel tasks on private stacks, blocking in recv.
+//! + winsrv (terminal + taskbar, owns the screen after takeover).
 
 pub mod dev;
 pub mod net;

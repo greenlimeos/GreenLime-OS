@@ -1,4 +1,4 @@
-//! greenlime-shell: interactive builtin shell over IPC (v0.8).
+//! greenlime-shell: interactive builtin shell over IPC.
 //! With the GUI terminal (`term0`) it reads canonical lines straight from
 //! the keyboard (dev OP_READ -> winsrv WIN_READ) and mirrors all output to
 //! `serial0` so test harnesses can assert on what actually ran. Headless
@@ -646,7 +646,7 @@ fn interactive(me: u32, fd: u64) -> ! {
     let rep = rpc(PORT_DEV, me, &req, 1);
     let ser = (rep.kind == REPLY_OK).then_some(rep.arg0);
 
-    out(me, fd, ser, b"GreenLime shell v0.9 (interactive) - type help\n");
+    out(me, fd, ser, b"GreenLime shell (interactive) - type help\n");
     if let Some(s) = ser {
         dev_write(me, s, b"[shell] interactive ready\n");
     }
@@ -668,7 +668,7 @@ fn interactive(me: u32, fd: u64) -> ! {
 
 /// Headless fallback: scripted demo (no input path on serial0).
 fn scripted(me: u32, fd: u64) -> ! {
-    dev_write(me, fd, b"GreenLime shell v0.6 (scripted)\n");
+    dev_write(me, fd, b"GreenLime shell (scripted)\n");
     for line in [
         &b"help"[..],
         &b"echo hi from GreenLime shell"[..],

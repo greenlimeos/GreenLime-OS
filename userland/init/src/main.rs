@@ -1,6 +1,6 @@
 //! greenlime-init (PID 1): first ring-3 program on GreenLime OS.
 //! Static, no_std, talks to the kernel ONLY via raw syscalls.
-//! Entry: _start with the kernel-provided stack. No args, no env (v0.5).
+//! Entry: _start with the kernel-provided stack. No args, no env.
 
 #![no_std]
 #![no_main]

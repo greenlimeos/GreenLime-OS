@@ -72,7 +72,7 @@ unsafe fn kmain() -> ! {
     ipc::init();
     syscall::init();
 
-    kprintln!("\n[boot] GreenLime OS v0.1.0 — hybrid kernel");
+    kprintln!("\n[boot] GreenLime OS — hybrid kernel");
     kprintln!("[kernel] kernelspace online | scheduler + ipc live");
     boot::boot_info();
 

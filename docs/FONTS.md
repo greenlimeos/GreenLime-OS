@@ -46,7 +46,7 @@ pyftsubset assets/fonts/work.ttf \
 ```
 
 Keep your full font as `assets/fonts/<Name>-full.ttf` (also ignored).
-The GUI (v0.8) gets a **lazy on-demand loader** for the full file, so this
+The GUI gets a **lazy on-demand loader** for the full file, so this
 subset is console-only and temporary by design.
 
 ## How the system fits together

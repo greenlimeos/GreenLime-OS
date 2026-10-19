@@ -9,7 +9,7 @@ use spin::Mutex;
 
 pub const FRAME_SIZE: u64 = 4096;
 /// Bitmap covers first 4 GiB (1M frames = 128 KiB static). Frames above are
-/// left reserved; QEMU gives us ~512 MiB, real PCs rarely need more for v0.2.
+/// left reserved; QEMU gives us ~512 MiB, real PCs rarely need more.
 const MAX_FRAMES: usize = 1024 * 1024;
 const BITMAP_BYTES: usize = MAX_FRAMES / 8;
 

@@ -1,4 +1,4 @@
-/* greenlime-demo — user ELF, loaded at 0x400000 like init/shell (v0.6). */
+/* greenlime-demo — user ELF, loaded at 0x400000 like init/shell. */
 ENTRY(_start)
 OUTPUT_FORMAT(elf64-x86-64)
 

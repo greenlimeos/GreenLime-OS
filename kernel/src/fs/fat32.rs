@@ -36,7 +36,7 @@ impl Fat32 {
         }
         let bps = le16(&sec, 11);
         if bps != 512 {
-            return None; // v0.7 supports 512-byte sectors only
+            return None; // supports 512-byte sectors only
         }
         let spc = sec[13];
         let reserved = le16(&sec, 14) as u32;

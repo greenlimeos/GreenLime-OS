@@ -23,7 +23,7 @@ drivers/pci.rs                             config-space scanner + class names
 
 Legacy (port I/O, single PFN queue) is ~350 lines and QEMU still provides
 it on transitional `virtio-blk-pci` devices. Modern (capabilities, MSI-X)
-is the v0.8+ upgrade path when input/net devices need it too.
+is the upgrade path when input/net devices need it too.
 
 ## Why polling, not interrupts?
 
@@ -56,5 +56,5 @@ blank-ish disk first and never reaches the CD).
 * AHCI full driver: controller is detected + reported by the PCI scan;
   read path stays virtio-blk until real-hardware work starts.
 * virtio-input (keyboard/mouse): PS/2 scancodes still cover v0.7; a real
-  event queue belongs with the v0.8 GUI input loop.
+  event queue belongs with the GUI input loop.
 * ext2: FAT32 covers the test story; second FS when something needs it.

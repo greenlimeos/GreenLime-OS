@@ -21,7 +21,7 @@ struct RamFile {
 static FILES: &[RamFile] = &[
     RamFile {
         path: "/motd.txt",
-        data: b"Welcome to GreenLime OS v0.6 - hybrid IPC online.\n",
+        data: b"Welcome to GreenLime OS - hybrid IPC online.\n",
     },
     RamFile {
         path: "/hello.txt",

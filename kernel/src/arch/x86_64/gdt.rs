@@ -112,7 +112,7 @@ pub fn kernel_code_selector() -> SegmentSelector {
     GDT.1.code
 }
 
-#[allow(dead_code)] // v0.5+: per-CPU SYSCALL targets
+#[allow(dead_code)] // per-CPU SYSCALL targets
 pub fn kernel_data_selector() -> SegmentSelector {
     GDT.1.data
 }

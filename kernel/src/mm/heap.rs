@@ -1,6 +1,6 @@
 //! Kernel heap: 16 MiB static buffer + linked-list allocator.
 //! Lets the kernel use Box/Vec. The TTF font copy + parsed outlines live
-//! here too (lazy full-font loading in v0.8 will shrink this pressure).
+//! here too (lazy full-font loading will shrink this pressure).
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;

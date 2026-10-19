@@ -1,5 +1,5 @@
 //! Storage bring-up (runs after mm: needs PMM frames + heap).
-//! PCI scan -> virtio-blk claim. Single disk for v0.7.
+//! PCI scan -> virtio-blk claim. Single disk.
 
 use crate::drivers::{pci, virtio_blk};
 use crate::kprintln;

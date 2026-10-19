@@ -109,7 +109,7 @@ pub fn boot_info() {
             .map(|e| e.length)
             .sum();
         kprintln!("[boot] usable RAM: {} MiB", usable / 1024 / 1024);
-        // v0.2: hand `resp` to mm::pmm::init_from_limine().
+        // hand `resp` to mm::pmm::init_from_limine().
     } else {
         kprintln!("[boot] no memory map!");
     }

@@ -1,6 +1,6 @@
 //! Virtual Memory Manager: inspects Limine-built paging, translates addresses.
 //! Limine already runs us paged (higher half + HHDM). Full map/unmap and
-//! per-process tables land in v0.4 — that needs the IDT (v0.3) so a bad
+//! per-process tables are here — they need the IDT so a bad
 //! mapping reports a page fault instead of triple-faulting QEMU.
 
 use core::sync::atomic::{AtomicU64, Ordering};

@@ -1,4 +1,4 @@
-/* greenlime-init — user ELF, loaded at 0x400000 by the kernel (v0.4).
+/* greenlime-init — user ELF, loaded at 0x400000 by the kernel.
  * Same 4K discipline as the kernel: Limine-style loaders aren't involved
  * here, but our own mapper assigns one permission set per page.
  */

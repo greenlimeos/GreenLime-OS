@@ -87,7 +87,7 @@ pub struct Task {
     pub kind: TaskKind,
     /// Page-table phys frame for this context (kernel table or user table).
     /// Restored on EVERY switch: resuming a kstack frame means nothing
-    /// without its address space (v0.6 lesson).
+    /// without its address space (lesson).
     pub cr3: u64,
     /// Kernel-stack resume point (valid once the task has run).
     pub saved_rsp: u64,
@@ -477,7 +477,7 @@ pub extern "x86-interrupt" fn ap_tick(
 /// Timer-tick check. Called from IRQ context (IF clear) AFTER the EOI.
 /// Option B "safe-point preemption": the tick NEVER switches context from
 /// IRQ (the old park-here path produced the splice-corruption class found
-/// live in v0.9 — rogue parked-scheduler frames). Instead it does exactly
+/// live — rogue parked-scheduler frames). Instead it does exactly
 /// two things: (1) run the double-claim watchdog (Task.owner cross-CPU
 /// check — the strongest probe for the splice class, stays armed), and
 /// (2) raise this CPU's need_resched flag. Consumed by the current task at

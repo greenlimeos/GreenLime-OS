@@ -1,4 +1,4 @@
-//! greenlime-demo: the window server's second client (v0.8 multi-window).
+//! greenlime-demo: the window server's second client (multi-window).
 //! Opens its own window via WIN_CREATE, echoes every key it receives while
 //! focused (console rules), and mirrors completed lines to serial as
 //! `[demo] got: ...` — harnesses prove keyboard focus routing by typing

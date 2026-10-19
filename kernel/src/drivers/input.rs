@@ -117,7 +117,7 @@ fn mouse_cmd(cmd: u8) -> bool {
 /// Enable the AUX port + mouse streaming. Keyboard keeps working regardless.
 pub fn init() {
     // Unmask cascade (IRQ2) + timer + keyboard on master, mouse on slave.
-    // Forgetting the cascade bit silently eats all slave IRQs (v0.8 lesson).
+    // Forgetting the cascade bit silently eats all slave IRQs (lesson).
     unsafe {
         pic::PICS.lock().write_masks(0xF8, 0xEF);
     }

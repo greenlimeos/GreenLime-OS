@@ -1,4 +1,4 @@
-//! x86_64 arch backend. v0.3: real GDT/IDT/PIC, interrupts enabled by kmain.
+//! x86_64 arch backend: real GDT/IDT/PIC, interrupts enabled by kmain.
 
 pub mod gdt;
 pub mod idt;

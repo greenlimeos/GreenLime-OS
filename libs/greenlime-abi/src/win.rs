@@ -1,4 +1,4 @@
-//! Window server protocol (PORT_WINSRV). v0.8: multi-window desktop.
+//! Window server protocol (PORT_WINSRV). Multi-window desktop.
 //! Terminal ops (1/2) go through the DEV server as `term0`; client-window
 //! ops (3..6) are sent to PORT_WINSRV directly by windowed clients.
 //! Payloads are UTF-8 text; cells, pixels, and drag events come later.

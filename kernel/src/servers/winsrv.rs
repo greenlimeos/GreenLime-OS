@@ -1,4 +1,4 @@
-//! Window server (kernel task, v0.8): owns the screen after fb takeover.
+//! Window server (kernel task): owns the screen after fb takeover.
 //! Damage-rect compositor over a back buffer: state changes invalidate
 //! rects; each lap composes ONLY the damage into the back buffer (layers
 //! in z-order: wallpaper desktop, windows, taskbar, start menu, popup)

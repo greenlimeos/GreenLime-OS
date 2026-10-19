@@ -1,0 +1,12 @@
+[package]
+name = "greenlime-fuzz"
+version.workspace = true
+edition.workspace = true
+description = "GreenLime syscall fuzzer (ring 3, deliberately unprivileged — v1.0 hardening)"
+
+[[bin]]
+name = "greenlime-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-abi = { workspace = true }

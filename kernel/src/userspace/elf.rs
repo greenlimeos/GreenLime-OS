@@ -87,6 +87,15 @@ pub fn load(image: &[u8], hhdm: u64) -> LoadedInit {
 
         let writable = p_flags & 0x2 != 0;
         let executable = p_flags & 0x1 != 0;
+        // W^X policy (v1.0 hardening): a segment that is BOTH writable and
+        // executable is a ROP staging area by construction. The loader
+        // refuses rather than mapping it — real kernels ship text R+X and
+        // data RW; ours are baked at build, so this stays loud-but-dead.
+        assert!(
+            !(writable && executable),
+            "[wrx] RWE segment in user image (vaddr {:#x}) — refused",
+            p_vaddr
+        );
         // GLS-008: wraparound here maps the wrong pages (release wraps).
         let last_byte = if p_memsz == 0 {
             p_vaddr // empty segment: maps nothing, loop below is empty

@@ -51,11 +51,21 @@ unsafe fn kmain() -> ! {
     // 6. Memory: PMM from Limine map, paging check, self-tests.
     mm::init();
 
+    // 6b. IOAPIC + LAPIC: route device IRQs and map the LAPIC page (B3).
+    arch::ioapic::init();
+    arch::lapic::init();
+
     // 7. Storage: PCI scan, virtio-blk claim (needs PMM + heap).
     drivers::storage::init();
 
     // 7b. Absolute pointer (virtio-tablet): host/guest cursor sync.
     drivers::virtio_input::init();
+
+    // 7c. Network card (virtio-net, Phase B): probe + queues, no traffic yet.
+    drivers::virtio_net::init();
+
+    // 7d. Driver registry report (model online; IRQ dispatch lands in B3).
+    drivers::report();
 
     // 8. Core hybrid primitives.
     sched::init();
@@ -66,13 +76,22 @@ unsafe fn kmain() -> ! {
     kprintln!("[kernel] kernelspace online | scheduler + ipc live");
     boot::boot_info();
 
+    // 8b. SMP: start APs (each prints + parks; bounded wait, fail-soft).
+    arch::smp::init();
+
     // Go live: timer ticks + keyboard from here on.
     arch::enable_interrupts();
 
     // Spawn servers (kernel tasks) + init/shell (user tasks), then schedule.
     // scheduler_loop never returns; tasks come back to it on yield/block.
+    // Net spawns last so shell/demo keep pids 3/4/5 (net takes 6).
     servers::init();
     userspace::spawn_all();
+    servers::spawn_net();
+    // Task 7, last by design: net owns slot 6 (ABI-baked into sender checks;
+    // see servers/net.rs), the fuzzer soaks in the final slot.
+    userspace::spawn_fuzz();
+    userspace::spawn_wallpaper();
     kprintln!("[kernel] entering scheduler...");
     sched::scheduler_loop();
 }

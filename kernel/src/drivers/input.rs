@@ -156,4 +156,7 @@ pub fn init() {
         "[drivers] input: keyboard ring live, mouse {}",
         if ok { "streaming" } else { "off" }
     );
+    // Driver model: PS/2 keyboard (IRQ1) + AUX mouse (IRQ12).
+    super::register("ps2-kbd", Some(1));
+    super::register("ps2-mouse", Some(12));
 }

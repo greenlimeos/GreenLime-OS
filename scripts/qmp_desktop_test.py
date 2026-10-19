@@ -108,22 +108,24 @@ def main():
         print("waiting for idle...", flush=True)
         wait_idle(SER)
         print("idle. cursor starts at screen center (640,400).", flush=True)
-        # Start mark center = (28, 776): left-aligned slots ->
-        # slot0 = 8..48. Cursor starts at (640, 400).
-        move(-612, 376)
+        # Start slot center = (616, 776): the demo (and Files) window opens
+        # at boot, so the dock pill holds 2 windows: w = 24+48*2 = 120,
+        # pill_x = 640-60 = 580, slot0 (Start) center = 580+36 = 616.
+        move(-24, 376)
         time.sleep(2)
         click()  # open menu
         shot("dist/fb-menu.ppm")
         print("menu shot taken", flush=True)
-        # About row center = (208, 487): left-docked panel (8,196,400,540),
-        # app row 3 at y=462..512, full-width row x=24..392.
-        move(180, -289)
+        # Pinned About tile center = (830, 450): card at (360,304) size
+        # (560,436); grid row 0 y=404; tile 4 x=384+4*100 → center (830,450).
+        # From the Start slot (616,776): move right 214, up 326.
+        move(214, -326)
         time.sleep(2)
         click()  # open About
         shot("dist/fb-about.ppm")
         print("about shot taken", flush=True)
-        # Dismiss: click desktop at (900, 300) — right of the panel.
-        move(692, -187)
+        # Dismiss: click desktop at (1000, 300) — outside the card.
+        move(170, -150)
         time.sleep(2)
         click()
         shot("dist/fb-dismissed.ppm")
@@ -183,16 +185,17 @@ def main():
                     n += 1
         return n
 
-    # Start-menu panel: exact MENU_BG (24, 27, 35) inside the panel rect
-    # (8,196)-(408,736). The wallpaper's blue channel stays >= 42 and
-    # window text never blends to (24,27,35), so only the panel matches.
+    # Start-menu card solid tiles: exact MENU_BG2 (52,56,64) across the
+    # pinned-tile row (360,304)-(920,740) card. Only the tiles + search
+    # pill use that color — the acrylic background varies per-pixel.
     def panel_px(path):
-        return count_color(path, (8, 196, 408, 736), (24, 27, 35))
+        return count_color(path, (384, 404, 896, 516), (52, 56, 64))
 
-    # Popup titlebar strip: exact TITLE_BG (38, 44, 58) at
-    # (412,297)-(868,325) — only the About/Settings dialog draws there.
+    # Popup titlebar strip: exact TITLE_BG (44,46,52) at
+    # (410,295)-(842,325) — only the About/Settings dialog draws there
+    # (close button excluded from the box).
     def popup_px(path):
-        return count_color(path, (412, 297, 868, 325), (38, 44, 58))
+        return count_color(path, (410, 295, 842, 325), (44, 46, 52))
 
     m_menu = panel_px("dist/fb-menu.ppm")
     m_about = panel_px("dist/fb-about.ppm")
@@ -203,7 +206,7 @@ def main():
     print(f"menu panel px: menu={m_menu} about={m_about} dismissed={m_gone}")
     print(f"popup titlebar px: menu={p_menu} about={p_about} dismissed={p_gone}")
     ok = True
-    if m_menu < 50000:
+    if m_menu < 30000:
         print("FAIL: start menu did not open")
         ok = False
     else:

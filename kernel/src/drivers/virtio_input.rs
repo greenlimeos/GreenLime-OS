@@ -12,6 +12,7 @@
 //! Buffers stay stocked: QEMU's virtio_input_send drops an entire report
 //! when it can't pop a buffer at SYN_REPORT time.
 
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::boot;
@@ -427,7 +428,11 @@ static TABLET: Mutex<Option<Tablet>> = Mutex::new(None);
 pub fn init() {
     let devs = pci::scan();
     match Tablet::probe(&devs) {
-        Some(t) => *TABLET.lock() = Some(t),
+        Some(t) => {
+            *TABLET.lock() = Some(t);
+            // Driver model: modern virtio-tablet, polled until B3.
+            super::register("virtio-tablet", None);
+        }
         None => kprintln!("[drivers] virtio-tablet: none (PS/2 mouse only)"),
     }
 }
@@ -449,13 +454,17 @@ pub fn events_pending() -> bool {
     unsafe { core::ptr::read_volatile(t.used_idx_ptr()) != t.last_used }
 }
 
-/// Drain queued events. Some((x, y, buttons)) when a complete report
-/// (SYN_REPORT) landed since the last call. Normalized: x/y in 0..32767,
-/// buttons bit0 = left, bit1 = right, bit2 = middle.
-pub fn poll() -> Option<(u16, u16, u8)> {
+/// Drain queued events. Returns one entry per complete report (SYN_REPORT)
+/// seen since the last call: (x, y, buttons) normalized to 0..32767,
+/// bit0 = left. Returns one entry per report so a press+release that QEMU
+/// batches into a single drain both surface — winsrv's pointer() detects
+/// the press edge on the first entry and clicks.
+pub fn poll() -> Vec<(u16, u16, u8)> {
     let mut guard = TABLET.lock();
-    let t = guard.as_mut()?;
-    let mut report = false;
+    let Some(t) = guard.as_mut() else {
+        return Vec::new();
+    };
+    let mut reports: Vec<(u16, u16, u8)> = Vec::new();
     let mut consumed = false;
     unsafe {
         let used_idx = core::ptr::read_volatile(t.used_idx_ptr());
@@ -468,7 +477,9 @@ pub fn poll() -> Option<(u16, u16, u8)> {
             let etype = core::ptr::read_volatile(ev as *const u16);
             let ecode = core::ptr::read_volatile((ev + 2) as *const u16);
             let eval = core::ptr::read_volatile((ev + 4) as *const u32) as i32;
-            report |= t.handle(etype, ecode, eval);
+            if t.handle(etype, ecode, eval) {
+                reports.push((t.cur[0], t.cur[1], t.btn));
+            }
             // Recycle immediately: a starved avail ring = dropped reports.
             let idx = core::ptr::read_volatile(t.avail_idx_ptr());
             core::ptr::write_volatile(
@@ -489,9 +500,5 @@ pub fn poll() -> Option<(u16, u16, u8)> {
             );
         }
     }
-    if report {
-        Some((t.cur[0], t.cur[1], t.btn))
-    } else {
-        None
-    }
+    reports
 }

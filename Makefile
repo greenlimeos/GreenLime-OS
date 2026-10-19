@@ -16,12 +16,12 @@ LIMINE_DIR ?= $(HOME)/limine
 .PHONY: build iso run run-uefi run-nographic debug diag clean check build-release iso-release run-release disk
 
 build:
-	cargo +nightly build -p greenlime-init -p greenlime-shell -p greenlime-demo --target x86_64-unknown-none
+	cargo +nightly build -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper --target x86_64-unknown-none
 	cargo +nightly build -p greenlime-kernel --target x86_64-unknown-none
 	cp $(CARGO_TARGET_DIR)/x86_64-unknown-none/debug/greenlime-kernel $(KERNEL_ELF)
 
 build-release:
-	cargo +nightly build --release -p greenlime-init -p greenlime-shell -p greenlime-demo --target x86_64-unknown-none
+	cargo +nightly build --release -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper --target x86_64-unknown-none
 	cargo +nightly build --release -p greenlime-kernel --target x86_64-unknown-none
 	cp $(CARGO_TARGET_DIR)/x86_64-unknown-none/release/greenlime-kernel $(KERNEL_ELF_RELEASE)
 
@@ -42,9 +42,9 @@ run-release: iso-release
 	bash scripts/run-qemu.sh bios $(ISO_RELEASE)
 
 check:
-	cargo +nightly build -p greenlime-init -p greenlime-shell -p greenlime-demo --target x86_64-unknown-none
+	cargo +nightly build -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper --target x86_64-unknown-none
 	cargo +nightly check -p greenlime-kernel --target x86_64-unknown-none
-	cargo check -p greenlime-abi -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-font
+	cargo check -p greenlime-abi -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper -p greenlime-font
 
 iso: build
 	mkdir -p iso_root/boot dist

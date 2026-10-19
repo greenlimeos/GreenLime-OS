@@ -1,18 +1,24 @@
 # GreenLime OS 🟢🍋
 
 A from-scratch operating system in Rust — custom x86-64 hybrid kernel,
-composited GUI desktop (LimeDE), IPC, and ring-3 userland. Long-term goal:
-compete with Windows 11.
+composited GUI desktop (LimeDE), IPC, ring-3 userland, SMP, and a ring-3
+network stack. Long-term goal: compete with Windows 11.
 
-> Status: **v0.9** ✅ — boots via Limine into the LimeDE desktop:
-> left-aligned taskbar with G start mark, left-docked launcher menu,
-> on-demand terminal, wallpaper, draggable windows, demo app.
+> Status: **v1.0** ✅ — the 1.0 line (made by GLM 5.3) brings SMP, ring-3
+> networking (DHCP/ICMP/DNS/TCP) and the Fluent-dark desktop: wallpaper
+> streamed by a userspace service, Files app, quick-settings flyout,
+> rounded acrylic windows with soft shadows and animations. The earlier
+> boot→GUI phases (v0.1–v0.9) are the groundwork the same tree builds on.
+> Boots via Limine into a dark acrylic desktop over your own wallpaper:
+> floating dock/tray pills, centered Start card with pinned tiles and
+> quick-settings flyout, draggable/maximizable rounded windows, Files
+> explorer, DHCP+ICMP+DNS+TCP networking.
 
-> 🤖 **Built with AI:** every line of this OS — kernel, servers, userland,
-> docs — was written with AI assistance using
-> [OpenCode](https://github.com/sst/opencode) powered by **Muse Spark**,
-> with a human driving architecture, testing every milestone in QEMU, and
-> reviewing each change.
+> 🤖 **Made by GLM 5.3:** every line of this OS — kernel, servers,
+> userland, docs — was written by **GLM 5.3** (the AI model) through
+> [OpenCode](https://github.com/sst/opencode), with a human driving
+> architecture, running every milestone in QEMU, and reviewing each
+> change before it landed.
 
 ## Contents
 
@@ -58,8 +64,9 @@ make run-release
 
 What happens: everything compiles, `dist/GreenLime-release.iso` is baked,
 and a QEMU window opens. You'll see the Limine menu → kernel boot log on
-serial → the LimeDE desktop. Your host cursor stays visible and the guest
-cursor tracks it 1:1 (virtio-tablet seamless pointer, no grab).
+serial → the LimeDE desktop with your wallpaper streamed in by the
+userspace service. Your host cursor stays visible and the guest cursor
+tracks it 1:1 (virtio-tablet seamless pointer, no grab).
 
 When you're done, close the QEMU window (or `Ctrl+C` the terminal) and the
 full serial log prints at the end for copy-paste bug reports.
@@ -76,63 +83,83 @@ full serial log prints at the end for copy-paste bug reports.
 
 ## Using the desktop
 
-- **Mouse:** point, click, drag window titlebars (or the 16px grip). No
-  pointer grab, no `Ctrl+Alt+G` — it just works.
-- **Taskbar:** left-aligned G mark and one slot per window; accent
-  underline marks the focused app; right-side tray shows an uptime clock
-  (`HH:MM` + `Day N`).
-- **Start menu:** click the G → 400×540 launcher with search box (type to
-  filter, Enter launches, Esc closes), vertical app rows, footer account.
-  Clicks outside the panel dismiss it.
-- **Terminal:** launch it from the menu (it never opens at boot), then
-  type `help`. Builtins: `help echo cat ps kill ls exit`. Full line
-  editing. Its ✕ button closes it; reopening restores buffered text.
+- **Mouse:** point, click, drag window titlebars (or the 16px grip), or
+  double-click a titlebar to maximize. No pointer grab, no `Ctrl+Alt+G` —
+  it just works.
+- **Taskbar strip:** three floating pills — left **weather**, centered
+  **dock** (start mark + one slot per window, focus = accent LED), right
+  **tray** (Wi-Fi/speaker/battery glyphs + real RTC clock `HH:MM` +
+  `Day N`).
+- **Start menu:** click the start mark → 560×436 acrylic card: greeting
+  header, 5 pinned tiles (Files / Terminal / Demo / Settings / About),
+  search pill (type to filter, Enter launches, Esc closes). Clicks
+  outside dismiss.
+- **Quick settings:** click the tray → acrylic flyout with 2×2 toggles
+  (Wi-Fi / Bluetooth / Night light / Battery saver) and click-to-set
+  volume + brightness sliders; "All settings" opens Settings. One
+  flyout at a time, outside-click dismiss.
+- **Terminal:** launch from the menu (never opens at boot). Builtins:
+  `help echo cat ps kill ls exit`, plus ring-3 network tools `ping` and
+  `fetch` through the IPC net broker. Its ✕ closes it; reopening
+  restores buffered text.
+- **Files:** launch from the menu — the explorer window lists the
+  filesystem with folder glyphs; click a directory to enter, `../` pops
+  back.
 - **Windows:** focus follows clicks, `WIN_CREATE` never steals focus,
-  ✕ button closes. The demo app opens a window by itself at boot.
-- **Popups:** About and Settings dialogs (X mark, any click dismisses),
-  centered 460×210.
+  ✕ closes, rounded corners + soft shadows throughout. Windows, the
+  menu, popups and the flyout all open with a 120 ms fade+rise.
+- **Popups:** About and Settings dialogs, centered 460×210, X mark, any
+  click dismisses.
 
 ## Architecture
 
 ```
 Limine → kernel (ring 0) → servers (kernel tasks) → userland (ring 3) → LimeDE
+.clients ──► desktop over IPC: windows, terminal, files, net broker, wallpaper
 ```
 
-Hybrid kernel: microkernel-style IPC + servers for structure, monolith-style
-speed (servers start as kernel tasks and can migrate to userspace later).
-Fixed task map: kernel tasks `0=vfs, 1=dev, 2=winsrv`; user tasks
-`3=init, 4=shell, 5=demo`. Max 8 tasks. Strict rule: `kernel/` may use
-`unsafe` + privileged instructions; `libs/*` + `userland/*` are safe-only
-and reach the kernel only through syscalls/IPC. Kernel memory is never
-mapped into user page tables.
+Hybrid kernel: microkernel-style keyed IPC + servers for structure,
+monolith-style speed (servers start as kernel tasks and can migrate to
+userspace later). Task map: kernel tasks `0=vfs, 1=dev, 2=winsrv, 6=net`;
+user tasks `3=init, 4=shell, 5=demo, 7=fuzz, 8=wallpaper` (max 9).
+`kernel/` may use `unsafe` + privileged instructions; `libs/*` +
+`userland/*` are safe-only and reach the kernel only through
+syscalls/IPC. Kernel memory is never mapped into user page tables (SMP
+rings keep their IRQ-stack PTEs mapped in every user CR3).
 
 ## Kernel
 
 - **Boot** (`boot.rs`): Limine requests for framebuffer (1280×800×32),
   memory map, HHDM, stack. Paging comes up with `cr3` level 4.
-- **arch/x86_64**: GDT (kcode/kdata/ucode/udata + TSS), IDT
+- **SMP**: AP startup via Limine MP (`arch/x86_64/smp.rs`), LAPIC +
+  IPIs, per-CPU TSS (own RSP0 + double-fault IST), per-CPU LAPIC timers
+  (PIT-calibrated) with safe preemption (EOI-first, need_resched flag
+  consumed at a safe point).
+- **arch/x86_64**: GDT (kcode/kdata/ucode/udata + per-CPU TSS), IDT
   (breakpoint/UD/PF/GP/DF + timer/keyboard IRQs), masked PIC, PIT @100Hz,
   verified SMEP + SMAP, `SYSCALL`/`SYSRET` gate with IF masked.
 - **Memory**: PMM frame allocator (4 KiB frames, ~126k free on 512M),
-  16 MiB static heap (`LockedHeap`), VMM with per-task user tables.
+  16 MiB static heap (`LockedHeap`), VMM with per-task user tables,
+  W^X enforced (ELF refuses W+X), KASLR seed (per-task stack jitter).
   1 GiB pages unsupported (detected, refused).
-- **Scheduler**: cooperative, task states Ready/Blocked(port)/Dead,
-  block/wake on IPC ports, `ps` snapshots.
-- **Syscall gate**: SystemV trampoline (`num, a0, a1, a2`), runs on the
-  caller's private kernel stack. Unknown numbers and rejected calls return
-  `u64::MAX`. User buffers are range-checked (`checked_add`, lower-half
-  only, length caps), copied under a STAC/SMAP window, then used from the
-  kernel copy.
+- **Scheduler**: cooperative core, task states Ready/Blocked/Dead,
+  block/wake on IPC ports, per-CPU run state via GS anchoring;
+  `ps` snapshots.
+- **Syscall gate**: SystemV trampoline, runs on the caller's private
+  64 KiB kernel stack. Unknown numbers and rejected calls return
+  `u64::MAX`. User buffers are range-checked *and page-probed*, copied
+  under a STAC/SMAP window, then used from the kernel copy.
 - **ELF loader** (`userspace/elf.rs`): static `ET_EXEC` x86-64 only,
   maps each `PT_LOAD` into a fresh address space, enforces user-half,
   image-bounds, and non-empty segment set. Images are embedded at build
   time via `build.rs`.
 - **Console**: serial COM1 + framebuffer TTF console (framebuffer handed
-  to winsrv once the desktop paints).
+  to winsrv once the desktop paints). Supervisor faults print a 32-word
+  stack dump + task table before halting (forensics by design).
 
 ## System calls
 
-ABI v3, frozen numbers (add, never reuse) — `libs/greenlime-abi/src/syscall.rs`:
+ABI v6, frozen numbers (add, never reuse) — `libs/greenlime-abi/src/syscall.rs`:
 
 | # | Name | Args | Returns |
 |---|---|---|---|
@@ -143,15 +170,17 @@ ABI v3, frozen numbers (add, never reuse) — `libs/greenlime-abi/src/syscall.rs
 | 4 | `IpcRecv` | port (must be own), buf ptr | 0 / `MAX` |
 | 5 | `Kill` | pid | 0 / error |
 | 6 | `GetPid` | — | pid |
+| 7 | `Park` | — | sleeps to the next tick (fuzzer pacing) |
 
 ## IPC
 
 Port-based, fixed-size messages (`libs/greenlime-abi/src/ipc.rs`):
 
 - **24 ports**: mailboxes `0–7` (task N owns port N), services
-  `PORT_VFS=16`, `PORT_DEV=17`, `PORT_WINSRV=19`. Queue depth 16 per port.
+  `PORT_VFS=16`, `PORT_DEV=17`, `PORT_NET=18`, `PORT_WINSRV=19`.
+  Queue depth 16 per port.
 - **`Message`**: `kind u32`, `sender u32` (**kernel-stamped, unforgeable**),
-  `arg0/arg1 u64`, `len u32`, `payload [u8; 240]` (`MAX_PAYLOAD=240`).
+  `arg0/arg1 u64`, `len u32`, `payload [u8; 2048]` (`MAX_PAYLOAD=2048`).
 - Semantics: send blocks on full, recv blocks on empty; `try_recv` polling
   so one slow client can't wedge a server; every mutation wakes port
   waiters (spurious wakeups are harmless — waiters retry).
@@ -161,30 +190,41 @@ Port-based, fixed-size messages (`libs/greenlime-abi/src/ipc.rs`):
 All loop forever on their service port, replying to the kernel-stamped sender.
 
 - **vfs** — ramfs (`/motd.txt`, `/hello.txt`), FAT32 `/disk`, live `/ps`
-  task list. `OPEN path → handle`, `READ/WRITE/CLOSE` by u64 handle,
-  `READDIR`, `PING` (magic `0x50494E47`). Offsets clamped, reads chunked
-  at 200 bytes, unknown paths/closes get `REPLY_ERR`.
+  task list. `OPEN/READ/WRITE/CLOSE` by owner-checked handle, `READDIR`,
+  `PING`.
 - **dev** — `serial0` (unified console) and `term0` (GUI terminal) as
-  files. term0 writes forward to winsrv fire-and-forget; term0 reads relay
-  `WIN_READ` and block until a full line is typed.
-- **winsrv** — window server + compositor (see LimeDE below). Protocol:
-  `WIN_WRITE` (terminal text), `WIN_READ` (canonical terminal input),
-  `WIN_CREATE` (payload = title → window id), `WIN_CLIENT_WRITE`,
-  `WIN_CLIENT_READ` (per-window key stream), `WIN_DESTROY`.
+  files. term0 writes forward to winsrv; term0 reads relay `WIN_READ`
+  and block until a full line is typed.
+- **winsrv** — desktop compositor (see LimeDE below). Protocol:
+  `WIN_WRITE`, `WIN_READ`, `WIN_CREATE`, `WIN_CLIENT_*`, `WIN_DESTROY`,
+  and the wallpaper service: `WIN_WALL_SETUP/ROWS/DONE` — task 8 streams
+  decoded JPEG rows through the IPC gate and the kernel converts + blits
+  (it never parses image bytes).
+- **net** — ABI net broker on `PORT_NET` (tagged protocol over the same
+  frozen IPC gate): NET_OPEN/SENDTO/RESOLVE/CLOSE for UDP,
+  NET_CONNECT/SEND/RECV/CLOSE for TCP (polls to ESTABLISHED, streaming
+  in 218-byte chunks, peer FIN → NET_EOF), NET_PING. smoltcp runs only
+  in the kernel net task; leaky sockets, forged senders and duplicate
+  ports all get refused.
 
 ## Drivers
 
 - **serial**: COM1, unified console + log mirror.
 - **input**: PS/2 keyboard (scancode ring, IRQ1) + PS/2 mouse bytes
   (drained and discarded whenever the tablet is present).
-- **virtio-tablet** (modern, MMIO caps walk): event queue 64 bufs,
+- **virtio-tablet** (modern MMIO caps transport): event queue 64 bufs,
   absolute `0..32767` → exact screen pixels, polled with buffer recycling.
   This is what makes the cursor track 1:1.
 - **virtio-blk**: queue 256, up to 65536 sectors of 512 B, block
   read/write for the FAT32 disk.
+- **virtio-net**: legacy-transport devices with MSI-X IRQ-driven RX/TX
+  wake (entry 0 → vector 0x40, both queue vectors wired; INTx fallback
+  via the q35 PIRQ router kept as backup).
+- **rtc**: boot time + minute-of-day (feeds the tray clock, "Day N" and
+  the start-card greeting).
 - **pci**: full bus enumeration (host bridge, `1234:1111` display,
-  `8086:10d3` network, virtio input/blk, ISA bridge, AHCI (detected),
-  SMBus). AHCI driver proper is future work.
+  virtio input/blk/net, ISA bridge, AHCI (detected), SMBus). AHCI driver
+  proper is future work.
 - **fb**: VBE framebuffer driver, `Framebuffer::from_raw`, handed over
   to winsrv at `[winsrv] desktop painted`.
 
@@ -195,39 +235,53 @@ Read-only FAT32 (`kernel/src/fs/fat32.rs`): 512-byte sectors, no LFN,
 geometry), `.`/`..`/deleted/volume-label entries skipped, directory reads
 capped at 64 KiB, file reads capped at 1 MiB, FAT-chain cycles broken by
 the byte cap. Test disk (`dist/disk.img`, 32 MiB) is made by
-`scripts/make-disk.sh` via `make disk`. Shell reads it with `cat`/`ls`.
+`scripts/make-disk.sh` via `make disk`. Files and shell read it.
 
 ## Userland
 
 Ring 3, built static for the ELF loader, syscalls/IPC only:
 
 - **init** — PID 1 (task 3): first user program, says hello, yields, exits.
-- **shell** (task 4) — v0.9 interactive shell: line editing with history
-  buffer, `help echo cat ps kill ls exit`, reads via dev `term0`,
-  mirrors output to serial (the harness ground truth), checks reply
-  senders and refuses forged messages.
+- **shell** (task 4) — interactive shell: line editing with history,
+  `help echo cat ps kill ls exit` + `ping <host>` / `fetch <url>` through
+  the net broker, reads via dev `term0`, mirrors output to serial (the
+  test harness' ground truth), checks reply senders and refuses forged
+  messages.
 - **demo** (task 5) — second window client: opens its window, writes,
-  moves, closes, says bye. Exercises the whole window protocol.
+  moves, closes, says bye; also does a ring-3 DNS resolve through the
+  broker. Exercises the whole window protocol.
+- **fuzz** (task 7) — unprivileged syscall fuzzer, paced by `Park` (it
+  sleeps between bursts so the CPUs reach idle); its heartbeats
+  (`[fuzz] iters=N`) and panic handler (payload + `file:line`) are the
+  soak ground truth: the 1h release-ISO soak ran clean end to end.
+- **wallpaper** (task 8) — embeds `assets/wallpapers/wallpaper.jpeg`,
+  decodes it with zune-jpeg in its own 16 MiB heap, streams RGB rows to
+  winsrv over the IPC gate. The kernel never parses image data — that's
+  the trust boundary.
 
 ## LimeDE desktop
 
-The winsrv compositor (`kernel/src/servers/winsrv.rs`, palette + geometry
-documented in `docs/GUI.md`):
+The winsrv compositor (`kernel/src/servers/winsrv.rs`; palette, acrylic,
+geometry and animation math documented in `docs/GUI.md`):
 
-- **Compositor**: 4 MiB heap back buffer + 4 MiB cached wallpaper (of the
-  16 MiB heap), single-union damage rect, compose order
-  desktop → windows → taskbar → menu → popup; the cursor is drawn as an
-  overlay, never baked into the back buffer.
-- **Wallpaper**: rendered once at takeover by integer-only fixed-point
-  math (Q8/Q16 gradient + 4 radial glows) — no floats, because this CPU
-  target has no SSE (see constraints).
-- **Theme** (no green — deliberately un-hacker): accent `(76,194,255)`,
-  focused titlebar `(38,44,58)`, body `(16,18,24)`, taskbar `(23,26,34)`,
-  menu `(24,27,35)`, rows `(34,38,49)`, console `(214,222,235)` on
-  `(10,14,28)`.
+- **Compositor**: back buffer + cached wallpaper rows (from the streamed
+  decode), single-union damage rect per lap, compose order
+  desktop → window shadows → windows → dock/weather/tray pills →
+  start card → quick settings → popup; the cursor is drawn as an
+  overlay, never baked into the back buffer. Idle = zero fb traffic.
+- **Theme "Fluent dark"**: charcoal surfaces `BG (32,34,38)`, focused
+  titlebar `(44,46,52)`, ink `FG (208,214,224)`, fluent accent
+  `(76,194,255)`. Every panel/card/pill is rounded (`RAD 10/8/10`) and
+  blends the wallpaper through it — acrylic (`PANEL_A=214`,
+  `CARD_A=226`) — with 4-ring soft shadows. Windows, menu, popups and
+  the quick flyout open with a 120 ms fade+rise animation.
+- **Detector rule**: the cursor `(240,240,240)` is the only pixel on
+  screen with all three channels ≥239 (tests locate it by that); every
+  painted UI color keeps one channel below the line on purpose, and the
+  wallpaper service clamps its own pixels the same way.
 - **Input pipeline**: virtio-tablet owns the pointer; PS/2 bytes are
   swallowed when the tablet exists; focus follows clicks; titlebar drag,
-  16px resize grip, ✕ close; at most 8 windows; scrollback-capped
+  double-click maximize, 16px resize grip, ✕ close; scrollback-capped
   terminal text; Start search routes keys (Enter = launch first match).
 - **QEMU side**: QEMU registers its PS/2 mouse before our tablet, so a
   helper (`scripts/activate_tablet.py`, double-forked daemon) issues HMP
@@ -256,7 +310,8 @@ options (DejaVu, Inter, Fira, Plex).
 - **QEMU** (`scripts/run-qemu.sh`): `-cpu qemu64,+smep,+smap`,
   `-machine q35`, `-m 512M`, `-vga std`, `-boot order=d`,
   `-device virtio-tablet-pci`, per-ISO serial logs
-  (`dist/serial-<name>.log`, dumped on exit). `make diag` collects logs.
+  (`dist/serial-<name>.log`, dumped on exit). `-smp 2` supported and
+  tested; SMP is what boots by default. `make diag` collects logs.
 - **Tablet helper**: `scripts/activate_tablet.py` (HMP `mouse_set`,
   detaches via double-fork, never sends `quit`).
 - `scripts/make-disk.sh`, `scripts/collect-logs.sh`,
@@ -264,13 +319,23 @@ options (DejaVu, Inter, Fira, Plex).
 
 ## Test suite
 
-Five headless QMP tests, all passing, plus pointer + input proofs
-(`python3 scripts/<test>.py <iso>`):
-`qmp_desktop_test`, `qmp_tablet_test`, `qmp_multitest`, `qmp_input_test`
-(cursor 640→840 on +200px, serial sees scancode), `qmp_type_test`,
-`qmp_mouse_idle`, `verify_tablet_pointer` (tablet `current=True,
-absolute=True`), `probe_mice`, `qmp_screendump`. Pixel-exact color
-assertions; `docs/GUI.md` lists what each test proves.
+Nine headless QMP tests, all green, plus the fuzz soak and pointer
+utilities (`python3 scripts/<test>.py <iso>`):
+
+| test | proves |
+|---|---|
+| `qmp_desktop_test.py` | Start card tiles (exact-color count), About popup, dismiss |
+| `qmp_multitest.py` | 18-check multi-window proof: focus, drag, resize, close, EOF |
+| `qmp_tablet_test.py` | splash band + absolute cursor corners + menu open/dismiss |
+| `qmp_input_test.py` | keyboard scancodes reach the guest, cursor moves exactly |
+| `qmp_type_test.py` | blind typing lands in the shell console |
+| `qmp_net_test.py` / `qmp_net_shell.py` | DHCP + ICMP + DNS + the ring-3 `ping`/`fetch` tools |
+| `qmp_smp_test.py` | 2 cores online, IPIs answered, per-CPU state |
+| `qmp_mouse_idle.py`, `verify_tablet_pointer.py`, `probe_mice.py`, `qmp_screendump.py` | pointer + utility layer |
+
+Plus the **1h syscall-fuzz soak on the release ISO**: clean end to end,
+0 faults, 0 panics. Pixel-exact color assertions;
+`docs/GUI.md` lists what each test proves.
 
 ## Requirements
 
@@ -281,39 +346,40 @@ assertions; `docs/GUI.md` lists what each test proves.
 | xorriso | 1.5.8.pl02 (libburnia, built from source into `~/.local`) |
 | Limine | 12.9.3 (binaries in `~/limine`, via `setup-wsl.sh`) |
 | Host | Windows 11 with WSL2 (Ubuntu 22.04/24.04 runs inside WSL), plus `mtools`, `git`, `curl` |
-| Guest | `-m 512M`, 1280×800×32 framebuffer, ~492 MiB usable RAM |
+| Guest | `-m 512M`, `-smp 2`, 1280×800×32 framebuffer, ~492 MiB usable RAM |
 
 ## Platform constraints
 
 - **No SSE** on `x86_64-unknown-none` (only fxsr/x87): all float math is
   softfloat — hot paths (especially the compositor) must be integer-only.
-- No 1 GiB pages, no SMP, no networking, no AHCI driver yet, text-only
-  windows (no pixels/cells client API yet), subset font.
+- No 1 GiB pages; AHCI flagged but no driver yet; text-only windows (no
+  pixels/cells client API yet); subset font.
 
 ## Security
 
-v0.9 closed an internal AI-assisted audit (10 findings, Critical down to
-Info — relay check, kill gate, handle/window owners, fault isolation, ELF
-and disk hardening; one Medium deferred). Full ledger in
+Hardening campaigns across the 1.0 phases closed the internal AI-assisted
+audit ledger GLS-001…012 (Critical down to Info — W^X, KASLR, capability
+stamps on every server request, page-probed user pointers, fault
+isolation, kstack budget). Two items deliberately deferred and documented
+(the `Blocked → Ready` wake window; GLS-007). Full ledger in
 `docs/SECURITY.md`. Hobby-grade nonetheless: no sandboxing or user model
 yet — don't put secrets in it.
 
 ## Roadmap
 
-- [x] v0.1 boot — Limine → serial + framebuffer print
-- [x] v0.2 memory — PMM, paging, heap
-- [x] v0.3 interrupts — GDT/IDT, timer, keyboard
-- [x] v0.4 userspace — ring-3, ELF loader, syscalls
-- [x] v0.5 IPC + servers — VFS + dev, `init` + shell
-- [x] v0.6 storage — PCI, virtio-blk, FAT32 (`ls`, `make disk`)
-- [x] v0.7 fonts — TTF rasterization + shell editing
-- [x] v0.8 GUI — LimeDE: taskbar, Start menu, wallpaper, compositor,
-  multi-window focus/drag/close
-- [x] v0.9 own identity + hardening — G mark, launcher menu, on-demand
-  terminal, new toolchain, security fixes
-- [ ] v1.0 driver model, SMP, network, storage
+**v1.0 starts at M10** — the 1.0 release is:
 
-See `docs/ROADMAP.md`. Milestones ship one at a time, each verified in QEMU.
+- [x] M10 SMP + network + hardening — 2 cores, DHCP/ICMP/DNS/TCP,
+  W^X/KASLR/fuzz, 1h soak
+- [x] M11 Fluent light + userspace wallpaper + Files app
+- [x] M12 Fluent dark — charcoal acrylic faces, soft shadows,
+  animations, quick settings
+
+M1–M9 are the pre-1.0 groundwork (boot, memory, userspace, fonts, IPC,
+storage, window server + compositor, identity hardening) — kept as
+history in `docs/ROADMAP.md`.
+
+See `docs/ROADMAP.md`. v1.0 ships verified in QEMU.
 
 ## License
 

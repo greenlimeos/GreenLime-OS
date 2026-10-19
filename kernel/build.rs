@@ -55,6 +55,35 @@ fn main() {
     }
     println!("cargo:rustc-env=GREENLIME_DEMO_ELF={}", demo);
 
+    // Fuzzer ELF, same deal (v1.0 hardening: spawned unprivileged).
+    let fuzz = format!(
+        "{}/x86_64-unknown-none/{}/greenlime-fuzz",
+        tdir, profile
+    );
+    println!("cargo:rerun-if-changed={}", fuzz);
+    if !std::path::Path::new(&fuzz).exists() {
+        panic!(
+            "greenlime-fuzz ELF missing at {}. Build userland first: run `make`, not bare `cargo build`.",
+            fuzz
+        );
+    }
+    println!("cargo:rustc-env=GREENLIME_FUZZ_ELF={}", fuzz);
+
+    // Wallpaper service ELF, same deal (task 8, CAP_WALL: streams the
+    // desktop image to winsrv).
+    let wallp = format!(
+        "{}/x86_64-unknown-none/{}/greenlime-wallpaper",
+        tdir, profile
+    );
+    println!("cargo:rerun-if-changed={}", wallp);
+    if !std::path::Path::new(&wallp).exists() {
+        panic!(
+            "greenlime-wallpaper ELF missing at {}. Build userland first: run `make`, not bare `cargo build`.",
+            wallp
+        );
+    }
+    println!("cargo:rustc-env=GREENLIME_WALLPAPER_ELF={}", wallp);
+
     // Default TTF for the framebuffer console (see assets/fonts/README.md).
     let font = format!("{}/../assets/fonts/default-font.ttf", manifest);
     println!("cargo:rerun-if-changed={}", font);

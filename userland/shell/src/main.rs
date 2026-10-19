@@ -11,6 +11,7 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use greenlime_abi::ipc::{Message, PORT_DEV, PORT_VFS, REPLY_OK};
+use greenlime_abi::net::{self as netab, PORT_NET};
 use greenlime_abi::syscall::Syscall;
 use greenlime_abi::vfs::*;
 
@@ -207,6 +208,281 @@ fn read_line(
     }
 }
 
+// ===== Phase D net tools (ABI v4 over the port-18 broker) =====
+
+/// Task id of the net broker (spawn order = always 6; kernel-stamped).
+const NET_TASK: u32 = 6;
+
+/// Send a request to the broker and take its reply. Kernel stamps the
+/// sender; a foreign reply means the IPC path lied — die loud.
+fn net_req(me: u32, req: &Message) -> Message {
+    send(PORT_NET, req);
+    let mut rep = Message::new(0);
+    recv(me, &mut rep);
+    if rep.sender != NET_TASK {
+        exit(3);
+    }
+    rep
+}
+
+/// Resolve a hostname. None = broker said no (loud, no retry).
+fn net_resolve(me: u32, name: &[u8]) -> Option<u32> {
+    let mut req = Message::new(netab::NET_RESOLVE);
+    if req.set_payload(name) < name.len() {
+        return None; // 240 B cap; a hostname never gets near it
+    }
+    let rep = net_req(me, &req);
+    (rep.kind == netab::NET_REPLY && rep.arg0 != u64::MAX)
+        .then(|| netab::addr_ip(rep.arg0))
+}
+
+/// One ICMP echo round-trip. Returns the RTT in ms.
+fn net_ping(me: u32, ip: u32) -> Option<u64> {
+    let mut req = Message::new(netab::NET_PING);
+    req.arg1 = netab::addr(ip, 0);
+    let rep = net_req(me, &req);
+    (rep.kind == netab::NET_REPLY && rep.arg0 != u64::MAX).then_some(rep.arg0)
+}
+
+/// ping <host>: DNS resolve via the broker, then an ICMP echo owned by
+/// the broker's ICMP socket. Prints the same two lines a real ping does.
+fn ping(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
+    out(me, fd, ser, b"ping: resolving ");
+    out(me, fd, ser, host);
+    out(me, fd, ser, b"\n");
+    let Some(ip) = net_resolve(me, host) else {
+        out(me, fd, ser, b"ping: resolve failed\n");
+        return;
+    };
+    let mut b = [0u8; 64];
+    let mut n = 0usize;
+    w_cmd(&mut b, &mut n, b"ping: ");
+    w_ip(&mut b, &mut n, host);
+    w_cmd(&mut b, &mut n, b" -> ");
+    w_ipq(&mut b, &mut n, ip);
+    w_cmd(&mut b, &mut n, b"\n");
+    out(me, fd, ser, &b[..n]);
+
+    let Some(rtt) = net_ping(me, ip) else {
+        out(me, fd, ser, b"ping: no reply in 5s\n");
+        return;
+    };
+    n = 0;
+    w_cmd(&mut b, &mut n, b"ping: reply from ");
+    w_ipq(&mut b, &mut n, ip);
+    w_cmd(&mut b, &mut n, b" in ");
+    w_dec(&mut b, &mut n, rtt);
+    w_cmd(&mut b, &mut n, b"ms\n");
+    out(me, fd, ser, &b[..n]);
+}
+
+/// fetch <host>: bare open + connect + GET + streamed body to the
+/// console. User-Agent: GreenLime/1.0 — this is the string an OS gets
+/// (or doesn't get) counted by. Default GET on port 80, HTTP only.
+fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
+    out(me, fd, ser, b"fetch: resolving ");
+    out(me, fd, ser, host);
+    out(me, fd, ser, b"\n");
+    let Some(ip) = net_resolve(me, host) else {
+        out(me, fd, ser, b"fetch: resolve failed\n");
+        return;
+    };
+    // 1. Open a TCP socket (broker assigns the local port).
+    let mut req = Message::new(netab::NET_OPEN);
+    req.arg0 = netab::NET_KIND_TCP;
+    req.arg1 = 0; // client socket: broker assigns an ephemeral port
+    let rep = net_req(me, &req);
+    if rep.kind != netab::NET_REPLY || rep.arg0 == u64::MAX {
+        out(me, fd, ser, b"fetch: open refused\n");
+        return;
+    }
+    let h = rep.arg0;
+
+    // 2. Connect to port 80.
+    let mut req = Message::new(netab::NET_CONNECT);
+    req.arg0 = h;
+    req.arg1 = netab::addr(ip, 80);
+    let rep = net_req(me, &req);
+    if rep.kind != netab::NET_REPLY || rep.arg0 != 0 {
+        let mut b = [0u8; 64];
+        let mut n = 0usize;
+        w_cmd(&mut b, &mut n, b"fetch: connect refused (");
+        w_ipq(&mut b, &mut n, ip);
+        w_cmd(&mut b, &mut n, b":80)\n");
+        out(me, fd, ser, &b[..n]);
+        close_h(me, h);
+        return;
+    }
+
+    // 3. One 240-B-capped request.
+    let mut req = [0u8; 240];
+    let mut rn = 0usize;
+    w_cmd(&mut req, &mut rn, b"GET / HTTP/1.1\r\nHost: ");
+    if rn + host.len() >= 200 {
+        out(me, fd, ser, b"fetch: host name too long\n");
+        close_h(me, h);
+        return;
+    }
+    w_cmd(&mut req, &mut rn, host);
+    w_cmd(
+        &mut req,
+        &mut rn,
+        b"\r\nUser-Agent: GreenLime/1.0 (ring-3 fetch)\r\nConnection: close\r\n\r\n",
+    );
+    let mut reqm = Message::new(netab::NET_SEND);
+    reqm.arg0 = h;
+    reqm.set_payload(&req[..rn]);
+    let rep = net_req(me, &reqm);
+    if rep.kind != netab::NET_REPLY || rep.arg0 != rn as u64 {
+        out(me, fd, ser, b"fetch: send refused\n");
+        close_h(me, h);
+        return;
+    }
+
+    // 4. Pull the stream: print the status line, then the first 512 bytes
+    //    of the body (terminal-friendly); count everything.
+    let mut hdr = [0u8; 384];
+    let mut hl = 0usize;
+    let mut body = false;
+    let mut body_shown = 0usize;
+    let mut total = 0usize;
+    loop {
+        let mut req = Message::new(netab::NET_RECV);
+        req.arg0 = h;
+        send(PORT_NET, &req);
+        let mut rep = Message::new(0);
+        recv(me, &mut rep);
+        if rep.sender != NET_TASK {
+            exit(3);
+        }
+        if rep.kind == netab::NET_EOF {
+            break; // stream end (peer FIN + drained)
+        }
+        if rep.kind != netab::NET_REPLY {
+            out(me, fd, ser, b"fetch: stream broke\n");
+            break;
+        }
+        let chunk = rep.payload_bytes();
+        total += chunk.len();
+        let mut ci = 0usize; // scan position inside this chunk
+        while ci < chunk.len() {
+            if body {
+                // Dump body bytes (HTML) to the console within the budget;
+                // after 512 shown, keep counting silently.
+                if body_shown < 512 {
+                    let take = (chunk.len() - ci).min(512 - body_shown);
+                    out(me, fd, ser, &chunk[ci..ci + take]);
+                    body_shown += take;
+                    ci += take;
+                } else {
+                    ci = chunk.len();
+                }
+            } else {
+                if hl < hdr.len() {
+                    hdr[hl] = chunk[ci];
+                    hl += 1;
+                }
+                if (hl >= 4
+                    && hdr[hl - 4] == b'\r'
+                    && hdr[hl - 3] == b'\n'
+                    && hdr[hl - 2] == b'\r'
+                    && hdr[hl - 1] == b'\n')
+                    || hl >= hdr.len()
+                {
+                    body = true;
+                    // Status line = bytes up to the first '\n' ('\r'
+                    // trimmed) → "fetch: HTTP/1.1 200 OK".
+                    let mut sl = 0usize;
+                    for i in 0..hl {
+                        if hdr[i] == b'\n' {
+                            break;
+                        }
+                        sl = i + 1;
+                    }
+                    let mut sco = sl.min(hdr.len());
+                    if sco > 0 && hdr[sco - 1] == b'\r' {
+                        sco -= 1;
+                    }
+                    let mut ob = [0u8; 400];
+                    let mut on = 0usize;
+                    w_cmd(&mut ob, &mut on, b"fetch: ");
+                    w_cmd(&mut ob, &mut on, &hdr[..sco]);
+                    w_cmd(&mut ob, &mut on, b"\n");
+                    out(me, fd, ser, &ob[..on]);
+                }
+                ci += 1;
+            }
+        }
+    }
+    let mut b = [0u8; 32];
+    let mut n = 0usize;
+    w_cmd(&mut b, &mut n, b"fetch: stream end, ");
+    w_dec(&mut b, &mut n, total as u64);
+    w_cmd(&mut b, &mut n, b" bytes total\n");
+    out(me, fd, ser, &b[..n]);
+    close_h(me, h);
+}
+
+/// Net CLOSE (best-effort: the broker frees the handle either way).
+fn close_h(me: u32, h: u64) {
+    let mut req = Message::new(netab::NET_CLOSE);
+    req.arg0 = h;
+    let _ = net_req(me, &req);
+}
+
+/// Append fixed bytes to a stack log buffer.
+fn w_cmd(buf: &mut [u8], n: &mut usize, s: &[u8]) {
+    let take = s.len().min(buf.len() - *n);
+    buf[*n..*n + take].copy_from_slice(&s[..take]);
+    *n += take;
+}
+
+/// Append a decimal number.
+fn w_dec(buf: &mut [u8], n: &mut usize, v: u64) {
+    if v == 0 {
+        w_cmd(buf, n, b"0");
+        return;
+    }
+    let mut rev = [0u8; 20];
+    let mut r = 0usize;
+    let mut x = v;
+    while x > 0 {
+        rev[r] = b'0' + (x % 10) as u8;
+        r += 1;
+        x /= 10;
+    }
+    let mut i = r;
+    while i > 0 {
+        i -= 1;
+        w_cmd(buf, n, &rev[i..i + 1]);
+    }
+}
+
+/// Append a dotted-quad IPv4.
+fn w_ipq(buf: &mut [u8], n: &mut usize, ip: u32) {
+    let oct = [(ip >> 24) as u8, (ip >> 16) as u8, (ip >> 8) as u8, ip as u8];
+    for (i, &v) in oct.iter().enumerate() {
+        if i > 0 {
+            w_cmd(buf, n, b".");
+        }
+        if v >= 100 {
+            w_dec(buf, n, (v / 100) as u64);
+            w_dec(buf, n, ((v / 10) % 10) as u64);
+            w_dec(buf, n, (v % 10) as u64);
+        } else if v >= 10 {
+            w_dec(buf, n, (v / 10) as u64);
+            w_dec(buf, n, (v % 10) as u64);
+        } else {
+            w_dec(buf, n, v as u64);
+        }
+    }
+}
+
+/// Append raw hostname bytes.
+fn w_ip(buf: &mut [u8], n: &mut usize, host: &[u8]) {
+    w_cmd(buf, n, host);
+}
+
 /// ls <path>: list a directory (no handles needed).
 fn ls(me: u32, fd: u64, ser: Option<u64>, path: &[u8]) {
     let mut req = Message::new(OP_READDIR);
@@ -277,7 +553,12 @@ fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
         out(me, fd, ser, b"bye\n");
         exit(0);
     } else if line == b"help" {
-        out(me, fd, ser, b"commands: help echo cat ps kill ls exit\n");
+        out(
+            me,
+            fd,
+            ser,
+            b"commands: help echo cat ps kill ls exit ping fetch\n",
+        );
     } else if line.starts_with(b"echo ") {
         out(me, fd, ser, &line[5..]);
         out(me, fd, ser, b"\n");
@@ -303,6 +584,10 @@ fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
             }
             None => out(me, fd, ser, b"kill: bad pid\n"),
         }
+    } else if line.starts_with(b"ping ") {
+        ping(me, fd, ser, trim(&line[5..]));
+    } else if line.starts_with(b"fetch ") {
+        fetch(me, fd, ser, trim(&line[6..]));
     } else if line.is_empty() {
     } else {
         out(me, fd, ser, b"unknown command\n");

@@ -77,6 +77,28 @@ pub fn recv(port: u32) -> Message {
     }
 }
 
+/// Kernel-side non-blocking send: pushes only if the queue has room,
+/// drops (returns false) otherwise. Push-model servers (net datagrams)
+/// use this so a full client mailbox can never wedge the broker loop.
+pub fn try_send(port: u32, mut msg: Message, sender: u32) -> bool {
+    assert!(check_port(port), "[ipc] bad port {}", port);
+    msg.sender = sender;
+    let ok = {
+        let mut ports = PORTS.lock();
+        let q = &mut ports[port as usize].queue;
+        if q.len() < PORT_QUEUE {
+            q.push_back(msg);
+            true
+        } else {
+            false
+        }
+    };
+    if ok {
+        sched::wake_port(port);
+    }
+    ok
+}
+
 /// Kernel-side non-blocking recv: None when empty. Servers poll with this
 /// so one slow client can't wedge the loop.
 pub fn try_recv(port: u32) -> Option<Message> {
@@ -103,6 +125,11 @@ pub fn sys_send(port: u32, user_msg: u64, sender: u32) -> u64 {
     if !check_port(port) {
         return u64::MAX;
     }
+    // GLS-011: page-table probe before the STAC copy. An unmapped
+    // in-range pointer here is a clean error, not a kernel fault.
+    if !crate::mm::vmm::user_range_ok(user_msg, MSG_SIZE, false) {
+        return u64::MAX;
+    }
     let msg = match copy_msg_in(user_msg) {
         Some(m) => m,
         None => return u64::MAX,
@@ -114,6 +141,9 @@ pub fn sys_send(port: u32, user_msg: u64, sender: u32) -> u64 {
 /// Recv into a user buffer (may block). Returns 0 on ok.
 pub fn sys_recv(port: u32, user_buf: u64, _me: u32) -> u64 {
     if !check_port(port) {
+        return u64::MAX;
+    }
+    if !crate::mm::vmm::user_range_ok(user_buf, MSG_SIZE, true) {
         return u64::MAX;
     }
     let msg = recv(port);

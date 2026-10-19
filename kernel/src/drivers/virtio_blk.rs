@@ -250,6 +250,8 @@ pub fn init(devs: &[pci::PciDev]) -> bool {
     match VirtioBlk::probe(devs) {
         Some(b) => {
             *BLK.lock() = Some(b);
+            // Driver model: legacy virtio-blk, polled until B3 wires IRQs.
+            super::register("virtio-blk", None);
             true
         }
         None => {

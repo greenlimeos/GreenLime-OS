@@ -4,9 +4,10 @@
 #![no_std]
 
 /// v3: OP_READDIR for directory listings.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 6;
 
 pub mod ipc;
+pub mod net;
 pub mod syscall;
 pub mod vfs;
 pub mod win;

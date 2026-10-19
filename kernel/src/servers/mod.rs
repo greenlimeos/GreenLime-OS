@@ -20,3 +20,10 @@ pub fn init() {
     sched::spawn_kernel_task("winsrv", winsrv::server_main);
     kprintln!("[servers] vfs/dev/winsrv tasks spawned");
 }
+
+/// Spawn the net server AFTER userspace so shell/demo keep pids 3/4/5
+/// (net takes 6). Called from kmain, not init().
+pub fn spawn_net() {
+    sched::spawn_kernel_task("net", net::server_main);
+    kprintln!("[servers] net task spawned");
+}

@@ -1,11 +1,14 @@
 //! IPC wire format. Fixed-size so kernel/userspace never disagree.
 //! ABI v2: sender is kernel-stamped, ports are well-known numbers.
+//! (v6: MAX_PAYLOAD 240 -> 2048 — the wallpaper service streams pixel
+//! bands through it; struct grows, so ABI_VERSION bumps.)
 
-/// Max inline payload. Larger transfers use shared-memory caps (later).
-pub const MAX_PAYLOAD: usize = 240;
+/// Max inline payload. Shared memory comes later. Sized to keep Message
+/// copies safe on 32 KiB kernel stacks (worth ~2 KB per local copy).
+pub const MAX_PAYLOAD: usize = 2048;
 
 /// Mailbox ports: task N owns port N (N < MAX_TASKS).
-pub const MAX_TASKS: u32 = 8;
+pub const MAX_TASKS: u32 = 9;
 /// Service ports.
 pub const PORT_VFS: u32 = 16;
 pub const PORT_DEV: u32 = 17;

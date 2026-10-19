@@ -36,6 +36,9 @@ BASE="${ISO##*/}"; BASE="${BASE%.iso}"
 LOG="dist/serial-$BASE.log"
 
 QEMU_COMMON=(-cpu qemu64,+smep,+smap -cdrom "$ISO" -m 512M -vga std -machine q35 -no-reboot)
+# CPU count (Phase A: SMP bring-up, APs print + park; BSP is fail-soft).
+# Headless SMP tests override with QEMU_SMP=4.
+QEMU_COMMON+=(-smp "${QEMU_SMP:-2}")
 # Boot the CD first: without this SeaBIOS tries the virtio disk and hangs
 # before Limine ever runs.
 QEMU_COMMON+=(-boot order=d)
@@ -46,6 +49,10 @@ if [ ! -f "$DISK" ]; then
   bash scripts/make-disk.sh
 fi
 QEMU_COMMON+=(-drive "file=$DISK,if=virtio,format=raw")
+# User-mode NAT NIC (Phase B): guest gets 10.0.2.15, gateway/DHCP/DNS at
+# 10.0.2.2. Only live runs get it — the headless suites keep their exact
+# old argv (no NIC) so nothing regresses; the net test passes its own.
+QEMU_COMMON+=(-device virtio-net-pci,netdev=n0 -netdev user,id=n0)
 # Absolute pointer: the guest cursor tracks the host cursor exactly.
 # QEMU's virtio-input is modern-only; our driver walks the PCI caps.
 QEMU_COMMON+=(-device virtio-tablet-pci)

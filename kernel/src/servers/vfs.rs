@@ -76,15 +76,15 @@ fn root_listing() -> Vec<u8> {
     out.into_bytes()
 }
 
-fn list_target(path: &str, offset: usize) -> Option<Vec<u8>> {
-    let full: Vec<u8> = if path == "/" || path.is_empty() {
-        root_listing()
+fn full_listing(path: &str) -> Option<Vec<u8>> {
+    if path == "/" || path.is_empty() {
+        Some(root_listing())
     } else if path == "/ps" {
         let mut out = String::from("PID NAME STATE\n");
         for (id, name, state) in sched::snapshot() {
             out.push_str(&alloc::format!("{} {} {:?}\n", id, name, state));
         }
-        out.into_bytes()
+        Some(out.into_bytes())
     } else if let Some(sub) = path.strip_prefix("/disk") {
         let sub = if sub.is_empty() { "/" } else { sub };
         let disk = DISK.lock();
@@ -95,13 +95,31 @@ fn list_target(path: &str, offset: usize) -> Option<Vec<u8>> {
             out.push_str(&n);
             out.push('\n');
         }
-        out.into_bytes()
+        Some(out.into_bytes())
     } else {
-        return None;
-    };
+        None
+    }
+}
+
+fn list_target(path: &str, offset: usize) -> Option<Vec<u8>> {
+    let full = full_listing(path)?;
     let off = offset.min(full.len());
     let end = (off + 200).min(full.len());
     Some(full[off..end].to_vec())
+}
+
+/// Names of a directory (for the Files window): one line per entry,
+/// directories ending with '/'. None = not a directory / unmounted.
+pub fn list_names(path: &str) -> Option<Vec<String>> {
+    let full = full_listing(path)?;
+    let text = core::str::from_utf8(&full).ok()?;
+    let mut names = Vec::new();
+    for l in text.split('\n') {
+        if !l.is_empty() {
+            names.push(String::from(l));
+        }
+    }
+    Some(names)
 }
 
 fn handle(req: Message) {

@@ -38,7 +38,7 @@ unsafe fn read_u32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     }
 }
 
-unsafe fn write_u32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+pub unsafe fn write_u32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     unsafe {
         Port::<u32>::new(CONFIG_ADDR).write(cfg_addr(bus, dev, func, offset));
         Port::<u32>::new(CONFIG_DATA).write(val);
@@ -151,5 +151,240 @@ pub fn bar0_iobase(d: &PciDev) -> Option<u16> {
         Some((d.bar0 & 0xFFFC) as u16)
     } else {
         None
+    }
+}
+
+// MSI-X capability (PCI 3.0 §6.12): ID 0x11.
+// Capability struct: {cap_id(8), next(8), msg_ctrl(16), table_offset(32)}.
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+const MSI_X_TABLE_OFFSET_MASK: u32 = 0xFFFFFFF8;
+const MSI_X_TABLE_BIR_MASK: u32 = 0x7;
+const MSI_X_ENTRY_BYTES: u32 = 16;
+
+/// MSI-X table entry (16 bytes): msg addr (8), msg data (4), vector control (2), reserved (2).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MsiXEntry {
+    pub addr: u64,
+    pub data: u32,
+    pub vec_ctrl: u16,
+    _reserved: u16,
+}
+
+/// Walk the PCI capability list for an MSI-X capability. Returns the
+/// capability offset or None. Called at boot (single CPU, IRQs off).
+pub unsafe fn msix_cap(d: &PciDev) -> Option<u8> {
+    let mut cap = unsafe { cfg_read_u8(d, 0x34) };
+    for _ in 0..32 {
+        if cap == 0 || cap < 0x40 || cap > 0xF0 {
+            return None;
+        }
+        let id = unsafe { cfg_read_u8(d, cap) };
+        let next = unsafe { cfg_read_u8(d, cap + 1) };
+        if id == PCI_CAP_ID_MSIX {
+            return Some(cap);
+        }
+        cap = next;
+    }
+    None
+}
+
+/// Read a u16 from PCI config space.
+pub unsafe fn cfg_read_u16(d: &PciDev, offset: u8) -> u16 {
+    let v = unsafe { read_u32(d.bus, d.dev, d.func, offset & 0xFC) };
+    (v >> ((offset & 2) * 8)) as u16
+}
+
+/// Read a u32 from PCI config space at the given byte offset.
+#[allow(dead_code)]
+pub unsafe fn cfg_read_u32_at(d: &PciDev, offset: u8) -> u32 {
+    unsafe { read_u32(d.bus, d.dev, d.func, offset) }
+}
+
+/// PCI Interrupt Line register (offset 0x3C): which IRQ line the device is
+/// wired to (set by firmware/BIOS). Returns None if not programmable.
+#[allow(dead_code)]
+pub fn irq_line(d: &PciDev) -> Option<u8> {
+    let v = unsafe { read_u32(d.bus, d.dev, d.func, 0x3C) };
+    let line = (v & 0xFF) as u8;
+    if line == 0xFF {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+/// PCI Interrupt Pin register (offset 0x3D): which INTx pin (1=INTA, 2=INTB, …).
+#[allow(dead_code)]
+pub fn irq_pin(d: &PciDev) -> Option<u8> {
+    let v = unsafe { read_u32(d.bus, d.dev, d.func, 0x3D) };
+    let pin = ((v >> 8) & 0xFF) as u8;
+    if pin == 0 {
+        None
+    } else {
+        Some(pin)
+    }
+}
+
+/// Program MSI-X table `entry` to deliver an MSI write to `msi_addr` with
+/// `msi_data` (xAPIC: addr 0xFEE00000 | dest<<12, data = vector with fixed
+/// delivery). Returns the physical page holding the table (kept mapped for
+/// the device lifetime). MSI-X must already be enabled (msix_enable).
+///
+/// `vector` is used only for the boot breadcrumb. The entry write is
+/// verified by read-back (QEMU backs the table with RAM); a mismatch means
+/// the BAR/BIR parse was wrong, so we fail instead of arming nothing.
+pub unsafe fn msix_program_entry(
+    d: &PciDev,
+    entry: u16,
+    vector: u8,
+    msi_addr: u64,
+    msi_data: u32,
+) -> Option<u64> {
+    let cap = unsafe { msix_cap(d)? };
+    // Message control: table size = entries - 1 (bits [10:0]).
+    let msg_ctrl = unsafe { cfg_read_u16(d, cap + 2) };
+    let table_size = (msg_ctrl as u32 & 0x7FF) + 1;
+    if entry as u32 >= table_size {
+        return None;
+    }
+    // Table Offset/BIR at cap + 4. Read as two u16s: cfg_read_u16 aligns
+    // the underlying dword access itself, so this is correct even if the
+    // capability isn't dword-aligned.
+    let table_off = unsafe {
+        (cfg_read_u16(d, cap + 4) as u32) | ((cfg_read_u16(d, cap + 6) as u32) << 16)
+    };
+    let bir = (table_off & MSI_X_TABLE_BIR_MASK) as u8;
+    let offset: u64 = (table_off & MSI_X_TABLE_OFFSET_MASK) as u64;
+
+    // BAR address for the table's BIR.
+    let bar_addr = match bir {
+        0 => Some(d.bar0 as u64),
+        1 => unsafe { Some(read_u32(d.bus, d.dev, d.func, 0x14) as u64) },
+        2 => {
+            let lo = unsafe { read_u32(d.bus, d.dev, d.func, 0x18) };
+            let hi = unsafe { read_u32(d.bus, d.dev, d.func, 0x1C) };
+            Some(((hi as u64) << 32) | (lo as u64))
+        }
+        3 => unsafe { Some(read_u32(d.bus, d.dev, d.func, 0x20) as u64) },
+        4 => unsafe { Some(read_u32(d.bus, d.dev, d.func, 0x24) as u64) },
+        5 => unsafe { Some(read_u32(d.bus, d.dev, d.func, 0x28) as u64) },
+        _ => None,
+    }? & !0xFu64; // mask BAR type bits
+
+    // The table sits at BAR + offset. Map the containing page identity
+    // (probe runs on the boot CPU before the scheduler; repairs flags if
+    // the page is already mapped) and build the entry pointer.
+    let table_phys = bar_addr + offset;
+    let page = table_phys & !0xFFFu64;
+    let in_page = table_phys & 0xFFFu64;
+    let table_virt = unsafe { crate::mm::vmm::map_mmio_page(page)? } + in_page;
+
+    // Write the entry: addr, data, vector control (bit 0 = mask; 0 =
+    // unmasked). The control write MUST be the 4-byte dword at +12
+    // (vec_ctrl + reserved): the table's memory region rejects accesses
+    // narrower than 4 bytes (valid.min_access_size = 4), so a 16-bit
+    // store is silently dropped — QEMU keeps the reset-default mask bit
+    // set and every later interrupt goes to the masked/pending path
+    // instead of being delivered. This is exactly how the first MSI-X
+    // bring-up looked silent (PBA bit 0 stuck at 1, no trace event).
+    let entry_ptr =
+        (table_virt + entry as u64 * MSI_X_ENTRY_BYTES as u64) as *mut MsiXEntry;
+    unsafe {
+        (*entry_ptr).addr = msi_addr;
+        (*entry_ptr).data = msi_data;
+        let ctrl_ptr =
+            (table_virt + entry as u64 * MSI_X_ENTRY_BYTES as u64 + 12) as *mut u32;
+        ctrl_ptr.write_volatile(0);
+        // Verify the write landed (the table is RAM-backed on QEMU):
+        // entry echoed AND the mask bit really clear.
+        let rb = core::ptr::read_volatile(entry_ptr);
+        let rb_ctrl = core::ptr::read_volatile(ctrl_ptr);
+        if rb.addr != msi_addr || rb.data != msi_data || rb_ctrl & 1 != 0 {
+            crate::kprintln!(
+                "[pci] msix: entry {} read-back mismatch (addr={:#x} data={:#x} ctrl={:#x})",
+                entry,
+                rb.addr,
+                rb.data,
+                rb_ctrl
+            );
+            return None;
+        }
+    }
+    crate::kprintln!(
+        "[pci] msix: entry {} -> addr {:#x} data {:#x} (vector {:#04x}, cap {:#x}, bir {}, page {:#x})",
+        entry,
+        msi_addr,
+        msi_data,
+        vector,
+        cap,
+        bir,
+        page
+    );
+
+    Some(page)
+}
+
+/// MSI-X Message Control (u16 at cap + 2): bit 15 = MSI-X Enable,
+/// bit 14 = Function Mask (1 = mask all vectors), bits 10..0 = Table
+/// Size - 1. Accessed via the u16 config helpers so the field is read or
+/// written correctly regardless of the capability's dword alignment.
+const MSI_X_CTL_ENABLE: u16 = 1 << 15;
+const MSI_X_CTL_FUNC_MASK: u16 = 1 << 14;
+
+/// Read the MSI-X Message Control register.
+#[allow(dead_code)]
+pub unsafe fn msix_msg_ctrl(d: &PciDev) -> Option<u16> {
+    let cap = unsafe { msix_cap(d)? };
+    Some(unsafe { cfg_read_u16(d, cap + 2) })
+}
+
+/// Enable MSI-X: clear Function Mask, set MSI-X Enable, confirm by reading
+/// back. Until this bit is set the device never generates MSI writes — it
+/// silently stays on legacy INTx, which looks like "MSI-X programmed but
+/// no interrupts".
+pub unsafe fn msix_enable(d: &PciDev) -> bool {
+    let cap = match unsafe { msix_cap(d) } {
+        Some(c) => c,
+        None => return false,
+    };
+    let ctrl = unsafe { cfg_read_u16(d, cap + 2) };
+    unsafe {
+        cfg_write_u16(
+            d,
+            cap + 2,
+            (ctrl & !MSI_X_CTL_FUNC_MASK) | MSI_X_CTL_ENABLE,
+        )
+    };
+    unsafe { cfg_read_u16(d, cap + 2) & MSI_X_CTL_ENABLE != 0 }
+}
+
+/// Disable MSI-X (clears the enable bit; the device reverts to INTx).
+#[allow(dead_code)]
+pub unsafe fn msix_disable(d: &PciDev) -> bool {
+    let cap = match unsafe { msix_cap(d) } {
+        Some(c) => c,
+        None => return false,
+    };
+    let ctrl = unsafe { cfg_read_u16(d, cap + 2) };
+    unsafe { cfg_write_u16(d, cap + 2, ctrl & !MSI_X_CTL_ENABLE) };
+    true
+}
+
+/// Read a u32 from PCI config space at the given byte offset.
+#[allow(dead_code)]
+pub unsafe fn cfg_write_u32(d: &PciDev, offset: u8, val: u32) {
+    unsafe { write_u32(d.bus, d.dev, d.func, offset, val) }
+}
+
+/// Write a u16 to PCI config space at the given byte offset (read-modify-
+/// write of the containing dword, so neighbors are preserved).
+pub unsafe fn cfg_write_u16(d: &PciDev, offset: u8, val: u16) {
+    let reg = offset & 0xFC;
+    let shift = (offset & 2) * 8;
+    unsafe {
+        let v = read_u32(d.bus, d.dev, d.func, reg);
+        let v = (v & !(0xFFFFu32 << shift)) | ((val as u32) << shift);
+        write_u32(d.bus, d.dev, d.func, reg, v);
     }
 }

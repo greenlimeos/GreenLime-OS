@@ -100,16 +100,16 @@ def splash_check(path):
 
 
 def menu_px(path):
-    """Start-menu panel pixels: exact MENU_BG (24,27,35) in the panel
-    rect (8,196)-(408,736). Wallpaper blue stays >= 42, so it can never
-    match; window text blends never land on the triple either."""
+    """Start-card solid tiles: exact MENU_BG2 (52,56,64) in the card rect
+    (360,304)-(920,740). The acrylic card varies per-pixel; only tiles +
+    the search pill hold that exact dark tile color."""
     w, h, px = read_ppm(path)
     n = 0
-    for y in range(196, 736):
+    for y in range(304, 740):
         row = y * w * 3
-        for x in range(8, 408):
+        for x in range(360, 920):
             o = row + x * 3
-            if (px[o], px[o + 1], px[o + 2]) == (24, 27, 35):
+            if (px[o], px[o + 1], px[o + 2]) == (52, 56, 64):
                 n += 1
     return n
 
@@ -270,10 +270,11 @@ def main():
             shot(f"dist/fb-tablet-{tag}.ppm")
             time.sleep(2)
 
-        # Start mark: left-aligned slots -> slot0 center (28, 776).
-        click_at(28, 776, "menu")
-        # Dismiss: click desktop at (900, 300) — right of the panel.
-        click_at(900, 300, "dismiss")
+        # Start slot of the centered dock pill: the demo window opens at
+        # boot → 2 slots, pill_x = 580 → slot0 center (616, 776).
+        click_at(616, 776, "menu")
+        # Dismiss: click desktop at (1000, 300) — right of the card.
+        click_at(1000, 300, "dismiss")
         m_menu = menu_px("dist/fb-tablet-menu.ppm")
         m_gone = menu_px("dist/fb-tablet-dismiss.ppm")
         print(f"tablet click: menu_px={m_menu} dismissed_px={m_gone}")

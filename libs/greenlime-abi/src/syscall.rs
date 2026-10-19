@@ -12,10 +12,14 @@ pub enum Syscall {
     IpcRecv = 4,
     Kill = 5,
     GetPid = 6,
+    /// Sleep until the next timer tick (v5, the fuzzer's pacing primitive:
+    /// lets a ring-3 task idle the CPU instead of spinning it — cooperative
+    /// Yield re-queues instantly, Park removes the task until the tick).
+    Park = 7,
 }
 
 impl Syscall {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     pub fn from_number(n: u64) -> Option<Self> {
         match n {
@@ -26,6 +30,7 @@ impl Syscall {
             4 => Some(Self::IpcRecv),
             5 => Some(Self::Kill),
             6 => Some(Self::GetPid),
+            7 => Some(Self::Park),
             _ => None,
         }
     }

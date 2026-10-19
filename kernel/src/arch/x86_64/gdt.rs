@@ -14,17 +14,31 @@ use crate::kprintln;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 1;
 const STACK_SIZE: usize = 4096 * 5;
 
-static mut PRIV_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-static mut DF_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+use super::smp::MAX_CPUS;
 
-static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
-    let mut tss = TaskStateSegment::new();
-    // Raw pointers only, stacks are exclusive to the TSS (addr_of! is safe).
-    let priv_top = addr_of!(PRIV_STACK) as u64 + STACK_SIZE as u64;
-    let df_top = addr_of!(DF_STACK) as u64 + STACK_SIZE as u64;
-    tss.privilege_stack_table[0] = VirtAddr::new(priv_top);
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = VirtAddr::new(df_top);
-    tss
+/// Per-CPU stacks (BSS): each CPU gets its own RSP0 + double-fault IST.
+/// 8 CPUs x 20 KiB x 2 = 320 KiB — static, always mapped, never moves.
+static mut PRIV_STACKS: [[u8; STACK_SIZE]; MAX_CPUS] = [[0; STACK_SIZE]; MAX_CPUS];
+static mut DF_STACKS: [[u8; STACK_SIZE]; MAX_CPUS] = [[0; STACK_SIZE]; MAX_CPUS];
+
+fn priv_stack_top(slot: usize) -> u64 {
+    // SAFETY: each slot is exclusive to its CPU (BSP takes its firmware
+    // order slot at arch init; APs take theirs at entry, before any use).
+    unsafe { addr_of!(PRIV_STACKS[slot]) as u64 + STACK_SIZE as u64 }
+}
+
+fn df_stack_top(slot: usize) -> u64 {
+    unsafe { addr_of!(DF_STACKS[slot]) as u64 + STACK_SIZE as u64 }
+}
+
+static TSS_TABLE: Lazy<[TaskStateSegment; MAX_CPUS]> = Lazy::new(|| {
+    core::array::from_fn(|i| {
+        let mut tss = TaskStateSegment::new();
+        tss.privilege_stack_table[0] = VirtAddr::new(priv_stack_top(i));
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            VirtAddr::new(df_stack_top(i));
+        tss
+    })
 });
 
 struct Selectors {
@@ -32,16 +46,20 @@ struct Selectors {
     data: SegmentSelector,
     user_code: SegmentSelector,
     user_data: SegmentSelector,
-    tss: SegmentSelector,
+    tss: [SegmentSelector; MAX_CPUS],
 }
 
-static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
-    let mut gdt = GlobalDescriptorTable::new();
+/// GDT capacity: 4 segments + 8 TSS x 2 slots = 20 used, 24 total.
+/// (The crate default of 8 panics on the 5th TSS — found the hard way.)
+const GDT_MAX: usize = 24;
+
+static GDT: Lazy<(GlobalDescriptorTable<GDT_MAX>, Selectors)> = Lazy::new(|| {
+    let mut gdt = GlobalDescriptorTable::<GDT_MAX>::empty();
     let code = gdt.append(Descriptor::kernel_code_segment());
     let data = gdt.append(Descriptor::kernel_data_segment());
     let user_data = gdt.append(Descriptor::user_data_segment());
     let user_code = gdt.append(Descriptor::user_code_segment());
-    let tss = gdt.append(Descriptor::tss_segment(&TSS));
+    let tss = core::array::from_fn(|i| gdt.append(Descriptor::tss_segment(&TSS_TABLE[i])));
     (
         gdt,
         Selectors {
@@ -55,20 +73,39 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
 });
 
 pub fn init() {
+    load_common();
+    // BSP takes its firmware-order slot (slot 0 when no MP response).
+    unsafe {
+        load_tss(GDT.1.tss[super::smp::bsp_index()]);
+    }
+    kprintln!("[arch] gdt loaded (kcode/kdata/ucode/udata + tss)");
+}
+
+/// Load one TSS slot (AP entry calls this with its firmware-order slot
+/// after load_common). Gives the CPU its own RSP0 + double-fault IST.
+pub fn load_tss_slot(slot: usize) {
+    assert!(slot < MAX_CPUS, "[gdt] TSS slot out of range");
+    unsafe {
+        load_tss(GDT.1.tss[slot]);
+    }
+}
+
+/// Load the shared GDT + reload every segment. APs call this directly:
+/// no TSS here (per-CPU TSS lands with the scheduler step — APs never
+/// transition rings while parked, so RSP0/IST are untouched).
+pub fn load_common() {
     GDT.0.load();
     unsafe {
         // Reload every segment: cached descriptors still point at Limine's
-        // GDT, and the first iretq (out of int3 below) would #GP on the
-        // stale SS. CS via set_reg, data segments directly, TSS via ltr.
+        // GDT, and any ring transition on a stale SS would #GP. CS via
+        // set_reg, data segments directly (BSP adds TSS via ltr in init).
         CS::set_reg(GDT.1.code);
         DS::set_reg(GDT.1.data);
         ES::set_reg(GDT.1.data);
         FS::set_reg(GDT.1.data);
         GS::set_reg(GDT.1.data);
         SS::set_reg(GDT.1.data);
-        load_tss(GDT.1.tss);
     }
-    kprintln!("[arch] gdt loaded (kcode/kdata/ucode/udata + tss)");
 }
 
 pub fn kernel_code_selector() -> SegmentSelector {

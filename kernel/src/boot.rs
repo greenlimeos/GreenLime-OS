@@ -1,8 +1,10 @@
 //! Limine boot protocol glue. ONLY file that knows Limine.
 //! Everything else uses `boot_info()` data, never Limine types.
 
-use limine::request::{FramebufferRequest, HhdmRequest, MemoryMapRequest, StackSizeRequest};
-use limine::response::{HhdmResponse, MemoryMapResponse};
+use limine::request::{
+    FramebufferRequest, HhdmRequest, MemoryMapRequest, MpRequest, StackSizeRequest,
+};
+use limine::response::{HhdmResponse, MemoryMapResponse, MpResponse};
 use limine::BaseRevision;
 
 use crate::kprintln;
@@ -28,6 +30,10 @@ static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[link_section = ".requests"]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
+#[used]
+#[link_section = ".requests"]
+static MP_REQUEST: MpRequest = MpRequest::new();
+
 /// Validate bootloader answered with a supported revision.
 pub fn init() {
     assert!(
@@ -44,6 +50,12 @@ pub fn memory_map() -> Option<&'static MemoryMapResponse> {
 /// HHDM slide for phys<->virt conversion (used by PMM self-test + VMM).
 pub fn hhdm_offset() -> Option<u64> {
     HHDM_REQUEST.get_response().map(HhdmResponse::offset)
+}
+
+/// MP (SMP) response: CPU list for AP bring-up. Valid for kernel lifetime
+/// (bootloader memory is never handed to the PMM).
+pub fn smp_response() -> Option<&'static MpResponse> {
+    MP_REQUEST.get_response()
 }
 
 /// Raw framebuffer geometry for the fb console. The address Limine reports

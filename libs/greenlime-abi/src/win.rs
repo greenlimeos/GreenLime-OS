@@ -28,3 +28,18 @@ pub const WIN_CLIENT_READ: u32 = 5;
 /// Close window `arg0` (server: `REPLY_OK`) — same path as the titlebar
 /// X button, which also EOFs any pending WIN_CLIENT_READ.
 pub const WIN_DESTROY: u32 = 6;
+
+/// Wallpaper service handshake (ring-3 wallpaper task, task 8; v1.1 GUI):
+/// `arg0` = decoded source width, `arg1` = decoded source height (pixels).
+/// Replies `REPLY_OK` with `arg0` = target width | (target height << 32)
+/// — the framebuffer dims the task scales to — or `REPLY_ERR` (no wall
+/// permission). Requires CAP_WALL; winsrv checks the stamped sender's
+/// caps at the gate like every other dangerous surface.
+pub const WIN_WALL_SETUP: u32 = 7;
+/// Wallpaper pixels: `arg0` = FIRST pixel index of this run (row-major,
+/// 0 .. src_w*src_h); payload = consecutive RGB triples (3 B/px) for that
+/// run, already scaled to the target dims. Fire-and-forget; blocks only
+/// when the port queue is full (natural flow control).
+pub const WIN_WALL_ROWS: u32 = 8;
+/// Last wallpaper row landed (no args): winsrv prints its proof line.
+pub const WIN_WALL_DONE: u32 = 9;

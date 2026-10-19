@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""GreenLime multi-window proof: second client, focus routing, taskbar
+"""GreenLime multi-window proof: second client, focus routing, dock
 buttons, window drag + resize + close — one boot, virtio-tablet pointer.
 
 Usage: python3 scripts/qmp_multitest.py [iso]
 
-Geometry (asserted from the server's own serial log first):
-  demo window opens at 700,120 540x330 (id 1, taskbar slot center 124,776
-  once the terminal is open: slots Start, terminal, demo).
+Geometry (asserted from the server's serial log first):
+  demo window opens at 700,120 540x330 (id 2 — id 1 is the system Files
+  window; with the terminal open the dock has Start, terminal, demo —
+  demo slot center (688,776), Start slot center (616,776)).
 
 Checks (serial unless marked "screen"):
   1. demo client spawned + window created
   2. screen: demo titlebar pixels at the expected geometry
   3. keys land in demo when focused:      [demo] got: hi
-  4. launch Terminal from the menu, then click back and forth:
+  4. launch Terminal from the start card, then click back and forth:
      focus win 0 + focusok on serial AND demo's input count stays 1
-  5. taskbar icon refocuses demo:       focus win 1 + [demo] got: q
-  6. titlebar drag moves the window:      win 1 moved to 600,80 (+ screen)
-  7. corner grip resizes:                 win 1 resized 580x370
-  8. titlebar X closes it:                win 1 closed + demo says bye (+ screen)
+  5. dock icon refocuses demo:          focus win 2 + [demo] got: q
+  6. titlebar drag moves the window:      win 2 moved to 600,80 (+ screen)
+  7. corner grip resizes:                 win 2 resized 580x370
+  8. titlebar X closes it:                win 2 closed + demo says bye (+ screen)
 """
 import json
 import os
@@ -32,9 +33,10 @@ HSOCK = "/tmp/gl-hmp5.sock"
 ISO = sys.argv[1] if len(sys.argv) > 1 else "dist/GreenLime.iso"
 SER = "dist/multi-serial.log"
 
-# Focused titlebar color (38, 44, 58) / unfocused (26, 30, 40).
-TITLE_BG = (38, 44, 58)
-TITLE_BG2 = (26, 30, 40)
+# Focused titlebar (44,46,52) / unfocused (33,35,40) — the v1.2
+# Fluent dark theme.
+TITLE_BG = (44, 46, 52)
+TITLE_BG2 = (33, 35, 40)
 
 
 def qmp(sock, cmd):
@@ -197,7 +199,7 @@ def main():
         serial = read_serial()
         check("demo window created",
               "[demo] window open" in serial)
-        m = re.search(r"\[winsrv\] win 1 open at (\d+),(\d+) (\d+)x(\d+)",
+        m = re.search(r"\[winsrv\] win 2 open at (\d+),(\d+) (\d+)x(\d+)",
                       serial)
         check("server logged geometry 700,120 540x330",
               m and m.group(0).endswith("700,120 540x330"))
@@ -259,19 +261,21 @@ def main():
         check("keys -> demo window ([demo] got: hi)",
               wait_for("[demo] got: hi", timeout=45))
 
-        # --- Launch Terminal from the menu, then click back and forth ----
-        # Start mark (28, 776), Terminal row 0 (208, 313): the launcher
-        # opens the terminal on demand (it never opens at boot).
-        click_at(28, 776)
-        click_at(208, 313)
+        # --- Launch Terminal from the start card, then click back and forth
+        # Start dock slot (616, 776) — with the demo window open the pill
+        # holds Start + demo (n=2: pill x=580, slot0 center 616). Then the
+        # Terminal pinned tile (530, 450): the launcher opens the terminal
+        # on demand (it never opens at boot).
+        click_at(616, 776)
+        click_at(530, 450)
         check("menu launched the terminal",
               wait_for("[winsrv] launch Terminal", timeout=30))
         check("terminal opened + focused (focus win 0)",
               wait_for("[winsrv] focus win 0", timeout=30))
         # --- Click demo, then terminal: keys must follow focus ------------
         click_at(970, 290)  # demo window content
-        check("click focuses demo (focus win 1)",
-              wait_for("[winsrv] focus win 1", timeout=30))
+        check("click focuses demo (focus win 2)",
+              wait_for("[winsrv] focus win 2", timeout=30))
         click_at(400, 400)  # terminal content
         check("click focuses terminal (focus win 0)",
               wait_for("[winsrv] focus win 0", timeout=30))
@@ -282,12 +286,12 @@ def main():
         n1 = read_serial().count("[demo] got: ")
         check("demo input count still 1 (no key leak)", n1 == 1)
 
-        # --- Taskbar icon refocuses the demo ------------------------------
-        # Left-aligned slots (Start, terminal, demo) -> demo slot 2
-        # = 104..144, center (124, 776).
-        click_at(124, 776)
-        check("taskbar icon focuses demo (focus win 1)",
-              wait_for("[winsrv] focus win 1", timeout=30))
+        # --- Dock icon refocuses the demo ---------------------------------
+        # Centered pill, three slots (Start, terminal, demo): pill x=556 →
+        # demo slot i=2 spans 668..708, center (688, 776).
+        click_at(688, 776)
+        check("dock icon focuses demo (focus win 2)",
+              wait_for("[winsrv] focus win 2", timeout=30))
         type_keys(["q", "ret"])
         check("keys -> demo again ([demo] got: q)",
               wait_for("[demo] got: q", timeout=45))
@@ -295,28 +299,30 @@ def main():
         # --- Drag the titlebar --------------------------------------------
         drag(900, 135, 800, 95)  # dx=200, dy=15 -> window at 600,80
         check("titlebar drag moved window (moved to 600,80)",
-              wait_for("[winsrv] win 1 moved to 600,80", timeout=30))
+              wait_for("[winsrv] win 2 moved to 600,80", timeout=30))
         shot("dist/fb-multi-moved.ppm")
-        n_moved = color_px("dist/fb-multi-moved.ppm", (605, 84, 1135, 100))
+        n_moved = color_px("dist/fb-multi-moved.ppm", (605, 84, 1135, 100),
+                           TITLE_BG)
         print(f"screen: titlebar at new pos px={n_moved}", flush=True)
         check("screen: titlebar at new position", n_moved > 3500)
 
         # --- Resize via the corner grip -----------------------------------
         drag(1132, 402, 1180, 450)  # (600+540-16, 80+330-16) grip center
         # Tablet scaling truncates guest px <-> device units: allow +/-2.
-        m = wait_for_match(r"\[winsrv\] win 1 resized (\d+)x(\d+)", timeout=30)
+        m = wait_for_match(r"\[winsrv\] win 2 resized (\d+)x(\d+)", timeout=30)
         check("grip resize (resized ~580x370)",
               m and abs(int(m.group(1)) - 580) <= 2
               and abs(int(m.group(2)) - 370) <= 2)
 
         # --- Close via the titlebar X -------------------------------------
         click_at(1161, 95)  # close btn = (600+580-30, 86, 22, 18)
-        check("X closed the window (win 1 closed)",
-              wait_for("[winsrv] win 1 closed", timeout=30))
+        check("X closed the window (win 2 closed)",
+              wait_for("[winsrv] win 2 closed", timeout=30))
         check("client saw the EOF (window closed, bye)",
               wait_for("[demo] window closed, bye", timeout=30))
         shot("dist/fb-multi-closed.ppm")
-        n_gone = color_px("dist/fb-multi-closed.ppm", (605, 84, 1135, 100))
+        n_gone = color_px("dist/fb-multi-closed.ppm", (605, 84, 1135, 100),
+                          TITLE_BG)
         print(f"screen: titlebar gone px={n_gone}", flush=True)
         check("screen: titlebar gone after close", n_gone < 300)
 

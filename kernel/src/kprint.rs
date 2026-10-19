@@ -18,16 +18,30 @@ pub fn init() {
     *guard = Some(port);
 }
 
-struct SerialWriter;
+/// One locked serial write per message (SMP: per-piece locking interleaved
+/// mid-message across CPUs and hid real bugs — see the yield-race hunt).
+/// Renders into a 1 KiB stack buffer (no heap: prints predate it), then a
+/// single lock hold writes serial + mirrors the screen.
+struct MsgBuf {
+    buf: [u8; 1024],
+    len: usize,
+}
 
-impl Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        if let Some(port) = SERIAL.lock().as_mut() {
-            // Uart16550Tty already implements fmt::Write.
-            port.write_str(s)?;
+impl MsgBuf {
+    const fn new() -> Self {
+        Self {
+            buf: [0; 1024],
+            len: 0,
         }
-        // Mirror to screen (own lock; fb code never kprints, so no recursion).
-        fb::print_str(s);
+    }
+}
+
+impl Write for MsgBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let room = self.buf.len().saturating_sub(self.len);
+        let n = s.len().min(room);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
         Ok(())
     }
 }
@@ -37,7 +51,19 @@ pub fn _kprint(args: fmt::Arguments) {
     // IRQ-safe: a timer tick must never deadlock on the console lock
     // while the boot CPU holds it mid-print.
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let _ = SerialWriter.write_fmt(args);
+        let mut msg = MsgBuf::new();
+        let _ = msg.write_fmt(args);
+        // Back the length off any split multibyte char (1 KiB truncation).
+        let mut n = msg.len;
+        while n > 0 && core::str::from_utf8(&msg.buf[..n]).is_err() {
+            n -= 1;
+        }
+        let s = unsafe { core::str::from_utf8_unchecked(&msg.buf[..n]) };
+        if let Some(port) = SERIAL.lock().as_mut() {
+            let _ = port.write_str(s);
+        }
+        // Mirror to screen (own lock; fb code never kprints, so no recursion).
+        fb::print_str(s);
     });
 }
 

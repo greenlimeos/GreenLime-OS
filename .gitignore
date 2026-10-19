@@ -5,3 +5,6 @@
 assets/fonts/*.ttf
 assets/fonts/*.otf
 __pycache__/
+
+# Stray installer downloads (WSL env setup artifacts)
+/*.deb

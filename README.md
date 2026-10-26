@@ -4,15 +4,39 @@ A from-scratch operating system in Rust — custom x86-64 hybrid kernel,
 composited GUI desktop (LimeDE), IPC, ring-3 userland, SMP, and a ring-3
 network stack. Long-term goal: compete with Windows 11.
 
-> Status: **v1.0** ✅ — the 1.0 line (made by GLM 5.3) brings SMP, ring-3
-> networking (DHCP/ICMP/DNS/TCP) and the Fluent-dark desktop: wallpaper
-> streamed by a userspace service, Files app, quick-settings flyout,
-> rounded acrylic windows with soft shadows and animations. The earlier
-> boot→GUI phases (v0.1–v0.9) are the groundwork the same tree builds on.
-> Boots via Limine into a dark acrylic desktop over your own wallpaper:
-> floating dock/tray pills, centered Start card with pinned tiles and
-> quick-settings flyout, draggable/maximizable rounded windows, Files
-> explorer, DHCP+ICMP+DNS+TCP networking.
+![GreenLime OS v1.1 desktop in QEMU (1280×800): charcoal glass, the Demo
+client window, and the Windows 11-style taskbar — lime start button,
+Files/Terminal/Settings pins, one button per running client, RTC clock
+tray](OS_screenshot.png)
+
+> Status: **v1.1 ✓** — the 1.0 line (made by GLM 5.3) brought
+> SMP, ring-3 networking (DHCP/ICMP/DNS/TCP) and the Fluent-dark desktop:
+> wallpaper streamed by a userspace service, Files app, rounded acrylic
+> windows with soft shadows and animations.
+> v1.1 adds M13: real SSE2 for userland (per-task FXSAVE/FXRSTOR across
+> every context switch) and a bit-exact SSE2 compositor — M14: a
+> writable FAT32 (persisted writes survive full reboots) — Limine
+> 12.9.4 — and a full **LimeDE rework** to a Windows-11-style charcoal
+> glass desktop: a bottom 48px taskbar with a **centered cluster** (the
+> lime start button, pinned tiles, one button per running client, and
+> the cluster re-centers as windows open/close), a floating acrylic
+> **start card** above the bar with live-search pinned tiles
+> (**Files / Terminal / Settings / Demo** — the Demo tile relaunches
+> the demo even after it exited, M15.1), a right two-line RTC clock
+> tray, azure Files folder glyphs and a brand **lime** accent. Boots
+> via Limine into the dark glass desktop over a `wallpaper.png` you can
+> simply replace, with draggable/maximizable rounded windows, Files
+> explorer and DHCP+ICMP+DNS+TCP networking. M15 adds an **app
+> graphics API**: clients flip their own window into graphics mode
+> (`WIN_BLIT_*`: owner-checked, budget-capped per-client canvases
+> streamed as RGB runs) — the demo ships a 40-frame animated canvas
+> (ball on a gradient + ridge wave) and the compositor keeps the mouse
+> cursor steady on screen under any message flood. **M15.1** makes the
+> start card's Demo tile a real launcher — demo alive → focus (never
+> duplicates), demo exited → respawn from the baked-in ELF via a
+> task-slot reap (the demo gets its boot task id right back) — and
+> drops every userland build warning to zero via an SSE-baked JSON
+> target spec (`targets/x86_64-greenlime-sse.json`).
 
 > 🤖 **Made by GLM 5.3:** every line of this OS — kernel, servers,
 > userland, docs — was written by **GLM 5.3** (the AI model) through
@@ -54,8 +78,9 @@ can't build this).
 git clone https://github.com/greenlimeos/GreenLime-OS.git
 cd GreenLime-OS
 
-# 2. One-time setup — downloads and installs everything automatically
-#    (Rust nightly, QEMU, xorriso, mtools, Limine):
+# 2. One-time setup — installs everything automatically in one command
+#    (the EXACT pinned Rust toolchain — nightly-2026-10-25 == 1.101.0-nightly,
+#    never "latest" — plus QEMU, xorriso, mtools, Limine):
 bash scripts/setup-wsl.sh
 
 # 3. Build + make the ISO + boot it in QEMU (one command):
@@ -81,35 +106,54 @@ full serial log prints at the end for copy-paste bug reports.
 | `make run-nographic` | No window, serial only. Exit with `Ctrl+A, X` |
 | `make debug` | GDB stub on `:1234`, CPU frozen — attach with `gdb-multiarch` from a 2nd terminal |
 
+### VirtualBox note
+
+You can also boot the ISO in VirtualBox ("Other (64-bit)", BIOS boot) —
+the kernel CPUID-gates SMEP/SMAP so it no longer triple-faults on
+VirtualBox's CPU profile (proved by `scripts/qmp_vboxsim_test.py`).
+Expect fewer built-ins there: VirtualBox exposes no virtio devices, so
+**no `/disk` storage and no networking** (`net` fails closed,
+`[net] no NIC claimed`). The desktop, Files (ramfs), terminal, and the
+PS/2 pointer all work. For troubleshooting, enable the serial COM1 port
+in the VM settings (Port Mode: *Raw File*, e.g. `C:\...\serial.log`) —
+the serial mirror is the kernel's ground truth for what happened.
+
 ## Using the desktop
 
 - **Mouse:** point, click, drag window titlebars (or the 16px grip), or
   double-click a titlebar to maximize. No pointer grab, no `Ctrl+Alt+G` —
-  it just works.
-- **Taskbar strip:** three floating pills — left **weather**, centered
-  **dock** (start mark + one slot per window, focus = accent LED), right
-  **tray** (Wi-Fi/speaker/battery glyphs + real RTC clock `HH:MM` +
-  `Day N`).
-- **Start menu:** click the start mark → 560×436 acrylic card: greeting
-  header, 5 pinned tiles (Files / Terminal / Demo / Settings / About),
-  search pill (type to filter, Enter launches, Esc closes). Clicks
-  outside dismiss.
-- **Quick settings:** click the tray → acrylic flyout with 2×2 toggles
-  (Wi-Fi / Bluetooth / Night light / Battery saver) and click-to-set
-  volume + brightness sliders; "All settings" opens Settings. One
-  flyout at a time, outside-click dismiss.
-- **Terminal:** launch from the menu (never opens at boot). Builtins:
-  `help echo cat ps kill ls exit`, plus ring-3 network tools `ping` and
-  `fetch` through the IPC net broker. Its ✕ closes it; reopening
-  restores buffered text.
-- **Files:** launch from the menu — the explorer window lists the
-  filesystem with folder glyphs; click a directory to enter, `../` pops
-  back.
+  it just works. Hovering lifts and highlights the taskbar cells.
+- **Taskbar:** full-width 48px bottom bar with a **centered cluster** of
+  40px cells — the lime **start button**, the **Files / Terminal /
+  Settings** pins (azure folder / lime `>_` glyphs), then one button
+  per running client (mini azure window). Running/open state shows a
+  lime underline under the cell. Clicking a client button refocuses
+  its window; the cluster re-centers as clients open and close.
+- **Start card:** click the start button (or the left Windows key) →
+  floating acrylic card above the bar with a search field and pinned
+  tiles **Files / Terminal / Settings / Demo**. Typing filters the
+  tiles live; **Demo** focuses the demo window while it is alive and
+  relaunches it from the baked-in ELF once the demo task exited
+  (M15.1). Clicks outside the card dismiss it.
+- **Tray:** right zone with the real RTC two-line clock (`HH:MM` over
+  `YYYY-MM-DD`, day rollover handled) — clock only by design; hover
+  shows a highlight, nothing opens.
+- **Terminal:** launch from its start-card tile — it never opens at
+  boot. Builtins: `help echo cat ps kill ls exit`, plus ring-3
+  network tools `ping` and `fetch` through the IPC net broker. Its ✕
+  closes it; reopening restores buffered text.
+- **Files:** launch from its start-card tile — the explorer window
+  lists the filesystem with azure folder glyphs; click a directory to
+  enter, `../` pops back.
+- **Settings:** opens from its start-card tile as a floating acrylic
+  info card (430,170,420,300) — drag and ✕ like any window.
 - **Windows:** focus follows clicks, `WIN_CREATE` never steals focus,
-  ✕ closes, rounded corners + soft shadows throughout. Windows, the
-  menu, popups and the flyout all open with a 120 ms fade+rise.
-- **Popups:** About and Settings dialogs, centered 460×210, X mark, any
-  click dismisses.
+  ✕ closes, rounded corners + soft shadows throughout. Windows and the
+  start card open with a 120 ms fade+rise.
+- **Wallpaper:** drop in your own `assets/wallpapers/wallpaper.png`
+  (≤1600×900) — `build.rs` picks `.png` → `.jpeg` → `.jpg` at build
+  time and the userspace service streams it in; no code changes (the
+  repo ships a generated blue-wave default in the same spirit).
 
 ## Architecture
 
@@ -137,7 +181,10 @@ rings keep their IRQ-stack PTEs mapped in every user CR3).
   consumed at a safe point).
 - **arch/x86_64**: GDT (kcode/kdata/ucode/udata + per-CPU TSS), IDT
   (breakpoint/UD/PF/GP/DF + timer/keyboard IRQs), masked PIC, PIT @100Hz,
-  verified SMEP + SMAP, `SYSCALL`/`SYSRET` gate with IF masked.
+  SMEP + SMAP enabled **when the CPU exposes them** (CPUID.(7:0)-
+  gated; VirtualBox CPU profiles hide both — an unconditional CR4 write
+  would #GP there → triple fault; found live and fixed, see
+  `scripts/qmp_vboxsim_test.py`), `SYSCALL`/`SYSRET` gate with IF masked.
 - **Memory**: PMM frame allocator (4 KiB frames, ~126k free on 512M),
   16 MiB static heap (`LockedHeap`), VMM with per-task user tables,
   W^X enforced (ELF refuses W+X), KASLR seed (per-task stack jitter).
@@ -197,9 +244,9 @@ All loop forever on their service port, replying to the kernel-stamped sender.
   and block until a full line is typed.
 - **winsrv** — desktop compositor (see LimeDE below). Protocol:
   `WIN_WRITE`, `WIN_READ`, `WIN_CREATE`, `WIN_CLIENT_*`, `WIN_DESTROY`,
-  and the wallpaper service: `WIN_WALL_SETUP/ROWS/DONE` — task 8 streams
-  decoded JPEG rows through the IPC gate and the kernel converts + blits
-  (it never parses image bytes).
+  and the wallpaper service: `WIN_WALL_SETUP/ROWS/DONE` — task 8
+  streams decoded PNG/JPEG rows through the IPC gate and the kernel
+  converts + blits (it never parses image bytes).
 - **net** — ABI net broker on `PORT_NET` (tagged protocol over the same
   frozen IPC gate): NET_OPEN/SENDTO/RESOLVE/CLOSE for UDP,
   NET_CONNECT/SEND/RECV/CLOSE for TCP (polls to ESTABLISHED, streaming
@@ -220,8 +267,8 @@ All loop forever on their service port, replying to the kernel-stamped sender.
 - **virtio-net**: legacy-transport devices with MSI-X IRQ-driven RX/TX
   wake (entry 0 → vector 0x40, both queue vectors wired; INTx fallback
   via the q35 PIRQ router kept as backup).
-- **rtc**: boot time + minute-of-day (feeds the tray clock, "Day N" and
-  the start-card greeting).
+- **rtc**: boot date + time and minute-of-day (feeds the tray two-line
+  clock `HH:MM` / `YYYY-MM-DD`, with uptime-based day rollover).
 - **pci**: full bus enumeration (host bridge, `1234:1111` display,
   virtio input/blk/net, ISA bridge, AHCI (detected), SMBus). AHCI driver
   proper is future work.
@@ -230,12 +277,23 @@ All loop forever on their service port, replying to the kernel-stamped sender.
 
 ## Filesystem
 
-Read-only FAT32 (`kernel/src/fs/fat32.rs`): 512-byte sectors, no LFN,
-8.3 uppercase compare, BPB validation (signature, `FAT32` magic, nonzero
-geometry), `.`/`..`/deleted/volume-label entries skipped, directory reads
-capped at 64 KiB, file reads capped at 1 MiB, FAT-chain cycles broken by
-the byte cap. Test disk (`dist/disk.img`, 32 MiB) is made by
-`scripts/make-disk.sh` via `make disk`. Files and shell read it.
+FAT32 (`kernel/src/fs/fat32.rs`) — a **writable filesystem since M14
+(v1.1)**: 512-byte sectors, no LFN, 8.3 uppercase compare, BPB validation
+(signature, `FAT32` magic, nonzero geometry), `.`/`..`/deleted/volume-label
+entries skipped, directory chains capped at 64 KiB, file writes capped at
+1 MiB, FAT-chain cycles broken by hard bounds. The write path (single vfs
+task, so `&mut self` is race-free): first-fit FAT allocation with a resume
+cursor, `EOC`-terminated chain building, file create/delete, `mkdir` with
+`.`/`..` cluster, empty-dir-only deletes, zero-filled extends (holes read
+as zeros), truncate with cluster release, and pwrite-at-offset. Durability
+is simple and real: writes go straight through the polling block driver,
+no cache to lose — `echo m14proof > /disk/m14.txt` then `cat` in a fresh
+boot shows the file back. Single FAT mirror is kept in sync (FAT[0]);
+FSInfo free-counts stay stale, which is legal. Test disk
+(`dist/disk.img`, 32 MiB) is made by `scripts/make-disk.sh` via
+`make disk` (delete the file to rebuild it — the script reuses an existing
+image). Shell and Files app read it; the shell writes it (admin-gated
+server-side — only init/shell hold the disk caps).
 
 ## Userland
 
@@ -243,7 +301,8 @@ Ring 3, built static for the ELF loader, syscalls/IPC only:
 
 - **init** — PID 1 (task 3): first user program, says hello, yields, exits.
 - **shell** (task 4) — interactive shell: line editing with history,
-  `help echo cat ps kill ls exit` + `ping <host>` / `fetch <url>` through
+  `help echo cat ps kill ls exit ping fetch rm mkdir` + `echo x > /disk/f`
+  for file writes (M14), `ping <host>` / `fetch <url>` through
   the net broker, reads via dev `term0`, mirrors output to serial (the
   test harness' ground truth), checks reply senders and refuses forged
   messages.
@@ -254,10 +313,14 @@ Ring 3, built static for the ELF loader, syscalls/IPC only:
   sleeps between bursts so the CPUs reach idle); its heartbeats
   (`[fuzz] iters=N`) and panic handler (payload + `file:line`) are the
   soak ground truth: the 1h release-ISO soak ran clean end to end.
-- **wallpaper** (task 8) — embeds `assets/wallpapers/wallpaper.jpeg`,
-  decodes it with zune-jpeg in its own 16 MiB heap, streams RGB rows to
-  winsrv over the IPC gate. The kernel never parses image data — that's
-  the trust boundary.
+- **wallpaper** (task 8) — embeds `assets/wallpapers/wallpaper.png`
+  (`build.rs` picks `.png` → `.jpeg` → `.jpg`, emitting
+  `GREENLIME_WALLPAPER[+_FMT]`), decodes it with zune-png 0.5.2 (PNG)
+  or zune-jpeg (JPEG) in its own 16 MiB heap, streams RGB rows to
+  winsrv over the IPC gate. PNG decode is lean (one exact-size Vec,
+  ready-to-blit conversion downscales 1600×900 → 1280×800) with a
+  ~13 MB budget guard that exits politely instead of OOM-ing. The
+  kernel never parses image data — that's the trust boundary.
 
 ## LimeDE desktop
 
@@ -266,23 +329,35 @@ geometry and animation math documented in `docs/GUI.md`):
 
 - **Compositor**: back buffer + cached wallpaper rows (from the streamed
   decode), single-union damage rect per lap, compose order
-  desktop → window shadows → windows → dock/weather/tray pills →
-  start card → quick settings → popup; the cursor is drawn as an
+  desktop → window shadows → windows → taskbar (centered cluster +
+  clock zone) → start card; the cursor is drawn as an
   overlay, never baked into the back buffer. Idle = zero fb traffic.
-- **Theme "Fluent dark"**: charcoal surfaces `BG (32,34,38)`, focused
-  titlebar `(44,46,52)`, ink `FG (208,214,224)`, fluent accent
-  `(76,194,255)`. Every panel/card/pill is rounded (`RAD 10/8/10`) and
-  blends the wallpaper through it — acrylic (`PANEL_A=214`,
-  `CARD_A=226`) — with 4-ring soft shadows. Windows, menu, popups and
-  the quick flyout open with a 120 ms fade+rise animation.
+- **SSE2 compositor (v1.0.1)**: wallpaper copy, present blit and both
+  blend paths run 4 px per vector through hand-written SSE2 kernels
+  (`arch/x86_64/simd.rs`), bit-exact against the scalar reference
+  (`blend_px`): `[m13] simd: SSE2 blend bit-exact on 20480 px`, release
+  measured 7.8x faster blends (92.8x on the debug build). XMM0–15 are
+  per-task state — FXSAVE/FXRSTOR in every context switch
+  (`[m13] xmm: 256/256 sentinel bytes survived a task switch`) — while
+  kernel Rust code stays integer-only, so IRQ handlers can never touch
+  XMM and no IRQ path needs an FXSAVE.
+- **Theme "LimeDE dark" (v1.1)**: charcoal glass with Windows-11
+  weight: `BG (30,32,37)`, focused titlebar `(38,40,46)`, unfocused
+  `(30,32,36)`, ink `FG (206,212,220)`, brand lime accent
+  `(170,232,64)`, Files azure `(56,126,236)`. Every taskbar cell,
+  start-card tile and window is rounded (`RAD 14/12/10`) and blends
+  the wallpaper through it — acrylic layers at `PANEL_A=214`,
+  `CARD_A=236`, `CHIP_A=238`) — with
+  4-ring soft shadows. Windows and the start card
+  open with a 120 ms fade+rise animation. No desktop watermark.
 - **Detector rule**: the cursor `(240,240,240)` is the only pixel on
   screen with all three channels ≥239 (tests locate it by that); every
   painted UI color keeps one channel below the line on purpose, and the
-  wallpaper service clamps its own pixels the same way.
+  wallpaper service clamps its own pixels to ≤238 the same way.
 - **Input pipeline**: virtio-tablet owns the pointer; PS/2 bytes are
   swallowed when the tablet exists; focus follows clicks; titlebar drag,
   double-click maximize, 16px resize grip, ✕ close; scrollback-capped
-  terminal text; Start search routes keys (Enter = launch first match).
+  terminal text; typing filters the start card's tiles live.
 - **QEMU side**: QEMU registers its PS/2 mouse before our tablet, so a
   helper (`scripts/activate_tablet.py`, double-forked daemon) issues HMP
   `mouse_set` over a monitor socket to promote the tablet to absolute —
@@ -300,8 +375,13 @@ options (DejaVu, Inter, Fira, Plex).
 
 ## Build system & scripts
 
-- **Toolchain**: `cargo +nightly`, target `x86_64-unknown-none`,
-  pinned by `rust-toolchain.toml`. Build cache lives in
+- **Toolchain**: exact date-pinned nightly via `rust-toolchain.toml` —
+  `nightly-2026-10-25`, i.e. rustc/cargo `1.101.0-nightly`
+  (`12433c307 2026-10-24`). `scripts/setup-wsl.sh` installs exactly that
+  build and verifies the compiler version before it prints done; plain
+  `cargo` in this tree always compiles with it (no `+nightly` selectors —
+  a channel override would bypass the pin). Target
+  `x86_64-unknown-none`. Build cache lives in
   `~/.cache/greenlime-target` (not in the repo) — override with
   `make CARGO_TARGET_DIR=/path ...`.
 - **ISO**: `xorriso` (BIOS El Torito + UEFI edd image) + `limine
@@ -319,16 +399,19 @@ options (DejaVu, Inter, Fira, Plex).
 
 ## Test suite
 
-Nine headless QMP tests, all green, plus the fuzz soak and pointer
+Ten headless QMP tests, all green, plus the fuzz soak and pointer
 utilities (`python3 scripts/<test>.py <iso>`):
 
 | test | proves |
 |---|---|
-| `qmp_desktop_test.py` | Start card tiles (exact-color count), About popup, dismiss |
-| `qmp_multitest.py` | 18-check multi-window proof: focus, drag, resize, close, EOF |
-| `qmp_tablet_test.py` | splash band + absolute cursor corners + menu open/dismiss |
+| `qmp_desktop_test.py` | Win11 desktop proof: start card opens with the start-button underline, Settings window opens from its tile, click-away closes the card but leaves the window (exact-color counts) |
+| `qmp_multitest.py` | 18-check multi-window proof: focus, taskbar demo-button refocus, drag, resize, close, EOF |
+| `qmp_tablet_test.py` | splash band + absolute cursor corners + start card open/dismiss via the start button |
 | `qmp_input_test.py` | keyboard scancodes reach the guest, cursor moves exactly |
-| `qmp_type_test.py` | blind typing lands in the shell console |
+| `qmp_type_test.py` | blind typing lands in the terminal opened from the Terminal start-card tile |
+| `qmp_disk_test.py` | M14: shell writes FAT32 (`echo >`, `rm`, `mkdir`), non-empty-dir delete refused, and phase 2 re-reads the file after a full reboot on the same disk |
+| `qmp_m15_test.py` | M15 + M15.1, 21 checks: the demo app's canvas animation — `WIN_BLIT_SETUP/BLIT/END` lifecycle on serial, screendump proves the lime ball + azure wave pixels inside the window (and that they move between frames), teardown returns the window to a working console — then the respawn: after X-close, the start card's Demo tile respawns the demo client on its reaped task slot (`launch Demo (respawned task 5)`, fresh `owner 5` canvas, second close/EOF/exit), with respawn-run markers judged inside a serial byte-offset window |
+| `qmp_vboxsim_test.py` | boots with VirtualBox's story — `qemu64` without SMEP/SMAP AND zero virtio devices: CR4 CPUID-gating (no triple fault), net fail-closed, desktop still paints |
 | `qmp_net_test.py` / `qmp_net_shell.py` | DHCP + ICMP + DNS + the ring-3 `ping`/`fetch` tools |
 | `qmp_smp_test.py` | 2 cores online, IPIs answered, per-CPU state |
 | `qmp_mouse_idle.py`, `verify_tablet_pointer.py`, `probe_mice.py`, `qmp_screendump.py` | pointer + utility layer |
@@ -342,18 +425,30 @@ Plus the **1h syscall-fuzz soak on the release ISO**: clean end to end,
 | Tool | Version used |
 |---|---|
 | QEMU | 11.1.2 (built from source into `~/.local`) |
-| Rust | 1.101.0-nightly (via `cargo +nightly`) |
+| Rust | `nightly-2026-10-25` (= 1.101.0-nightly, exact pin in `rust-toolchain.toml`) |
 | xorriso | 1.5.8.pl02 (libburnia, built from source into `~/.local`) |
-| Limine | 12.9.3 (binaries in `~/limine`, via `setup-wsl.sh`) |
+| Limine | 12.9.4 (binaries in `~/limine`, via `setup-wsl.sh`) |
 | Host | Windows 11 with WSL2 (Ubuntu 22.04/24.04 runs inside WSL), plus `mtools`, `git`, `curl` |
 | Guest | `-m 512M`, `-smp 2`, 1280×800×32 framebuffer, ~492 MiB usable RAM |
 
 ## Platform constraints
 
-- **No SSE** on `x86_64-unknown-none` (only fxsr/x87): all float math is
-  softfloat — hot paths (especially the compositor) must be integer-only.
-- No 1 GiB pages; AHCI flagged but no driver yet; text-only windows (no
-  pixels/cells client API yet); subset font.
+- **Kernel stays soft-float by design** (`x86_64-unknown-none`): IRQ
+  paths can never touch XMM. This constraint was never userland's: since
+  M13 userland runs real SSE/SSE2 (per-task FXSAVE/FXRSTOR + SSE2
+  compositor kernels), and since M15.1 it builds against the SSE-baked
+  target spec `targets/x86_64-greenlime-sse.json` — zero build warnings,
+  no CLI-vs-target flag fights.
+- **Storage is virtio-blk only**: real disks would need the AHCI
+  driver — deferred by design until real-hardware work; the controller
+  is detected + reported by the PCI scan (`[drivers] ahci: SATA
+  controller present (full driver: later)`), and QEMU's disk goes
+  through virtio-blk instead. The writable FAT32 (M14: writes persist
+  across full reboots) sits on virtio-blk. Story in `docs/STORAGE.md`.
+- No 1 GiB pages; windows are text + chrome, but any client may flip
+  its own window into a budget-capped per-window graphics canvas
+  (M15 `WIN_BLIT` — the demo's 40-frame animation is the proof);
+  subset font.
 
 ## Security
 
@@ -373,13 +468,39 @@ yet — don't put secrets in it.
   W^X/KASLR/fuzz, 1h soak
 - [x] M11 Fluent light + userspace wallpaper + Files app
 - [x] M12 Fluent dark — charcoal acrylic faces, soft shadows,
-  animations, quick settings
+  animations
+
+**v1.0.1 adds M13** — SSE + fast compositor: SSE/SSE2 enabled for
+userland (BSP + APs, `#XM` in the IDT), per-task FXSAVE/FXRSTOR in the
+context switch (XMM survives switches and interrupts), and bit-exact
+SSE2 blend/copy/blit kernels — full suite green with every contract
+pixel count unchanged. Kernel SSE ships as asm kernels, not intrinsics:
+the `x86_64-unknown-none` spec pairs `-sse,+soft-float` and LLVM rejects
+`target_feature` on it (rust#117938), keeping IRQ paths integer-only by
+construction.
+
+**v1.1 ships M14 → M15.1** — storage, the big visual rework, app
+graphics and a taskbar that launches programs:
+
+- [x] M14 writable FAT32 — shell `echo >` / `rm` / `mkdir`; writes
+  persist across full reboots (disk test 12/12 + 3/3 on the same image)
+- [x] M14.5 LimeDE rework — full visual pass: charcoal glass, brand
+  lime + azure, drop-in PNG wallpaper, RTC date tray; final chrome is
+  the Windows-11-style centered taskbar + start card
+- [x] M15 app graphics API — `WIN_BLIT_*` per-window canvases
+  (owner-checked, budget-capped), the demo's 40-frame zero-heap
+  animation, cursor steady under any message flood
+- [x] M15.1 launcher + task-slot reap — the start card's Demo tile
+  respawns the exited demo client (`[winsrv] launch Demo (respawned
+  task 5)`, the demo's boot task id comes right back); freed task ids
+  recycle kernel-wide; userland builds emit zero warnings on the
+  SSE-baked target spec `targets/x86_64-greenlime-sse.json`
 
 M1–M9 are the pre-1.0 groundwork (boot, memory, userspace, fonts, IPC,
 storage, window server + compositor, identity hardening) — kept as
 history in `docs/ROADMAP.md`.
 
-See `docs/ROADMAP.md`. v1.0 ships verified in QEMU.
+See `docs/ROADMAP.md`. v1.0 through v1.1 (M15.1) verified in QEMU.
 
 ## License
 

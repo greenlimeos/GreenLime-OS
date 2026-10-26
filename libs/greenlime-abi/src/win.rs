@@ -43,3 +43,32 @@ pub const WIN_WALL_SETUP: u32 = 7;
 pub const WIN_WALL_ROWS: u32 = 8;
 /// Last wallpaper row landed (no args): winsrv prints its proof line.
 pub const WIN_WALL_DONE: u32 = 9;
+
+// ---- M15 app graphics API: per-client canvases (window content = pixels)
+// A windowed client may switch its OWN window's content area from text
+// mode into graphics mode: WIN_BLIT_SETUP allocates a canvas sized
+// w x h (clamped to the content viewport), WIN_BLIT streams RGB pixel
+// runs into it row-major, WIN_BLIT_END frees it and returns the window
+// to text mode. Owner-checked like every client op (kernel-stamped
+// sender must be the WIN_CREATE owner) — canvases are per-window, not
+// shared. Pixels are opaque XRGB once landed; the client keeps every
+// channel < 239 the same as every painted UI color (the wallpaper task
+// clamps its own pixels too — the cursor-uniqueness predicate).
+
+/// Enable graphics mode on window `arg0`: `arg1` = canvas w | (h << 32).
+/// Replies `REPLY_OK` with the CLAMPED dims packed the same way (canvas
+/// may end up smaller than requested — the content viewport bounds it),
+/// or `REPLY_ERR` (not owner / no fb / canvas budget exhausted). The
+/// canvas starts filled with the window body color.
+pub const WIN_BLIT_SETUP: u32 = 10;
+/// Pixels into window `arg0`'s canvas: `arg1` = FIRST pixel index of this
+/// run (row-major, 0 .. cw*ch), payload = consecutive RGB triples (3 B/px)
+/// — the same run shape as WIN_WALL_ROWS. Fire-and-forget (no reply;
+/// send blocks on a full port queue = the flow control). Out-of-bounds or
+/// non-owner runs are dropped silently.
+pub const WIN_BLIT: u32 = 11;
+/// Disable graphics mode on window `arg0` (frees the canvas, repaints the
+/// content area in text mode, reply `REPLY_OK` — the client needs the
+/// sync point so the console phase starts after the pixels really left).
+/// Not-owner replies `REPLY_ERR`; no canvas = still `REPLY_OK`.
+pub const WIN_BLIT_END: u32 = 12;

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""GreenLime multi-window proof: second client, focus routing, dock
+"""GreenLime multi-window proof: second client, focus routing, taskbar
 buttons, window drag + resize + close — one boot, virtio-tablet pointer.
 
 Usage: python3 scripts/qmp_multitest.py [iso]
 
 Geometry (asserted from the server's serial log first):
-  demo window opens at 700,120 540x330 (id 2 — id 1 is the system Files
-  window; with the terminal open the dock has Start, terminal, demo —
-  demo slot center (688,776), Start slot center (616,776)).
+  demo window opens at 700,120 540x330 (id 2). v1.1 Windows 11 taskbar:
+  full-width 48px bar, centered cluster — start (532,756,40,40) center
+  (552,776), Terminal tile 1 in the start card (510,528,126,100) center
+  (573,578); the demo client button sits at (708,756,40,40), center
+  (728,776) — nclients excludes the Terminal/Files/Settings system
+  windows, so it never shifts.
 
 Checks (serial unless marked "screen"):
   1. demo client spawned + window created
@@ -15,7 +18,7 @@ Checks (serial unless marked "screen"):
   3. keys land in demo when focused:      [demo] got: hi
   4. launch Terminal from the start card, then click back and forth:
      focus win 0 + focusok on serial AND demo's input count stays 1
-  5. dock icon refocuses demo:          focus win 2 + [demo] got: q
+  5. taskbar button refocuses demo:       focus win 2 + [demo] got: q
   6. titlebar drag moves the window:      win 2 moved to 600,80 (+ screen)
   7. corner grip resizes:                 win 2 resized 580x370
   8. titlebar X closes it:                win 2 closed + demo says bye (+ screen)
@@ -33,10 +36,10 @@ HSOCK = "/tmp/gl-hmp5.sock"
 ISO = sys.argv[1] if len(sys.argv) > 1 else "dist/GreenLime.iso"
 SER = "dist/multi-serial.log"
 
-# Focused titlebar (44,46,52) / unfocused (33,35,40) — the v1.2
-# Fluent dark theme.
-TITLE_BG = (44, 46, 52)
-TITLE_BG2 = (33, 35, 40)
+# Focused titlebar (43,43,43) / unfocused (37,37,38) — the v1.1
+# Windows 11 dark theme.
+TITLE_BG = (43, 43, 43)
+TITLE_BG2 = (37, 37, 38)
 
 
 def qmp(sock, cmd):
@@ -261,13 +264,11 @@ def main():
         check("keys -> demo window ([demo] got: hi)",
               wait_for("[demo] got: hi", timeout=45))
 
-        # --- Launch Terminal from the start card, then click back and forth
-        # Start dock slot (616, 776) — with the demo window open the pill
-        # holds Start + demo (n=2: pill x=580, slot0 center 616). Then the
-        # Terminal pinned tile (530, 450): the launcher opens the terminal
-        # on demand (it never opens at boot).
-        click_at(616, 776)
-        click_at(530, 450)
+        # --- Launch Terminal from the start card, then click back and
+        # forth. Start button (552,776) opens the card; the Terminal tile
+        # (510,528,126,100) launches it on demand (never open at boot).
+        click_at(552, 776)
+        click_at(573, 578)
         check("menu launched the terminal",
               wait_for("[winsrv] launch Terminal", timeout=30))
         check("terminal opened + focused (focus win 0)",
@@ -286,11 +287,12 @@ def main():
         n1 = read_serial().count("[demo] got: ")
         check("demo input count still 1 (no key leak)", n1 == 1)
 
-        # --- Dock icon refocuses the demo ---------------------------------
-        # Centered pill, three slots (Start, terminal, demo): pill x=556 →
-        # demo slot i=2 spans 668..708, center (688, 776).
-        click_at(688, 776)
-        check("dock icon focuses demo (focus win 2)",
+        # --- Taskbar button refocuses the demo ---------------------------
+        # The demo client button: first (only) client → (708,756,40,40),
+        # center (728,776). nclients excludes the Terminal/Files/Settings
+        # system windows, so foregrounding the terminal does not shift it.
+        click_at(728, 776)
+        check("taskbar button focuses demo (focus win 2)",
               wait_for("[winsrv] focus win 2", timeout=30))
         type_keys(["q", "ret"])
         check("keys -> demo again ([demo] got: q)",
@@ -315,7 +317,7 @@ def main():
               and abs(int(m.group(2)) - 370) <= 2)
 
         # --- Close via the titlebar X -------------------------------------
-        click_at(1161, 95)  # close btn = (600+580-30, 86, 22, 18)
+        click_at(1164, 95)  # close btn = (600+580-26, 84, 20, 22) center
         check("X closed the window (win 2 closed)",
               wait_for("[winsrv] win 2 closed", timeout=30))
         check("client saw the EOF (window closed, bye)",

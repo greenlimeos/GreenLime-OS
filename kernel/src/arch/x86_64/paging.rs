@@ -19,7 +19,15 @@ pub fn smap_on() -> bool {
 }
 
 pub fn init() {
-    // CPUID.(7:0).EBX: bit 7 = SMEP, bit 20 = SMAP.
+    // CPUID.(7:0).EBX: bit 7 = SMEP, bit 20 = SMAP. Guard by the max
+    // basic leaf first: querying an unimplemented leaf may return
+    // vendor-string fragments in EBX on odd hypervisors (bits could be
+    // set at random).
+    if core::arch::x86_64::__cpuid_count(0, 0).eax < 7 {
+        SMAP_ON.store(false, Ordering::SeqCst);
+        kprintln!("[arch] protections: smep=false smap=false (no cpuid leaf 7)");
+        return;
+    }
     let ebx = core::arch::x86_64::__cpuid_count(7, 0).ebx;
     let mut want = 0u64;
     if ebx & (1 << 7) != 0 {

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""v1.1 interactive stdin proof: launch the terminal from the start card,
-then type into it via QMP sendkey.
+"""v1.1 interactive stdin proof: launch the terminal from the start
+card, then type into it via QMP sendkey.
 
 Usage: python3 scripts/qmp_type_test.py [iso]
 
 The terminal no longer opens at boot — it opens on demand from the
-launcher, so this test clicks the Start dock slot (616,776) + the
-Terminal tile (530,450) first (also proving the launch flow), then types
-two commands:
+start button, so this test clicks the start button (552,776) to open
+the card + the Terminal tile (573,578) first (also proving the launch
+flow), then types two commands:
   1. "echo greenlime works"      -> output must appear (round trip works)
   2. "echo abd" + backspace + "c" -> "abc" (backspace edits the line)
 
@@ -97,6 +97,7 @@ def main():
     try:
         print("waiting for shell...", flush=True)
         wait_marker(SER, "[shell] interactive ready")
+        time.sleep(20)  # let winsrv drain + settle (wallpaper streams late)
         print("shell ready, boot took ~time below", flush=True)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(60)
@@ -132,12 +133,11 @@ def main():
         def shot(path):
             qmp(s, {"execute": "screendump", "arguments": {"filename": path}})
 
-        # Terminal opens on demand: Start dock slot (616,776) — the demo
-        # window is open at boot, so the pill has 2 windows (n=2: w=120,
-        # pill_x=580, slot0 center 616) — then the Terminal pinned tile
-        # (530,450) in the centered start card.
-        click_at(616, 776)
-        click_at(530, 450)
+        # Terminal opens on demand: start button (552,776) opens the
+        # start card, then the Terminal tile — tile 1 = (510,528,126,100),
+        # center (573,578).
+        click_at(552, 776)
+        click_at(573, 578)
         wait_marker(SER, "[winsrv] launch Terminal")
 
         shot("dist/fb-before-type.ppm")

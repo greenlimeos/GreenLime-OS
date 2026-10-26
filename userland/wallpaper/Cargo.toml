@@ -2,7 +2,7 @@
 name = "greenlime-wallpaper"
 version.workspace = true
 edition.workspace = true
-description = "GreenLime desktop wallpaper service (ring 3): decodes assets/wallpapers/wallpaper.jpeg and streams rows to winsrv"
+description = "GreenLime desktop wallpaper service (ring 3): decodes assets/wallpapers/wallpaper.{png,jpeg,jpg} and streams rows to winsrv"
 
 [[bin]]
 name = "greenlime-wallpaper"
@@ -10,11 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 greenlime-abi = { workspace = true }
-# Pure-Rust JPEG decode: zune-jpeg's x86/SIMD paths are OFF (no "x86"
-# feature) because the scheduler swaps no FP state, and unsafe platform
-# paths are disabled at runtime too. One boot-time decode is fast enough
-# in portable code.
+# Pure-Rust decoders: SIMD/std paths OFF (no "x86" features) because the
+# scheduler swaps no FP state, and unsafe platform paths are disabled at
+# runtime too. The format follows the asset build.rs finds (PNG or JPEG).
 zune-jpeg = { workspace = true }
+zune-png = { workspace = true }
 zune-core = { workspace = true }
 # Heap for the decoder (16 MiB bss region, zero-filled by the ELF loader).
 linked_list_allocator = { workspace = true }

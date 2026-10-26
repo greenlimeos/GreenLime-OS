@@ -6,13 +6,18 @@ set -uo pipefail
 
 echo "================ GreenLime diag $(date -u +%FT%TZ) ================"
 echo "--- versions ---"
-rustc +nightly --version 2>&1 || rustc --version
+rustc --version 2>&1
 qemu-system-x86_64 --version 2>&1 | head -2
 ~/limine/limine --version 2>&1 | head -2 || echo "(limine tool: no --version)"
 cat Cargo.toml | grep -A6 workspace.dependencies
 echo ""
 echo "--- build ---"
-cargo +nightly build -p greenlime-kernel --target x86_64-unknown-none 2>&1 | tail -30
+# Diagnostics run in the repo tree: rust-toolchain.toml selects the pinned
+# nightly automatically. Export it explicitly so cargo re-invocations hit
+# the pinned toolchain even from outside the tree (blank = fall back to default).
+PIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml | head -n1)"
+[ -n "$PIN" ] && export RUSTUP_TOOLCHAIN="$PIN"
+cargo build -p greenlime-kernel --target x86_64-unknown-none 2>&1 | tail -30
 echo ""
 echo "--- iso layout ---"
 ls -lh dist/ 2>&1

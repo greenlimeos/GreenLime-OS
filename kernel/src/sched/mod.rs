@@ -43,12 +43,17 @@ pub mod caps {
     /// Stream desktop wallpaper rows / handshake to the window server
     /// (WIN_WALL_* ops). Held by the wallpaper task (task 8) only.
     pub const CAP_WALL: u16 = 1 << 2;
+    /// Mutate persistent disk state via the vfs server: create / delete
+    /// / mkdir / write / setsize on /disk/* (M14). Reads stay open to
+    /// everyone. Held by init + shell (USER_ADMIN) and kernel servers.
+    pub const CAP_DISK: u16 = 1 << 3;
     pub const ALL: u16 = 0xFFFF;
     /// A default userland grant: everything public except the sharp bits.
     /// Task sizing is a spawn-time KERNEL decision, not a runtime grant.
     pub const USER_DEFAULT: u16 = CAP_NET;
-    /// init + shell: userland's admin pair (kill is script-only today).
-    pub const USER_ADMIN: u16 = CAP_NET | CAP_KILL;
+    /// init + shell: userland's admin pair + the disk (M14: the shell is
+    /// the disk admin — echo > /disk/f, rm, mkdir all flow through it).
+    pub const USER_ADMIN: u16 = CAP_NET | CAP_KILL | CAP_DISK;
     /// A deliberately unprivileged image (the syscall fuzzer): Denied is
     /// part of the surface it must survive.
     pub const USER_NONE: u16 = 0;
@@ -109,13 +114,42 @@ struct AlignedStack([u8; KSTACK_SIZE]);
 
 static mut KSTACKS: [AlignedStack; MAX_TASKS_USIZE] =
     [const { AlignedStack([0; KSTACK_SIZE]) }; MAX_TASKS_USIZE];
-static mut KSTACK_NEXT: usize = 0;
+// (No allocation cursor: stacks map 1:1 to the task id — see kstack_top_for.)
 
 /// Per-CPU scheduler resume points. Only the owning CPU reads/writes its
 /// slot (indexed via GS), so no lock is needed. The first switch parks
 /// whatever stack the CPU entered on (boot/Limine — abandoned, never
 /// reused, exactly like the old single-CPU design).
 static mut SCHED_RSP: [u64; smp::MAX_CPUS] = [0; smp::MAX_CPUS];
+
+/// Per-task x87/SSE images (M13). Seeded from a clean template at boot so
+/// the first FXRSTOR of a fresh task is valid; the switch asm writes them.
+static mut FX_SAVE: [switch::FxArea; MAX_TASKS_USIZE] =
+    [const { switch::FxArea([0; 512]) }; MAX_TASKS_USIZE];
+
+/// Per-CPU scheduler-context FX images (the context that runs the loop).
+static mut SCHED_FX: [switch::FxArea; smp::MAX_CPUS] =
+    [const { switch::FxArea([0; 512]) }; smp::MAX_CPUS];
+
+/// Seed every FX context with the canonical clean FPU image. Called once on
+/// the BSP, after CPU features are enabled and before the first switch.
+pub fn fx_init_all() {
+    let mut tpl = switch::FxArea([0; 512]);
+    switch::fx_init_template(&mut tpl);
+    // SAFETY: single-threaded boot window; the switch asm is the only other
+    // writer and it cannot run until scheduler_loop is entered later. Raw
+    // pointers keep this out of `static_mut_refs` UB territory.
+    unsafe {
+        let fx = addr_of_mut!(FX_SAVE) as *mut switch::FxArea;
+        for i in 0..MAX_TASKS_USIZE {
+            core::ptr::copy_nonoverlapping(&tpl, fx.add(i), 1);
+        }
+        let sched = addr_of_mut!(SCHED_FX) as *mut switch::FxArea;
+        for i in 0..smp::MAX_CPUS {
+            core::ptr::copy_nonoverlapping(&tpl, sched.add(i), 1);
+        }
+    }
+}
 
 static TASKS: Mutex<alloc::vec::Vec<Task>> = Mutex::new(alloc::vec::Vec::new());
 /// Running task per CPU lives in the GS-anchored CpuLocal (see smp), not
@@ -167,27 +201,90 @@ extern "C" fn task_returned_trap() -> ! {
     exit_current(99);
 }
 
-fn alloc_kstack() -> u64 {
-    // SAFETY: boot-time single-threaded spawns only (before scheduler_loop).
-    unsafe {
-        let i = KSTACK_NEXT;
-        assert!(i < MAX_TASKS_USIZE, "[sched] too many tasks");
-        KSTACK_NEXT += 1;
-        addr_of_mut!(KSTACKS[i]) as u64 + KSTACK_SIZE as u64
+/// Kernel stacks live in a fixed MAX_TASKS pool, keyed by TASK ID (not by
+/// allocation order): a reaped id hands its stack straight to whatever
+/// claims the id again. The slot trio (stack, FX image, mailbox port) is
+/// all id-addressed, which is what makes reuse cheap and boring.
+fn kstack_top_for(id: TaskId) -> u64 {
+    // SAFETY: address taken only; the contents are managed exclusively by
+    // the switch asm for this id's task.
+    unsafe { addr_of_mut!(KSTACKS[id as usize]) as u64 + KSTACK_SIZE as u64 }
+}
+
+/// Freed task ids (task slots whose owner is Dead). Guard discipline: pop
+/// and push run ONLY with TASKS.lock() held — the table is the gate, which
+/// keeps take/install vs exit/kill atomic without a second lock.
+static mut FREE_IDS: [TaskId; MAX_TASKS_USIZE] = [0; MAX_TASKS_USIZE];
+static mut FREE_TOP: usize = 0;
+
+/// Next id for a spawn: a reaped slot first (the demo respawns at its boot
+/// id, so a start-card tile click reads exactly like the boot proof), else
+/// the next never-used id. SAFETY: TASKS.lock() held.
+unsafe fn take_id() -> (TaskId, bool) {
+    let top = addr_of_mut!(FREE_TOP).read();
+    if top != 0 {
+        addr_of_mut!(FREE_TOP).write(top - 1);
+        return (addr_of_mut!(FREE_IDS[top - 1]).read(), true);
+    }
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    assert!((id as usize) < MAX_TASKS_USIZE, "[sched] too many tasks");
+    (id, false)
+}
+
+/// Retire a Dead task's id for reuse. SAFETY: TASKS.lock() held; the task
+/// itself must already be Dead (no claimer, no resurrection path). Double
+/// release is impossible by construction — and self-guarded anyway, since
+/// a linear scan of a ≤9-long pool is cheaper than debugging a minted
+/// duplicate id (two live tasks sharing one port would be silent chaos).
+unsafe fn release_id(id: TaskId) {
+    let top = addr_of_mut!(FREE_TOP).read();
+    for i in 0..top {
+        if addr_of_mut!(FREE_IDS[i]).read() == id {
+            return;
+        }
+    }
+    if top < MAX_TASKS_USIZE {
+        addr_of_mut!(FREE_IDS[top]).write(id);
+        addr_of_mut!(FREE_TOP).write(top + 1);
+    } else {
+        panic!("[sched] free-id pool overflow (double release?)");
     }
 }
 
-fn next_id() -> TaskId {
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    assert!((id as usize) < MAX_TASKS_USIZE, "[sched] too many tasks");
-    id
+/// Put a task struct into its slot. Fresh ids append; reused ids REPLACE
+/// the Dead struct in place. TASKS is indexed by id everywhere (`tasks[id]`:
+/// exits, parks, claims, kills) so the slot-index == task.id identity must
+/// never break — that is exactly what this guards.
+fn install(tasks: &mut alloc::vec::Vec<Task>, task: Task) {
+    let i = task.id as usize;
+    assert!(i < MAX_TASKS_USIZE, "[sched] slot overflow");
+    if tasks.len() > i {
+        assert!(tasks[i].id == task.id, "[sched] slot/id drift");
+        tasks[i] = task;
+    } else {
+        assert!(tasks.len() == i, "[sched] task push out of order");
+        tasks.push(task);
+    }
 }
 
 /// Spawn a kernel-mode server/worker. It starts on first schedule.
 pub fn spawn_kernel_task(name: &'static str, entry: unsafe extern "C" fn() -> !) -> TaskId {
-    let id = next_id();
-    let top = alloc_kstack();
-    // SAFETY: fresh static stack, exclusive to this task.
+    // Id pick under the table lock (freelist pop is one step vs concurrent
+    // exits), then drop: the slot install re-takes the lock at the end.
+    let (id, reused) = {
+        let _tasks = TASKS.lock();
+        // SAFETY: guarded by the lock held in this scope.
+        unsafe { take_id() }
+    };
+    if reused {
+        // A reused id inherits the dead owner's own mailbox port; the leftover
+        // queued self-messages are garbage to the successor. reset_port never
+        // runs under TASKS.lock (its wake nests the table).
+        crate::ipc::reset_port(id);
+    }
+    let top = kstack_top_for(id);
+    // SAFETY: fresh static stack, or the retired owner's — full re-primed
+    // by init_kstack either way, exclusive to this task.
     let rsp = unsafe {
         switch::init_kstack(
             top,
@@ -195,17 +292,23 @@ pub fn spawn_kernel_task(name: &'static str, entry: unsafe extern "C" fn() -> !)
             task_returned_trap as *const () as usize as u64,
         )
     };
-    TASKS.lock().push(Task {
-        id,
-        name,
-        state: TaskState::Ready,
-        kind: TaskKind::Kernel,
-        cr3: KERNEL_CR3.load(Ordering::SeqCst),
-        saved_rsp: rsp,
-        kstack_top: top,
-        owner: AtomicI64::new(-1),
-        caps: caps::ALL,
-    });
+    {
+        let mut tasks = TASKS.lock();
+        install(
+            &mut tasks,
+            Task {
+                id,
+                name,
+                state: TaskState::Ready,
+                kind: TaskKind::Kernel,
+                cr3: KERNEL_CR3.load(Ordering::SeqCst),
+                saved_rsp: rsp,
+                kstack_top: top,
+                owner: AtomicI64::new(-1),
+                caps: caps::ALL,
+            },
+        );
+    }
     kprintln!("[sched] spawned kernel task {} ({})", id, name);
     id
 }
@@ -213,8 +316,22 @@ pub fn spawn_kernel_task(name: &'static str, entry: unsafe extern "C" fn() -> !)
 /// Load a user ELF into a fresh address space + map its stack. Its kernel
 /// stack is primed to enter ring 3 through the user stub on first schedule.
 pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
-    let id = next_id();
+    // M15.1 slot reap: the id pick (freelist pop vs monotonic pass) happens
+    // under the table lock, then the lock DROPS — the heavy work below
+    // (ELF load + pmm allotment + page maps) must not hold TASKS, and the
+    // port reset's wake would nest the table.
+    let (id, reused) = {
+        let _tasks = TASKS.lock();
+        // SAFETY: the table lock is held in this scope.
+        unsafe { take_id() }
+    };
     assert!((id as usize) < MAX_TASKS as usize, "[sched] id exceeds mailboxes");
+    if reused {
+        // A reused id inherits the dead owner's own mailbox port: leftover
+        // queued self-messages are garbage to its successor (boot and wire,
+        // not errors). reset_port never runs under TASKS.lock.
+        crate::ipc::reset_port(id);
+    }
     let hhdm = boot::hhdm_offset().expect("[sched] HHDM missing");
     let loaded = crate::userspace::elf::load(image, hhdm);
     // Shared kernel MMIO (LAPIC) goes into every user table explicitly:
@@ -251,8 +368,7 @@ pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
     // but a ROP-ish layout assumption stops trusting a fixed address.
     let jitter_pages =
         ((crate::mm::kaslr_seed() ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 17) % 512;
-    let stack_top = STACK_TOP - jitter_pages * 4096;
-    // 32 pages (128 KiB): shell/wallpaper frames hold ABI-v6 Messages
+    let stack_top = STACK_TOP - jitter_pages * 4096;    // 32 pages (128 KiB): shell/wallpaper frames hold ABI-v6 Messages
     // (~2 KiB each with MAX_PAYLOAD 2048) several frames deep, and at -O0
     // the wallpaper's decode stack usage is much larger still (64 KiB
     // overflowed in the debug build, 65 KB below the stack top).
@@ -264,8 +380,15 @@ pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
             mm::vmm::map_user_page(loaded.cr3, hhdm, v, f, true, false);
         }
     }
-    let top = alloc_kstack();
-    // SAFETY: fresh static stack; stub reads CURRENT and iretqs to ring 3.
+    // SysV entry invariant: at a function entry rsp % 16 == 8 (as if `call`
+    // had pushed a return address). We iret straight into _start, so reserve
+    // that 8-byte slot. SSE-enabled userland (M13) uses movaps stack spills;
+    // a 16-aligned entry rsp faults #GP in ring 3 (soft-float codegen never
+    // noticed the misalignment, so this only surfaced once SSE was real).
+    let user_rsp = stack_top - 8;
+    let top = kstack_top_for(id);
+    // SAFETY: fresh static stack, or the retired owner's — fully re-primed
+    // by init_kstack either way; stub reads CURRENT and iretqs to ring 3.
     let rsp = unsafe {
         switch::init_kstack(
             top,
@@ -282,21 +405,27 @@ pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
         "wallpaper" => caps::CAP_WALL,
         _ => caps::USER_DEFAULT,
     };
-    TASKS.lock().push(Task {
-        id,
-        name,
-        state: TaskState::Ready,
-        kind: TaskKind::User {
-            cr3: loaded.cr3,
-            entry: loaded.entry,
-            stack_top,
-        },
-        cr3: loaded.cr3,
-        saved_rsp: rsp,
-        kstack_top: top,
-        owner: AtomicI64::new(-1),
-        caps: user_caps,
-    });
+    {
+        let mut tasks = TASKS.lock();
+        install(
+            &mut tasks,
+            Task {
+                id,
+                name,
+                state: TaskState::Ready,
+                kind: TaskKind::User {
+                    cr3: loaded.cr3,
+                    entry: loaded.entry,
+                    stack_top: user_rsp,
+                },
+                cr3: loaded.cr3,
+                saved_rsp: rsp,
+                kstack_top: top,
+                owner: AtomicI64::new(-1),
+                caps: user_caps,
+            },
+        );
+    } // table lock drops here — only boot-proof prints follow
     kprintln!(
         "[sched] spawned user task {} ({}) entry={:#x}",
         id, name, loaded.entry
@@ -415,7 +544,13 @@ fn switch_to_task(id: TaskId) {
         );
         // Save this CPU's scheduler context, resume the task. Returns here
         // when the task yields/blocks/exits. Fresh tasks land in entry stub.
-        switch::switch_to(addr_of_mut!(SCHED_RSP[cpu]), rsp);
+        // FX areas: scheduler image out, task image in (M13).
+        switch::switch_to(
+            addr_of_mut!(SCHED_RSP[cpu]),
+            addr_of_mut!(SCHED_FX[cpu]),
+            rsp,
+            addr_of_mut!(FX_SAVE[id as usize]),
+        );
     }
 }
 
@@ -614,7 +749,14 @@ fn switch_here_to_sched(id: TaskId) {
         &tasks[id as usize].saved_rsp as *const u64 as *mut u64
     };
     let sched_rsp = unsafe { addr_of_mut!(SCHED_RSP[cpu]).read() };
-    unsafe { switch::switch_to(save_slot, sched_rsp) };
+    unsafe {
+        switch::switch_to(
+            save_slot,
+            addr_of_mut!(FX_SAVE[id as usize]),
+            sched_rsp,
+            addr_of_mut!(SCHED_FX[cpu]),
+        )
+    };
     // Resumed here when scheduled again.
 }
 
@@ -653,12 +795,24 @@ pub fn exit_current(code: u64) -> ! {
     let (save_slot, sched_rsp) = {
         let mut tasks = TASKS.lock();
         tasks[id as usize].state = TaskState::Dead;
+        // M15.1 slot reap: hand the id back to the spawner while the table
+        // lock is held. The corpse stays parked (state Dead), but its id,
+        // stack and mailbox port are now legitimately re-assignable — the
+        // start-card respawns the demo through exactly this path.
+        unsafe { release_id(id) };
         // Park in our own (dead) slot: SCHED_RSP must keep the scheduler's rsp.
         let slot = &mut tasks[id as usize].saved_rsp as *mut u64;
         let sched = unsafe { addr_of_mut!(SCHED_RSP[cpu]).read() };
         (slot, sched)
     };
-    unsafe { switch::switch_to(save_slot, sched_rsp) };
+    unsafe {
+        switch::switch_to(
+            save_slot,
+            addr_of_mut!(FX_SAVE[id as usize]),
+            sched_rsp,
+            addr_of_mut!(SCHED_FX[cpu]),
+        )
+    };
     unreachable!("dead task resumed")
 }
 
@@ -685,6 +839,9 @@ pub fn kill_task(pid: TaskId) -> bool {
             return false;
         }
         t.state = TaskState::Dead;
+        // M15.1 slot reap: same rule as exit_current — the id re-enters the
+        // free list (release_id also self-guards a double release).
+        unsafe { release_id(pid) };
         kprintln!("[sched] killed task {} ({})", pid, t.name);
         true
     } else {

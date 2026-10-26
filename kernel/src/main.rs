@@ -30,6 +30,14 @@ pub unsafe extern "C" fn _start() -> ! {
 }
 
 unsafe fn kmain() -> ! {
+    // 0. CPU features (M13): SSE/SSE2 legal for ring 3 + task-context
+    // intrinsics (same CR bits APs already get in init_ap_features). Kernel
+    // code stays built without +sse, so IRQ handlers never touch XMM and
+    // user XMM state needs no FXSAVE in the IRQ path. Then seed the per-task
+    // FX areas with a clean FPU image before any context switch.
+    arch::init_ap_features();
+    sched::fx_init_all();
+
     // 1. Boot protocol first — validates Limine revision.
     boot::init();
 

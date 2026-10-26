@@ -32,10 +32,14 @@ fn panic(info: &PanicInfo) -> ! {
     // the fixed line alone hid the real cause.
     let mut buf = [0u8; 176];
     let mut n = copy_str(&mut buf, 0, b"[FUZZ-PANIC] ");
-    let msg: &[u8] = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
-        s.as_bytes()
-    } else {
-        b"(payload)"
+    // message().as_str() is the modern payload story (PanicInfo::payload()
+    // was deprecated in 1.81 — "never returns anything useful" under
+    // abort/no_std). Literal panic!("...") land here exactly; formatted
+    // panic!() args cannot materialize without alloc, so those print the
+    // sentinel and the file:line below pinpoints the site.
+    let msg: &[u8] = match info.message().as_str() {
+        Some(s) => s.as_bytes(),
+        None => b"(formatted)", // location line still caries the answer
     };
     n = copy_str(&mut buf, n, &msg[..msg.len().min(96)]);
     if let Some(loc) = info.location() {

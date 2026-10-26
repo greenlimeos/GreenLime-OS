@@ -41,6 +41,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt.invalid_opcode
             .set_handler_fn(ud_handler)
             .set_code_selector(cs);
+        idt.simd_floating_point
+            .set_handler_fn(xm_handler)
+            .set_code_selector(cs);
         idt.page_fault
             .set_handler_fn(page_fault_handler)
             .set_code_selector(cs);
@@ -136,6 +139,19 @@ extern "x86-interrupt" fn ud_handler(frame: InterruptStackFrame) {
         kprintln!("[FAULT] stk[{}]={:#x}", i, w);
     }
     crate::sched::debug_table();
+    halt();
+}
+
+/// #XM — unmasked SIMD floating-point exception. A ring-3 task dies like on
+/// #UD/#PF; a supervisor #XM is a kernel bug and halts loud.
+extern "x86-interrupt" fn xm_handler(frame: InterruptStackFrame) {
+    if frame.code_segment.0 & 3 == 3 {
+        if let Some(id) = crate::sched::current_id() {
+            kill_user_task(id, "XM", 136); // 128 + SIGFPE
+        }
+    }
+    kprintln!("[FAULT] #XM SIMD floating-point exception");
+    kprintln!("[FAULT] {:#?}", frame);
     halt();
 }
 

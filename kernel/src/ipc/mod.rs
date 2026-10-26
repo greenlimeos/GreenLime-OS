@@ -37,6 +37,23 @@ fn check_port(port: u32) -> bool {
     (port as usize) < PORT_COUNT
 }
 
+/// Empty a task-owned port for slot reuse (M15.1): a reaped task's id may
+/// be handed to a new task whose port is the same number — the dead owner's
+/// queued self-messages would be garbage to its successor. Anyone blocked
+/// on the port is woken (they just retry against an empty queue; a fresh
+/// owner's client behaves like the first boot did). Call WITHOUT holding
+/// TASKS.lock: the wake takes the task table.
+pub fn reset_port(port: u32) {
+    if !check_port(port) {
+        return;
+    }
+    {
+        let mut ports = PORTS.lock();
+        ports[port as usize].queue.clear();
+    }
+    sched::wake_port(port);
+}
+
 /// Kernel-side send: blocks while the queue is full.
 pub fn send(port: u32, mut msg: Message, sender: u32) {
     assert!(check_port(port), "[ipc] bad port {}", port);

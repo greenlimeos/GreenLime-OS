@@ -1,9 +1,10 @@
 //! greenlime-wallpaper (task 8): the desktop wallpaper lives in USERSPACE.
 //!
-//! The build embeds `assets/wallpapers/wallpaper.jpeg` (see build.rs); this
-//! task decodes it with a pure-Rust JPEG decoder, scales it (nearest
-//! neighbor, integer math) to the dims winsrv reports, then streams RGB
-//! pixels over IPC: WIN_WALL_SETUP (dims handshake) -> WIN_WALL_ROWS
+//! The build embeds `assets/wallpapers/wallpaper.{png,jpeg,jpg}` (see
+//! build.rs; PNG wins if present — drop one there and rebuild); this task
+//! decodes it with a pure-Rust decoder (zune-png or zune-jpeg), scales it
+//! (nearest neighbor, integer math) to the dims winsrv reports, then
+//! streams RGB pixels over IPC: WIN_WALL_SETUP (dims handshake) -> WIN_WALL_ROWS
 //! (row-major pixel bands, one <= MAX_PAYLOAD chunk per message,
 //! arg0 = first pixel index) -> WIN_WALL_DONE.
 //!
@@ -21,6 +22,8 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 use core::arch::asm;
 use core::panic::PanicInfo;
 use greenlime_abi::ipc::{MAX_PAYLOAD, Message, PORT_WINSRV, REPLY_OK};
@@ -30,10 +33,12 @@ use linked_list_allocator::LockedHeap;
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
+use zune_core::result::DecodingResult;
 use zune_jpeg::JpegDecoder;
+use zune_png::PngDecoder;
 
-/// The wallpaper JPEG, baked at build time (build.rs pins the path).
-static WALL_JPEG: &[u8] = include_bytes!(env!("GREENLIME_WALLPAPER"));
+/// The wallpaper image (build.rs pins the path + its format).
+static WALL: &[u8] = include_bytes!(env!("GREENLIME_WALLPAPER"));
 
 /// Heap for the decoder: 16 MiB bss (zero-filled by the ELF loader).
 const HEAP_SIZE: usize = 16 * 1024 * 1024;
@@ -41,6 +46,90 @@ static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[global_allocator]
 static ALLOC: LockedHeap = LockedHeap::empty();
+
+/// A decoded source image: RGB triples ready for the scaler.
+struct Decoded {
+    w: usize,
+    h: usize,
+    rgb: Vec<u8>,
+}
+
+/// Extract RGB triples from zune's decode output. PNG output follows the
+/// SOURCE format (RGB/RGBA/palette/luma) so whatever came back is
+/// normalized here; 16-bit samples downshift to 8-bit. Memory-lean: one
+/// exact-size output allocation, no intermediate sample copies (the 16 MiB
+/// bss heap is tight against the decode buffer + zlib windows).
+fn to_rgb3(res: DecodingResult, w: usize, h: usize, comp: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h * 3);
+    match res {
+        DecodingResult::U8(src) => {
+            for px in src.chunks_exact(comp.max(1)) {
+                let (r, g, b) = if comp < 3 {
+                    (px[0], px[0], px[0])
+                } else {
+                    (px[0], px[1], px[2])
+                };
+                out.extend_from_slice(&[r, g, b]);
+            }
+        }
+        DecodingResult::U16(src) => {
+            for px in src.chunks_exact(comp.max(1)) {
+                let (r, g, b) = if comp < 3 {
+                    let v = (px[0] >> 8) as u8;
+                    (v, v, v)
+                } else {
+                    ((px[0] >> 8) as u8, (px[1] >> 8) as u8, (px[2] >> 8) as u8)
+                };
+                out.extend_from_slice(&[r, g, b]);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Decode the build-pinned asset with the decoder build.rs selected
+/// (GREENLIME_WALL_FMT). Returns dims + RGB triples; None on any decode
+/// failure (caller logs + exits). All unsafe/intrinsic paths in the
+/// decoders are OFF — the scheduler swaps no FP state.
+fn decode_wall() -> Option<Decoded> {
+    match env!("GREENLIME_WALL_FMT") {
+        "png" => {
+            let mut dec = PngDecoder::new_with_options(
+                ZCursor::new(WALL),
+                DecoderOptions::default().set_use_unsafe(false),
+            );
+            dec.decode_headers().ok()?;
+            let (w, h) = dec.dimensions()?;
+            let comp = dec.colorspace().unwrap_or(ColorSpace::RGB).num_components();
+            // Heap budget: decode buffer (output_buffer_size already
+            // factors the bit depth) PLUS our re-packed RGB3 must fit the
+            // 16 MiB bss heap together with zune's inflate windows.
+            let src = dec.output_buffer_size().unwrap_or(usize::MAX);
+            if src.saturating_add(w.checked_mul(h)?.saturating_mul(3)) > 13 * 1024 * 1024 {
+                log("[wall] wallpaper too large for the decode heap");
+                exit(2);
+            }
+            let res = dec.decode().ok()?;
+            let rgb = to_rgb3(res, w, h, comp);
+            Some(Decoded { w, h, rgb })
+        }
+        // JPEG (zune-jpeg): decode_headers first, then decode — same
+        // order as before; output colorspace forced to RGB so grayscale
+        // sources expand cleanly.
+        _ => {
+            let opts = DecoderOptions::default()
+                .jpeg_set_out_colorspace(ColorSpace::RGB)
+                .set_use_unsafe(false);
+            let mut dec = JpegDecoder::new_with_options(ZCursor::new(WALL), opts);
+            dec.decode_headers().ok()?;
+            let info = dec.info()?;
+            let (w, h) = (info.width as usize, info.height as usize);
+            let rgb = dec.decode().ok()?;
+            Some(Decoded { w, h, rgb })
+        }
+    }
+}
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -131,41 +220,29 @@ pub extern "C" fn _start() -> ! {
     let me = getpid();
     log("[wall] userspace wallpaper service starting");
 
-    // 1. Decode (JPEG-1; zune handles progressive + baseline). Output
-    //    color space is forced to RGB so grayscale sources expand cleanly.
-    let opts = DecoderOptions::default()
-        .jpeg_set_out_colorspace(ColorSpace::RGB)
-        .set_use_unsafe(false);
-    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(WALL_JPEG), opts);
-    if let Err(e) = decoder.decode_headers() {
-        log(alloc::format!(
-            "[wall] decode headers failed: {:?}",
-            e
-        )
-        .as_str());
-        exit(2);
-    }
-    let Some(info) = decoder.info() else {
-        log("[wall] no image info after headers");
+    // 1. Decode (format follows build.rs's asset selection). Both decoders
+    //    are pure Rust with unsafe/intrinsic paths off (no FP state swaps).
+    let Some(d) = decode_wall() else {
+        log("[wall] decode failed (bad wallpaper asset?)");
         exit(2);
     };
-    let (sw, sh) = (info.width as usize, info.height as usize);
+    let (sw, sh) = (d.w, d.h);
     if sw == 0 || sh == 0 {
         log("[wall] zero-size decoded image");
         exit(2);
     }
-    let px = match decoder.decode() {
-        Ok(p) => p,
-        Err(_) => {
-            log("[wall] decode failed (bad wallpaper.jpeg?)");
-            exit(2);
-        }
-    };
+    let px = d.rgb;
     if px.len() < sw * sh * 3 {
         log("[wall] decoded buffer too small");
         exit(2);
     }
-    log(alloc::format!("[wall] decoded {}x{}", sw, sh).as_str());
+    log(alloc::format!(
+        "[wall] decoded {}x{} ({})",
+        sw,
+        sh,
+        env!("GREENLIME_WALL_FMT")
+    )
+    .as_str());
 
     // 2. Handshake: setup carries our source dims; winsrv replies the
     //    target dims packed arg0 = w | (h << 32).

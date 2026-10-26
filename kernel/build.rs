@@ -14,9 +14,15 @@ fn main() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| String::from("debug"));
     let tdir = std::env::var("CARGO_TARGET_DIR")
         .unwrap_or_else(|_| format!("{}/../target", manifest));
+    // M15.1: userland builds run through the SSE-baked target spec (the
+    // Makefile's UE_TARGET); its build dir sits under the spec's own name.
+    // GREENLIME_UE_DIR names it explicitly; bare `cargo build` falls back
+    // to the stock soft-float triple so a plain userland build still works.
+    let ue_dir = std::env::var("GREENLIME_UE_DIR")
+        .unwrap_or_else(|_| String::from("x86_64-unknown-none"));
     let init = format!(
-        "{}/x86_64-unknown-none/{}/greenlime-init",
-        tdir, profile
+        "{}/{}/{}/greenlime-init",
+        tdir, ue_dir, profile
     );
     println!("cargo:rerun-if-changed={}", init);
     if !std::path::Path::new(&init).exists() {
@@ -29,8 +35,8 @@ fn main() {
 
     // Shell ELF, same deal (see spawn_all).
     let shell = format!(
-        "{}/x86_64-unknown-none/{}/greenlime-shell",
-        tdir, profile
+        "{}/{}/{}/greenlime-shell",
+        tdir, ue_dir, profile
     );
     println!("cargo:rerun-if-changed={}", shell);
     if !std::path::Path::new(&shell).exists() {
@@ -43,8 +49,8 @@ fn main() {
 
     // Demo window client ELF, same deal (see spawn_all).
     let demo = format!(
-        "{}/x86_64-unknown-none/{}/greenlime-demo",
-        tdir, profile
+        "{}/{}/{}/greenlime-demo",
+        tdir, ue_dir, profile
     );
     println!("cargo:rerun-if-changed={}", demo);
     if !std::path::Path::new(&demo).exists() {
@@ -57,8 +63,8 @@ fn main() {
 
     // Fuzzer ELF, same deal (v1.0 hardening: spawned unprivileged).
     let fuzz = format!(
-        "{}/x86_64-unknown-none/{}/greenlime-fuzz",
-        tdir, profile
+        "{}/{}/{}/greenlime-fuzz",
+        tdir, ue_dir, profile
     );
     println!("cargo:rerun-if-changed={}", fuzz);
     if !std::path::Path::new(&fuzz).exists() {
@@ -72,8 +78,8 @@ fn main() {
     // Wallpaper service ELF, same deal (task 8, CAP_WALL: streams the
     // desktop image to winsrv).
     let wallp = format!(
-        "{}/x86_64-unknown-none/{}/greenlime-wallpaper",
-        tdir, profile
+        "{}/{}/{}/greenlime-wallpaper",
+        tdir, ue_dir, profile
     );
     println!("cargo:rerun-if-changed={}", wallp);
     if !std::path::Path::new(&wallp).exists() {

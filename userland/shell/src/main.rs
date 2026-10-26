@@ -520,9 +520,13 @@ fn cat(me: u32, fd: u64, ser: Option<u64>, path: &[u8]) {
     let handle = match vfs_open(me, path) {
         Some(h) => h,
         None => {
-            out(me, fd, ser, b"cat: not found: ");
-            out(me, fd, ser, path);
-            out(me, fd, ser, b"\n");
+            // One atomic line (serial proof lines must stay contiguous).
+            let mut nb = [0u8; 128];
+            let mut nn = 0usize;
+            w_cmd(&mut nb, &mut nn, b"cat: not found: ");
+            w_cmd(&mut nb, &mut nn, path);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
             return;
         }
     };
@@ -548,6 +552,102 @@ fn cat(me: u32, fd: u64, ser: Option<u64>, path: &[u8]) {
     assert_reply_ok(&rep, b"vfs close");
 }
 
+/// Best-effort disk op by path (OP_CREATE / OP_DELETE / OP_MKDIR).
+/// True on REPLY_OK; False on caps denial, missing parent, or disk err.
+fn vfs_path_op(me: u32, kind: u32, path: &[u8]) -> bool {
+    let mut req = Message::new(kind);
+    req.set_payload(path);
+    let rep = rpc(PORT_VFS, me, &req, 0);
+    rep.kind == REPLY_OK
+}
+
+/// `echo text > /disk/file` (M14): replace a file's contents. Overwrite
+/// is delete-then-create (always truncates even when the old file was
+/// longer), then pwrite text + newline at offset 0 in chunks. Serial
+/// prints a deterministic "wrote N bytes -> path" proof line.
+fn write_file(me: u32, fd: u64, ser: Option<u64>, text: &[u8], target: &[u8]) {
+    if target.is_empty() {
+        out(me, fd, ser, b"shell: missing target file\n");
+        return;
+    }
+    // Delete any existing file first ("not found" is fine — fresh file).
+    let _ = vfs_path_op(me, OP_DELETE, target);
+    if !vfs_path_op(me, OP_CREATE, target) {
+        out(me, fd, ser, b"echo: cannot create ");
+        out(me, fd, ser, target);
+        out(me, fd, ser, b"\n");
+        return;
+    }
+    let handle = match vfs_open(me, target) {
+        Some(h) => h,
+        None => {
+            out(me, fd, ser, b"echo: cannot open ");
+            out(me, fd, ser, target);
+            out(me, fd, ser, b"\n");
+            return;
+        }
+    };
+    let mut off = 0u64;
+    // The echo newline rides in the LAST chunk so the kernel proofs a
+    // single "[vfs] wrote N bytes" line.
+    let mut buf = [0u8; 961];
+    if text.is_empty() {
+        buf[0] = b'\n';
+        req_write(me, handle, 0, &buf[..1], &mut off, fd, ser);
+    } else {
+        let nc = (text.len() + 959) / 960;
+        for (i, chunk) in text.chunks(960).enumerate() {
+            if i + 1 == nc {
+                buf[..chunk.len()].copy_from_slice(chunk);
+                buf[chunk.len()] = b'\n';
+                req_write(me, handle, off, &buf[..chunk.len() + 1], &mut off, fd, ser);
+            } else {
+                req_write(me, handle, off, chunk, &mut off, fd, ser);
+            }
+        }
+    }
+    let mut req = Message::new(OP_CLOSE);
+    req.arg0 = handle;
+    let rep = rpc(PORT_VFS, me, &req, 0);
+    assert_reply_ok(&rep, b"vfs close");
+    // One atomic console line: "wrote N bytes -> <target>".
+    let mut nb = [0u8; 128];
+    let mut nn = 0usize;
+    w_cmd(&mut nb, &mut nn, b"wrote ");
+    w_dec(&mut nb, &mut nn, off);
+    w_cmd(&mut nb, &mut nn, b" bytes -> ");
+    w_cmd(&mut nb, &mut nn, target);
+    w_cmd(&mut nb, &mut nn, b"\n");
+    out(me, fd, ser, &nb[..nn]);
+}
+
+/// One pwrite round trip; aborts the cell on error.
+fn req_write(me: u32, handle: u64, off: u64, data: &[u8], done: &mut u64, fd: u64, ser: Option<u64>) {
+    let mut req = Message::new(OP_WRITE);
+    req.arg0 = handle;
+    req.arg1 = off;
+    req.set_payload(data);
+    let rep = rpc(PORT_VFS, me, &req, 0);
+    if rep.kind != REPLY_OK {
+        out(me, fd, ser, b"echo: write failed\n");
+        exit(1);
+    }
+    *done += rep.arg0;
+}
+
+/// Byte index of a ` > ` separator (redirection), or None.
+fn find_redir(s: &[u8]) -> Option<usize> {
+    if s.len() < 3 {
+        return None;
+    }
+    for i in 0..=s.len() - 3 {
+        if &s[i..i + 3] == b" > " {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
     if line == b"exit" {
         out(me, fd, ser, b"bye\n");
@@ -557,11 +657,17 @@ fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
             me,
             fd,
             ser,
-            b"commands: help echo cat ps kill ls exit ping fetch\n",
+            b"commands: help echo cat ps kill ls exit ping fetch rm mkdir; echo x > /disk/f\n",
         );
     } else if line.starts_with(b"echo ") {
-        out(me, fd, ser, &line[5..]);
-        out(me, fd, ser, b"\n");
+        let rest = &line[5..];
+        // M14: `echo text > /disk/file` replaces a disk file's contents.
+        if let Some(i) = find_redir(rest) {
+            write_file(me, fd, ser, trim(&rest[..i]), trim(&rest[i + 2..]));
+        } else {
+            out(me, fd, ser, rest);
+            out(me, fd, ser, b"\n");
+        }
     } else if line.starts_with(b"cat ") {
         cat(me, fd, ser, trim(&line[4..]));
     } else if line.starts_with(b"ls ") {
@@ -583,6 +689,42 @@ fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
                 }
             }
             None => out(me, fd, ser, b"kill: bad pid\n"),
+        }
+    } else if line.starts_with(b"rm ") {
+        // M14: delete a file or an empty dir (admin-capped server-side).
+        let t = trim(&line[3..]);
+        let mut nb = [0u8; 96];
+        let mut nn = 0usize;
+        if t.is_empty() {
+            out(me, fd, ser, b"rm: missing path\n");
+        } else if vfs_path_op(me, OP_DELETE, t) {
+            w_cmd(&mut nb, &mut nn, b"rm: ok ");
+            w_cmd(&mut nb, &mut nn, t);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
+        } else {
+            w_cmd(&mut nb, &mut nn, b"rm: err ");
+            w_cmd(&mut nb, &mut nn, t);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
+        }
+    } else if line.starts_with(b"mkdir ") {
+        // M14: create a directory (admin-capped server-side).
+        let t = trim(&line[6..]);
+        let mut nb = [0u8; 96];
+        let mut nn = 0usize;
+        if t.is_empty() {
+            out(me, fd, ser, b"mkdir: missing path\n");
+        } else if vfs_path_op(me, OP_MKDIR, t) {
+            w_cmd(&mut nb, &mut nn, b"mkdir: ok ");
+            w_cmd(&mut nb, &mut nn, t);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
+        } else {
+            w_cmd(&mut nb, &mut nn, b"mkdir: err ");
+            w_cmd(&mut nb, &mut nn, t);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
         }
     } else if line.starts_with(b"ping ") {
         ping(me, fd, ser, trim(&line[5..]));

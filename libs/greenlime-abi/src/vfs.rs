@@ -22,4 +22,19 @@ pub const OP_PING: u32 = 5;
 /// arg1 = byte offset, like READ.
 pub const OP_READDIR: u32 = 6;
 
+// v1.1 (M14) — additive opcodes, no renumbering: v1.0 clients are
+// unaffected. OP_CREATE/DELETE/MKDIR carry the path in the payload and
+// only touch /disk/*; OP_WRITE and OP_SETSIZE are handle-based and grow
+// the ABI surface of WRITE (WRITE gains its first real semantics: pwrite
+// at arg1 offset, zero-fill + extend; reply arg0 = bytes written).
+/// Create an empty file at payload path (disk only). Fails if it exists.
+pub const OP_CREATE: u32 = 7;
+/// Delete a file or an EMPTY directory at payload path (disk only).
+pub const OP_DELETE: u32 = 8;
+/// Create a directory at payload path (disk only).
+pub const OP_MKDIR: u32 = 9;
+/// Truncate/extend the file at handle to arg1 bytes (disk only). Reply
+/// arg0 = resulting size. Extends are zero-filled; excess clusters free.
+pub const OP_SETSIZE: u32 = 10;
+
 pub const PING_MAGIC: u64 = 0x5049_4E47;

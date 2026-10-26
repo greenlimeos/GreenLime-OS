@@ -28,6 +28,7 @@ const ST_DRIVER_OK: u8 = 4;
 const ST_FEATURES_OK: u8 = 8;
 
 const BLK_T_IN: u32 = 0; // read
+const BLK_T_OUT: u32 = 1; // write (virtio legacy blk request type)
 const BLK_S_OK: u8 = 0;
 
 const DESC_NEXT: u16 = 1;
@@ -209,6 +210,68 @@ impl VirtioBlk {
         pmm::free_frame(frame);
         true
     }
+
+    /// Write one 512-byte sector (polls used ring). Same bounce-frame shape
+    /// as read_block, but the request type is T_OUT and the data descriptor
+    /// is device-READ (no DESC_WRITE). False on timeout or device error.
+    pub fn write_block(&mut self, lba: u64, src: &[u8; SECTOR]) -> bool {
+        assert!(self.blk_size == 512, "[drivers] virtio-blk: blk_size != 512");
+        // One bounce frame: [header 16][data 512][status 1].
+        let frame = pmm::alloc_frame().expect("[drivers] virtio-blk: no bounce frame");
+        let hhdm = self.hhdm;
+        let hdr = frame;
+        let data = frame + 16;
+        let status = frame + 16 + 512;
+        unsafe {
+            let w32 = |p: u64, v: u32| core::ptr::write_volatile((p + hhdm) as *mut u32, v);
+            let w64 = |p: u64, v: u64| core::ptr::write_volatile((p + hhdm) as *mut u64, v);
+            let w8 = |p: u64, v: u8| core::ptr::write_volatile((p + hhdm) as *mut u8, v);
+            w32(hdr, BLK_T_OUT);
+            w32(hdr + 4, 0);
+            w64(hdr + 8, lba);
+            w8(status, 0xFF);
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (data + hhdm) as *mut u8,
+                SECTOR,
+            );
+
+            self.desc(0).write(Desc { addr: hdr, len: 16, flags: DESC_NEXT, next: 1 });
+            // Data: device reads from guest (no DESC_WRITE).
+            self.desc(1).write(Desc { addr: data, len: 512, flags: DESC_NEXT, next: 2 });
+            self.desc(2).write(Desc { addr: status, len: 1, flags: DESC_WRITE, next: 0 });
+
+            let idx = core::ptr::read_volatile(self.avail_idx_ptr());
+            core::ptr::write_volatile(
+                self.avail_ring_ptr().add((idx % self.queue_size) as usize),
+                0,
+            );
+            core::ptr::write_volatile(self.avail_idx_ptr(), idx.wrapping_add(1));
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+            Port::<u16>::new(self.io + R_QUEUE_NOTIFY).write(0);
+            let _ = Port::<u8>::new(self.io + R_ISR).read();
+
+            let mut spins = 0u32;
+            loop {
+                if core::ptr::read_volatile(self.used_idx_ptr()) != self.last_used {
+                    break;
+                }
+                spins += 1;
+                if spins > TIMEOUT {
+                    pmm::free_frame(frame);
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            self.last_used = self.last_used.wrapping_add(1);
+            let st = core::ptr::read_volatile((status + hhdm) as *const u8);
+            let ok = st == BLK_S_OK;
+            pmm::free_frame(frame);
+            return ok;
+        }
+    }
 }
 
 /// Allocate `n` physically contiguous frames (retry loop; early-boot RAM is
@@ -269,6 +332,19 @@ pub fn read_block(lba: u64, out: &mut [u8; SECTOR]) -> bool {
                 return false;
             }
             b.read_block(lba, out)
+        }
+        None => false,
+    }
+}
+
+/// Write a 512-byte buffer to LBA. False if no disk / bad lba / device err.
+pub fn write_block(lba: u64, src: &[u8; SECTOR]) -> bool {
+    match BLK.lock().as_mut() {
+        Some(b) => {
+            if lba >= b.capacity_sectors {
+                return false;
+            }
+            b.write_block(lba, src)
         }
         None => false,
     }

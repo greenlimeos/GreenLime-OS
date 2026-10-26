@@ -1,22 +1,45 @@
-//! Wallpaper build script: pins `assets/wallpapers/wallpaper.jpeg` as a
-//! build-time include (`GREENLIME_WALLPAPER`). If the file is missing we
-//! materialize a tiny dark placeholder JPEG (baked below) so `make` keeps
-//! working before a real wallpaper is dropped in — the placeholder decodes
-//! to one flat pixel, which the service scales to a solid-looking desktop.
+//! Wallpaper build script: pins the wallpaper asset found under
+//! `assets/wallpapers/` as a build-time include. Priority: `wallpaper.png`
+//! (drop a PNG there later, no further config), then `wallpaper.jpeg` /
+//! `wallpaper.jpg`. Two env vars reach the wall service:
+//!   GREENLIME_WALLPAPER = absolute path to the asset
+//!   GREENLIME_WALL_FMT  = "png" | "jpeg"  (decoder selection)
+//! If nothing exists we materialize a tiny dark placeholder JPEG (baked
+//! below) so `make` keeps working before a real wallpaper is dropped in —
+//! the placeholder decodes to one flat pixel, which the service streams
+//! to a solid-looking desktop.
 
 fn main() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let asset_path = format!("{}/../../assets/wallpapers/wallpaper.jpeg", manifest);
-    let asset = std::path::Path::new(&asset_path);
-    if !asset.exists() {
-        std::fs::create_dir_all(asset.parent().unwrap())
-            .expect("create assets/wallpapers dir");
-        std::fs::write(&asset_path, PLACEHOLDER_JPEG)
-            .expect("write placeholder wallpaper.jpeg");
-        println!("cargo:warning=assets/wallpapers/wallpaper.jpeg missing — wrote the baked placeholder (drop a real JPEG there)");
+    let base = format!("{}/../../assets/wallpapers", manifest);
+    let mut found: Option<(&str, String)> = None;
+    for (fmt, name) in [
+        ("png", "wallpaper.png"),
+        ("jpeg", "wallpaper.jpeg"),
+        ("jpeg", "wallpaper.jpg"),
+    ] {
+        let p = format!("{}/{}", base, name);
+        let path = std::path::Path::new(&p);
+        if path.exists() {
+            found = Some((fmt, p));
+            break;
+        }
     }
-    println!("cargo:rerun-if-changed={}", asset_path);
-    println!("cargo:rustc-env=GREENLIME_WALLPAPER={}", asset_path);
+    let (fmt, path) = match found {
+        Some(f) => f,
+        None => {
+            let p = format!("{}/wallpaper.jpeg", base);
+            std::fs::create_dir_all(&base).expect("create assets/wallpapers dir");
+            std::fs::write(&p, PLACEHOLDER_JPEG).expect("write placeholder wallpaper.jpeg");
+            println!("cargo:warning=assets/wallpapers/ has no wallpaper — wrote the baked placeholder (drop wallpaper.png or .jpeg there)");
+            ("jpeg", p)
+        }
+    };
+    println!("cargo:rerun-if-changed={}", base); // dir watch: a future PNG drop re-fires this script
+    println!("cargo:rerun-if-changed={}", path);
+    println!("cargo:rerun-if-changed-env=GREENLIME_WALLPAPER");
+    println!("cargo:rustc-env=GREENLIME_WALLPAPER={}", path);
+    println!("cargo:rustc-env=GREENLIME_WALL_FMT={}", fmt);
 }
 
 /// 1x1 dark slate-blue JPEG (flat color) — System.Drawing at quality 50.
@@ -31,7 +54,7 @@ static PLACEHOLDER_JPEG: &[u8] = &[
     0x20, 0x1E, 0x1C, 0x1C, 0x1E, 0x24, 0x18, 0x1C, 0x22, 0x24, 0x26, 0x26,
     0x22, 0x20, 0x26, 0x2C, 0x28, 0x2A, 0x24, 0x2C, 0x26, 0x26, 0x24, 0x2E,
     0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E,
-    0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0x2E, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x08,
+    0x2E, 0xFF, 0xDB, 0x00, 0x43, 0x01, 0x08,
     0x09, 0x09, 0x0C, 0x0B, 0x0C, 0x18, 0x0E, 0x0E, 0x18, 0x30, 0x24, 0x1E,
     0x24, 0x30, 0x30, 0x24, 0x1E, 0x1E, 0x30, 0x38, 0x2E, 0x28, 0x2E, 0x38,
     0x38, 0x34, 0x30, 0x34, 0x2A, 0x30, 0x24, 0x2A, 0x34, 0x2A, 0x38, 0x3E,

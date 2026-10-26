@@ -99,17 +99,26 @@ def splash_check(path):
     return title, dirty
 
 
-def menu_px(path):
-    """Start-card solid tiles: exact MENU_BG2 (52,56,64) in the card rect
-    (360,304)-(920,740). The acrylic card varies per-pixel; only tiles +
-    the search pill hold that exact dark tile color."""
-    w, h, px = read_ppm(path)
+def launch_px(path):
+    """Start-button lime underline: exact LIME (170,232,64) in the box
+    (540,786)-(568,796) — only the open start card's underline ink paints
+    there (the lime G glyph above ends by y≈782)."""
+    w, px = 1280, None
+    with open(path, "rb") as f:
+        assert f.readline().strip() == b"P6"
+        dims = []
+        while len(dims) < 3:
+            line = f.readline()
+            if line.startswith(b"#"):
+                continue
+            dims += line.split()
+        px = f.read()
     n = 0
-    for y in range(304, 740):
+    for y in range(786, 796):
         row = y * w * 3
-        for x in range(360, 920):
+        for x in range(540, 568):
             o = row + x * 3
-            if (px[o], px[o + 1], px[o + 2]) == (52, 56, 64):
+            if (px[o], px[o + 1], px[o + 2]) == (170, 232, 64):
                 n += 1
     return n
 
@@ -248,7 +257,8 @@ def main():
                        lambda c: abs(c[0] - w // 2) <= 14
                        and abs(c[1] - h // 2) <= 14)
 
-        # --- Stage 3: tablet click opens the Start menu, click-off closes it ---
+        # --- Stage 3: tablet click opens the start card, click-off
+        # closes it (same contracts as the desktop test) ---
         def to_dev(axis, px):
             lo, hi = (x0, x1) if axis == 0 else (y0, y1)
             dim = w if axis == 0 else h
@@ -270,22 +280,22 @@ def main():
             shot(f"dist/fb-tablet-{tag}.ppm")
             time.sleep(2)
 
-        # Start slot of the centered dock pill: the demo window opens at
-        # boot → 2 slots, pill_x = 580 → slot0 center (616, 776).
-        click_at(616, 776, "menu")
-        # Dismiss: click desktop at (1000, 300) — right of the card.
+        # Start button of the centered cluster: (532,756,40,40),
+        # center (552,776).
+        click_at(552, 776, "menu")
+        # Dismiss: click desktop at (1000, 300) — outside card + windows.
         click_at(1000, 300, "dismiss")
-        m_menu = menu_px("dist/fb-tablet-menu.ppm")
-        m_gone = menu_px("dist/fb-tablet-dismiss.ppm")
-        print(f"tablet click: menu_px={m_menu} dismissed_px={m_gone}")
-        if m_menu < 50000:
-            print("FAIL: tablet click did not open the Start menu")
+        m_menu = launch_px("dist/fb-tablet-menu.ppm")
+        m_gone = launch_px("dist/fb-tablet-dismiss.ppm")
+        print(f"tablet click: underline_px={m_menu} dismissed_px={m_gone}")
+        if m_menu < 40:
+            print("FAIL: tablet click did not open the start card")
             ok = False
-        elif m_gone > 2000:
-            print("FAIL: tablet click did not dismiss the menu")
+        elif m_gone > 6:
+            print("FAIL: tablet click did not dismiss the card")
             ok = False
         else:
-            print("OK: tablet click opens + dismisses the menu")
+            print("OK: tablet click opens + dismisses the card")
 
         try:
             qmp(s, {"execute": "quit"})

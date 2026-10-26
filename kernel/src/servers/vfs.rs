@@ -1,5 +1,9 @@
 //! VFS server (kernel task): static ramfs + FAT32 disk + dynamic /ps.
-//! Clients: OPEN path -> handle, READ/WRITE/CLOSE by handle, PING, READDIR.
+//! Clients: OPEN path -> handle, READ/WRITE/CLOSE by handle, PING,
+//! READDIR, and (M14, v1.1) disk mutations: CREATE / DELETE / MKDIR by
+//! path, WRITE (pwrite at arg1 offset, hole-fill + extend) and SETSIZE
+//! by handle. Disk mutations are admin-gated (caps::USER_ADMIN) and only
+//! touch /disk/*; reads stay open to every task.
 //! Paths: `/disk/...` = FAT32 disk, `/ps` = task list, else ramfs.
 //! Replies go to the request's (kernel-stamped) sender mailbox.
 
@@ -58,6 +62,20 @@ fn reply(to: u32, kind: u32, arg0: u64, payload: &[u8]) {
 
 fn err(to: u32) {
     reply(to, REPLY_ERR, 0, &[]);
+}
+
+/// M14: disk mutations need the admin pair (init + shell). Reads stay
+/// open to every task.
+fn admin(task: u32) -> bool {
+    sched::caps_of(task) & sched::caps::USER_ADMIN == sched::caps::USER_ADMIN
+}
+
+/// Print-safe path for proof lines: ASCII graphics only, cut at 64.
+fn safe_path(p: &str) -> alloc::string::String {
+    p.chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(64)
+        .collect()
 }
 
 /// Root listing: ramfs files + disk/ + ps.
@@ -248,6 +266,142 @@ fn handle(req: Message) {
             }
         }
         OP_PING => reply(from, REPLY_OK, PING_MAGIC, &[]),
+        OP_WRITE => {
+            // M14: pwrite the payload at arg1 offset. Extends the file
+            // (new clusters appended) and zero-fills holes. Disk files
+            // only — ramfs is &'static data, /ps is generated. Reply
+            // arg0 = bytes written.
+            let payload = req.payload_bytes();
+            let n = payload.len() as u64;
+            let res: Option<(u64, String)> = {
+                let open = OPEN.lock();
+                // GLS-004: handles are guessable — only the opener may
+                // write through one.
+                let entry = match open
+                    .iter()
+                    .find(|o| o.handle == req.arg0 && o.owner == from)
+                {
+                    Some(e) => e,
+                    None => {
+                        drop(open);
+                        err(from);
+                        return;
+                    }
+                };
+                if !admin(from) {
+                    drop(open);
+                    err(from);
+                    return;
+                }
+                match &entry.target {
+                    OpenTarget::DiskFile(path) => {
+                        let mut disk = DISK.lock();
+                        let vol = match disk.as_mut() {
+                            Some(v) => v,
+                            None => {
+                                drop(open);
+                                err(from);
+                                return;
+                            }
+                        };
+                        vol.write_at(path, req.arg1, payload)
+                            .map(|_sz| (n, alloc::format!("/disk{}", path)))
+                    }
+                    _ => None,
+                }
+            };
+            match res {
+                Some((n, path)) => {
+                    kprintln!("[vfs] wrote {} bytes -> {}", n, safe_path(&path));
+                    reply(from, REPLY_OK, n, &[]);
+                }
+                None => err(from),
+            }
+        }
+        OP_SETSIZE => {
+            // M14: truncate/extend the file at handle to arg1 bytes.
+            // Extends are pre-zeroed; excess clusters are freed. Reply
+            // arg0 = resulting size.
+            let res: Option<(u64, String)> = {
+                let open = OPEN.lock();
+                let entry = match open
+                    .iter()
+                    .find(|o| o.handle == req.arg0 && o.owner == from)
+                {
+                    Some(e) => e,
+                    None => {
+                        drop(open);
+                        err(from);
+                        return;
+                    }
+                };
+                if !admin(from) {
+                    drop(open);
+                    err(from);
+                    return;
+                }
+                match &entry.target {
+                    OpenTarget::DiskFile(path) => {
+                        let mut disk = DISK.lock();
+                        let vol = match disk.as_mut() {
+                            Some(v) => v,
+                            None => {
+                                drop(open);
+                                err(from);
+                                return;
+                            }
+                        };
+                        vol.set_size(path, req.arg1)
+                            .map(|sz| (sz, alloc::format!("/disk{}", path)))
+                    }
+                    _ => None,
+                }
+            };
+            match res {
+                Some((sz, path)) => {
+                    kprintln!("[vfs] setsize {} -> {}", safe_path(&path), sz);
+                    reply(from, REPLY_OK, sz, &[]);
+                }
+                None => err(from),
+            }
+        }
+        OP_CREATE | OP_DELETE | OP_MKDIR => {
+            // M14 disk mutations: payload = path, /disk/* only, admin
+            // gate (init/shell). Ramfs files are &'static constants —
+            // mutating them would make boot state lie.
+            let path = core::str::from_utf8(req.payload_bytes()).unwrap_or("");
+            let sub = path.strip_prefix("/disk").unwrap_or("");
+            let sub = if sub.is_empty() { "/" } else { sub };
+            if !admin(from) || sub.len() < 2 || !sub.starts_with('/') {
+                err(from);
+                return;
+            }
+            let mut disk = DISK.lock();
+            let vol = match disk.as_mut() {
+                Some(v) => v,
+                None => {
+                    err(from);
+                    return;
+                }
+            };
+            let ok = match req.kind {
+                OP_CREATE => vol.create(sub),
+                OP_DELETE => vol.delete(sub),
+                _ => vol.mkdir(sub),
+            };
+            let full = alloc::format!("/disk{}", sub);
+            drop(disk);
+            if ok {
+                match req.kind {
+                    OP_CREATE => kprintln!("[vfs] created {}", safe_path(&full)),
+                    OP_DELETE => kprintln!("[vfs] deleted {}", safe_path(&full)),
+                    _ => kprintln!("[vfs] mkdir {} ok", safe_path(&full)),
+                }
+                reply(from, REPLY_OK, 0, &[]);
+            } else {
+                err(from);
+            }
+        }
         _ => err(from),
     }
 }

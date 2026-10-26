@@ -126,7 +126,7 @@ pub extern "C" fn _start() -> ! {    let me = getpid();
 
     // 1. Open our window (server picks geometry, hands us keyboard focus).
     let mut req = Message::new(WIN_CREATE);
-    req.set_payload(b"Demo - limeclient");
+    req.set_payload(b"GreenLime Demo");
     let rep = rpc(me, &req);
     if rep.kind != REPLY_OK {
         log("[demo] no display, exiting");
@@ -140,6 +140,13 @@ pub extern "C" fn _start() -> ! {    let me = getpid();
         id,
         b"GreenLime demo client\nkeys typed while this window is\nfocused land here - click to focus\n> ",
     );
+
+    // 2.5 M15: app graphics API demo — the window's content goes
+    // graphics (an animated canvas streamed ring-3 -> winsrv), then
+    // hands the window back to text mode. Console behavior below is
+    // unchanged; keys typed during the animation buffer in the ring
+    // and replay on the first read after the canvas releases.
+    canvas_intro(me, id);
 
     // 3. Echo loop: raw keys in (focused only), mirror lines to serial.
     let mut line = [0u8; 64];
@@ -330,6 +337,230 @@ fn put_dec(buf: &mut [u8], n: &mut usize, d: u8) {
     if *n < buf.len() {
         buf[*n] = b'0' + d;
         *n += 1;
+    }
+}
+
+// ===== M15: animated client graphics through the app canvas API =========
+// The demo switches its own window into graphics mode, streams 40 frames
+// of pure pixel art through WIN_BLIT_SETUP/WIN_BLIT/WIN_BLIT_END (navy
+// gradient field, an azure ridge wave, a lime ball in free flight), then
+// releases the canvas and returns to console mode — both modes in one
+// window, the whole M15 story in one task. Zero heap: the renderer is a
+// pure function of (row, frame), one 1536 B row buffer + one 256 B dirty
+// mask on the stack, one 2 KiB Message reused per sent row. Pacing is
+// Park (10 ticks/frame): ~7 fps measured on the release build, ~1 s per
+// frame on the debug build under TCG.
+//
+// Proof strings: `[demo] m15: canvas open WxH live`, one
+// `[demo] m15: frame N ball X,Y` per frame (doubles as the headless
+// test's motion ground truth), `[demo] m15: canvas released`. Canvas
+// pixels are clamped so no pixel has all three channels >= 239 — the
+// cursor stays the only all-channel >=239 blob on screen.
+
+const CANVAS_W: u32 = 512;
+const CANVAS_H_MAX: u32 = 256; // SETUP clamps down to the viewport, never up
+const FRAMES: u32 = 40;
+const PARKS_PER_FRAME: u32 = 10; // ~10 ticks ≈ 100 ms of pacing per frame
+const BALL_R: i32 = 14;
+
+/// Park until the next tick (ABI v5 pacing primitive, fuzzer's tool).
+fn park() {
+    unsafe { syscall(Syscall::Park as u64, 0, 0, 0) };
+}
+
+fn push_str(buf: &mut [u8], n: &mut usize, s: &[u8]) {
+    for &b in s {
+        if *n < buf.len() {
+            buf[*n] = b;
+            *n += 1;
+        }
+    }
+}
+
+fn push_u32(buf: &mut [u8], n: &mut usize, v: u32) {
+    let mut tmp = [0u8; 10];
+    let mut m = 0usize;
+    if v == 0 {
+        put_dec(&mut tmp, &mut m, 0);
+    } else {
+        let mut rest = v;
+        while rest > 0 {
+            put_dec(&mut tmp, &mut m, (rest % 10) as u8);
+            rest /= 10;
+        }
+        // reversed: rewrite forward
+        for i in (0..m).rev() {
+            if *n < buf.len() {
+                buf[*n] = tmp[i];
+                *n += 1;
+            }
+        }
+        return;
+    }
+    for i in (0..m).rev() {
+        if *n < buf.len() {
+            buf[*n] = tmp[i];
+            *n += 1;
+        }
+    }
+}
+
+/// ASCII-by-construction log (digits + fixed prefixes only).
+fn log_built(buf: &[u8], n: usize) {
+    let s = core::str::from_utf8(&buf[..n]).unwrap_or("[demo] m15: ?");
+    log(s);
+}
+
+/// Fire-and-forget one canvas row run: `arg1` = FIRST pixel index of the
+/// run (row-major across the whole canvas), i.e. `row * cw`.
+fn blit_row(id: u32, first_px: u32, bytes: &[u8]) {
+    let mut m = Message::new(WIN_BLIT);
+    m.arg0 = id as u64;
+    m.arg1 = first_px as u64;
+    m.set_payload(bytes);
+    send(PORT_WINSRV, &m);
+}
+
+/// Mark the rows a ball disc touches (old or new position) as dirty.
+fn mark_ball(dirty: &mut [bool; CANVAS_H_MAX as usize], by: i32, ch: u32) {
+    let r = BALL_R;
+    let y0 = (by - r).max(0) as u32;
+    let y1 = (by + r).min(ch as i32 - 1) as u32;
+    for y in y0..=y1 {
+        if (y as usize) < dirty.len() {
+            dirty[y as usize] = true;
+        }
+    }
+}
+
+/// The whole M15 story on the demo's own window, then back to console.
+/// Park-paced (~10 fps), 40 frames, then a WIN_BLIT_END teardown whose
+/// REPLY_OK is the sync point for the text-mode phase that follows.
+fn canvas_intro(me: u32, id: u32) {
+    // 1. SETUP: ask for 512x256; the server clamps to the viewport and
+    //    answers with the ACTUAL dims (trust the reply, not the ask).
+    let mut req = Message::new(WIN_BLIT_SETUP);
+    req.arg0 = id as u64;
+    req.arg1 = CANVAS_W as u64 | ((CANVAS_H_MAX as u64) << 32);
+    let rep = rpc(me, &req);
+    if rep.kind != REPLY_OK {
+        log("[demo] m15: canvas refused, staying on text");
+        return;
+    }
+    let cw = (rep.arg0 & 0xFFFF_FFFF) as u32;
+    let ch = (rep.arg0 >> 32) as u32;
+    {
+        let mut buf = [0u8; 80];
+        let mut n = 0usize;
+        push_str(&mut buf, &mut n, b"[demo] m15: canvas open ");
+        push_u32(&mut buf, &mut n, cw);
+        push_str(&mut buf, &mut n, b"x");
+        push_u32(&mut buf, &mut n, ch);
+        push_str(&mut buf, &mut n, b" live");
+        log_built(&buf, n);
+    }
+    // 2. Animate: ball in free flight (bounce off all four edges), the
+    //    wave ridge scrolling underneath. Only dirty rows stream — the
+    //    ball band (old + new) plus the always-moving wave band.
+    let (mut bx, mut by) = (40i32, 40i32);
+    let (mut vx, mut vy) = (7i32, 5i32);
+    let mut dirty = [false; CANVAS_H_MAX as usize];
+    let mut row = [0u8; 3 * CANVAS_W as usize];
+    const WAVE_ROWS: u32 = 24;
+    for t in 0..FRAMES {
+        for _ in 0..PARKS_PER_FRAME {
+            park();
+        }
+        mark_ball(&mut dirty, by, ch);
+        bx += vx;
+        if bx < BALL_R {
+            bx = BALL_R;
+            vx = -vx;
+        }
+        if bx > cw as i32 - 1 - BALL_R {
+            bx = cw as i32 - 1 - BALL_R;
+            vx = -vx;
+        }
+        by += vy;
+        if by < BALL_R {
+            by = BALL_R;
+            vy = -vy;
+        }
+        if by > ch as i32 - 1 - BALL_R {
+            by = ch as i32 - 1 - BALL_R;
+            vy = -vy;
+        }
+        mark_ball(&mut dirty, by, ch);
+        if ch >= 60 {
+            let y1 = (ch as i32 - 28).max(0) as u32;
+            for y in y1.saturating_sub(WAVE_ROWS)..=y1 {
+                dirty[y as usize] = true;
+            }
+        }
+        for y in 0..ch {
+            if !dirty[y as usize] {
+                continue;
+            }
+            for x in 0..cw {
+                // 1. Gradient base (18,22,34) -> (26,31,48), Q8 lerp.
+                let dyg = if ch > 1 { (y * 255) / (ch - 1) } else { 0 };
+                let mut r = (18 * (255 - dyg) + 26 * dyg) / 255;
+                let mut g = (22 * (255 - dyg) + 31 * dyg) / 255;
+                let mut b = (34 * (255 - dyg) + 48 * dyg) / 255;
+                // 2. Azure ridge wave (3 px thick, scrolling with t) —
+                //    a real triangle ridge: rises 0..23, falls back down.
+                let wave_base = ch as i32 - 28;
+                let dyw = wave_base - y as i32;
+                if dyw >= 0 && dyw <= 23 && dyw < 24 {
+                    let ph = ((x * 3 + t * 11) % 48) as i32;
+                    let hgt = if ph < 24 { ph } else { 47 - ph };
+                    if dyw == 0 || (dyw >= 1 && hgt >= dyw && hgt - dyw < 3) {
+                        r = 56;
+                        g = 126;
+                        b = 236;
+                    }
+                }
+                // 3. Ball disc on top (whole disc lime).
+                let dx = bx - x as i32;
+                let dy2 = by - y as i32;
+                if dx * dx + dy2 * dy2 <= BALL_R * BALL_R {
+                    r = 170;
+                    g = 232;
+                    b = 64;
+                }
+                // Cursor uniqueness: never all three >= 239.
+                if r >= 239 && g >= 239 && b >= 239 {
+                    r = 238;
+                }
+                let o = (x * 3) as usize;
+                row[o] = r as u8;
+                row[o + 1] = g as u8;
+                row[o + 2] = b as u8;
+            }
+            blit_row(id, y * cw, &row[..(cw * 3) as usize]);
+            dirty[y as usize] = false;
+        }
+        // Heartbeat + motion ground truth for qmp_m15_test.py.
+        {
+            let mut buf = [0u8; 80];
+            let mut n = 0usize;
+            push_str(&mut buf, &mut n, b"[demo] m15: frame ");
+            push_u32(&mut buf, &mut n, t);
+            push_str(&mut buf, &mut n, b" ball ");
+            push_u32(&mut buf, &mut n, bx as u32);
+            push_str(&mut buf, &mut n, b",");
+            push_u32(&mut buf, &mut n, by as u32);
+            log_built(&buf, n);
+        }
+    }
+    // 3. Teardown (REPLY_OK is the sync point): text mode returns.
+    let mut req = Message::new(WIN_BLIT_END);
+    req.arg0 = id as u64;
+    let rep = rpc(me, &req);
+    if rep.kind == REPLY_OK {
+        log("[demo] m15: canvas released, text mode");
+    } else {
+        log("[demo] m15: release failed");
     }
 }
 

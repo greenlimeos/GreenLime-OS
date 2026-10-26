@@ -97,6 +97,7 @@ def main():
     try:
         print("waiting for shell...", flush=True)
         wait_marker(SER, "[shell] interactive ready")
+        time.sleep(20)  # let winsrv drain + settle (wallpaper streams late)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(60)
         s.connect(QSOCK)
@@ -130,9 +131,10 @@ def main():
         def shot(path):
             qmp(s, {"execute": "screendump", "arguments": {"filename": path}})
 
-        # Open the terminal from the launcher (same spots as type test).
-        click_at(616, 776)   # Start dock slot (demo open at boot → n=2)
-        click_at(530, 450)   # Terminal pinned tile in the start card
+        # Open the terminal from the start card (same spots as the
+        # type test).
+        click_at(552, 776)   # start button → card
+        click_at(573, 578)   # Terminal tile (tile 1)
         wait_marker(SER, "[winsrv] launch Terminal")
 
         # 1. ping google.com

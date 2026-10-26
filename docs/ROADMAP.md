@@ -6,10 +6,12 @@ human driving review and running every milestone in QEMU.
 Version framing: **v1.0 starts at M10 — SMP + net + hardening.** The
 phases built *for v1.0* are M10 (SMP + ring-3 networking + hardening),
 M11 (Fluent light: userspace wallpaper service + Files app) and M12
-(Fluent dark — the shipping look). The earlier `v0.1`–`v0.9` sections
+(Fluent dark). The earlier `v0.1`–`v0.9` sections
 are the pre-1.0 groundwork (boot → memory → userspace → fonts → IPC →
 storage → window-server/compositor → identity hardening), kept here as
-history. The `v1.0 · M##` tags below are the 1.0 build order.
+history. The `v1.0 · M##` tags below are the 1.0 build order; **v1.1**
+adds M13 (SSE2 + fast compositor), M14 (writable FAT32) and the M14.5
+LimeDE rework — the current shipping look.
 
 Honest scope: Windows 11 = ~50M+ LOC, thousands of drivers, decades of compat.
 You beat it by starting tiny and never rewriting. Each milestone is bootable in QEMU.
@@ -321,6 +323,307 @@ You beat it by starting tiny and never rewriting. Each milestone is bootable in 
   (tl/br/mid cursor + menu open 62,598 / dismiss 0), input PASS (cursor
   640→840, sc 0x1e), smp/net/type rc=0, dbg-loop 5/5 boots fault-free,
   hardening smoke green on release, 1h soak PASS pre-suite.
+
+## v1.1 — Applications, speed, real storage (planned)
+
+Scope picked for 1.1: three phases, in this order (the build-wide one first,
+everything after stacks on it).
+
+### v1.1 · M13 — SSE + fast compositor ✅ DONE
+- [x] SSE/SSE2 enabled at boot on the BSP + every AP (CR4.OSFXSR +
+  OSXMMEXCPT, CR0.MP set / EM clear — `arch::init_ap_features`, now also
+  called from kmain), `#XM` handler in the IDT (ring-3 task dies like
+  #UD/#PF, supervisor halts loud).
+- [x] FXSAVE/FXRSTOR in the context switch: `switch_context_asm` now takes
+  a per-context 512-byte FX area (16-aligned; `FX_SAVE[task]` +
+  `SCHED_FX[cpu]`), seeded once at boot from a `fninit` + default-MXCSR
+  template. Proof: `[m13] xmm: 256/256 sentinel bytes survived a task
+  switch` — winsrv loads distinct sentinels into XMM0–15, yields to the
+  scheduler (other tasks run), and every byte comes back.
+- [x] Build split: **userland** builds with `-C target-feature=
+  +sse,+sse2,-soft-float` (Makefile `UE_RUSTFLAGS` + relocation-model,
+  since env RUSTFLAGS overrides `.cargo/config`); the **kernel stays
+  built without `+sse`** — IRQ handlers can never touch XMM, which is why
+  the IRQ path needs no FXSAVE and user XMM state survives interrupts.
+  Toolchain landmine (documented, stays avoided): the
+  `x86_64-unknown-none` spec pairs `-sse,+soft-float`, and LLVM rejects
+  `#[target_feature(enable="sse2")]` (+ `-soft-float` alone breaks core/
+  compiler_builtins float returns — "SSE register return with SSE
+  disabled", rust#117938). Kernel kernels therefore ship as **hand-written
+  SSE2 asm** (`arch/x86_64/simd.rs`), not intrinsics; every Rust path
+  stays integer-only.
+  Found live along the way: userland entered ring 3 with rsp % 16 == 0 —
+  once codegen emitted `movaps` spills, every user task #GP'd (soft-float
+  never noticed). Fixed: initial user rsp reserves the SysV return-slot
+  (stack_top − 8).
+- [x] Compositor hot paths vectorized (bit-exact vs the scalar reference
+  `blend_px` — 4 px/vector: acrylic `blend_const_span`, scrim/shadow
+  `blend_over_span`, wallpaper copy + present blit `copy_span`).
+  Proof: `[m13] simd: SSE2 blend bit-exact on 20480 px`, `… scalar 1436
+  Mcyc vs sse2 15 Mcyc -> 92.8x` (debug build; release 111 vs 14 Mcyc =
+  7.8x — scalar is auto-tuned by -O2 there).
+- Exit: ✅ met — B3 suite 5/5 (desktop contract pixel counts unchanged:
+  menu 41,116 / About 11,552 over the SSE2 blend), tablet PASS (62,598
+  menu tiles), input PASS (cursor 640→840, 60-px blob rule), release ISO
+  desktop green with wallpaper streams, zero `[FAULT]` lines.
+- Portability addendum (live-found on VirtualBox "Other (64-bit)"):
+  `init_ap_features` wrote CR4 with **SMEP+SMAP unconditionally** —
+  VirtualBox's default CPU profile exposes neither bit, the CPU raised
+  #GP on `mov cr4, eax` (`0f 22 e0`, eax=PAE|OSFXSR|OSXMM|SMEP|SMAP),
+  and with no IDT loaded yet that escalated to a triple fault →
+  **Guru Meditation 1155 (VINF_EM_TRIPLE_FAULT)**, black screen at
+  Limine handoff. Fix (both call sites — BSP `kmain` + every AP):
+  CPUID.(7:0)-gate the two bits exactly like `paging::init` already
+  did, **max-leaf guarded** (some hypervisors return vendor-string
+  fragments in EBX for unimplemented leaves) and kept
+  OSXMMEXCPT/OSFXSR unconditional (SSE2 mandatory in long mode).
+  New regression test: **`scripts/qmp_vboxsim_test.py`** — boots
+  QEMU with the VirtualBox story (`-cpu qemu64` without the feature
+  flags AND zero virtio devices) and proves
+  `[arch] protections: smep=false smap=false`, desktop painted, shell
+  interactive, demo window, wallpaper streamed, no `[FAULT]`, net
+  fail-closed. QEMU's `+smep,+smap` suites kept green (B3 5/5 after the
+  fix; the gate is a no-op there).
+
+### v1.1 · M14 — Writable filesystem
+- [x] FAT32 write path: FAT chain alloc/free (first-fit + resume cursor,
+  `EOC` on alloc so partial ops leave a legal chain end), dir entry
+  create/delete with terminator-correct slot reuse (E5 as-is; a consumed
+  `0x00` marker is rewritten a slot later; the chain's last slot being
+  consumed triggers a dir-cluster append), mkdir with `.`/`..`+terminator,
+  empty-dir-only deletes, extend (pre-zeroed) / truncate (`set_size`)
+  with excess-cluster release, pwrite-at-offset with hole zero-fill.
+  Single FAT mirror kept in sync; FSInfo counts intentionally stale
+  (legal).
+- [x] vfs WRITE (now real: pwrite at arg1 offset with extend + zero-fill
+  holes; reply arg0 = bytes written) + new additive ops OP_CREATE=7,
+  OP_DELETE=8, OP_MKDIR=9, OP_SETSIZE=10 (v1.0 clients unaffected). Disk
+  mutations are caps-gated: `CAP_DISK = 1<<3` folded into USER_ADMIN
+  (init + shell only; reads stay open). Shell: `echo text > /disk/f`
+  (delete-then-create overwrite, one atomic proof line), `rm`,
+  `mkdir`, atomic `cat: not found`. Files app saving: deferred (needs a
+  text-buffer UI; shell covers disk mutations today) — see 1.2 notes.
+- [x] virtio-blk `write_block` (T_OUT header, data descriptor
+  device-read; same bounce frame shape as read).
+- Exit: ✅ met — `scripts/qmp_disk_test.py`: shell writes
+  `m14proof` to `/disk/m14.txt` via `echo >`, reads it back in the same
+  boot, then (after a full QEMU reboot on the same `dist/disk.img`) a
+  read-only second phase still sees the file + `mkdir`'d dir. Also
+  proves: `rm` deletes a file (gone on `cat`), refuses a NON-EMPTY dir
+  (`/disk/docs` intact), 12/12 checks on the debug ISO and 12/12 + 3/3 on
+  the release ISO. Kernel proofs: `[vfs] created|deleted|mkdir … ok`,
+  `[vfs] wrote N bytes -> /disk/…`; shell proofs: `wrote N bytes -> …`,
+  `rm/mkdir: ok|err …`. All prior suites stay green (B3 5/5, tablet,
+  input, release desktop pixel contracts unchanged).
+- Found live along the way: u16 fat32 dir-entry packing panics on first
+  boot use (u32→2-byte field `copy_from_slice`) — fixed by `(f>>16) as
+  u16` splits; the QMP disk test caught it before any reviewer could.
+
+## v1.1 · M14.5 — LimeDE desktop rework ✅ DONE (ChromeOS charcoal glass)
+
+User directive: make the GUI match a posted ChromeOS dark reference
+"exactly" — individual floating shelf chips (not one merged pill), an
+azure Files folder, no desktop watermark, bright tray glyphs, and the
+blue wave wallpaper. The user also ruled: **no procedural wallpaper
+engine** — a `wallpaper.png` is simply dropped in later; the repo ships
+a generated default asset in the same spirit.
+
+- [x] **Palette "LimeDE dark"** (`winsrv.rs`): `BG(30,32,37)`,
+  `TITLE_BG(38,40,46)` / `TITLE_BG2(30,32,36)` focused/unfocused
+  titlebars, `FRAME(64,68,78)`, `HOVER(52,56,64)`, `ACTIVE(56,60,70)`,
+  brand **`LIME(170,232,64)`** (the `ACCENT` cyan-blue is fully
+  renamed/deleted), `LIME_FILL(44,74,22)`, **`AZURE(56,126,236)` +
+  `AZURE_HI(96,158,244)`** (Files folder, client chips), chip surface
+  `MENU_BG(24,26,30)`, panel card `CARD(28,30,36)`, quick OFF tiles
+  `MENU_BG2(46,49,56)`, inks `MENU_FG(230,233,240)` / `INK(206,212,220)`
+  / `SUB_FG(122,128,142)`, tray glyphs `WHITE(232,238,247)`.
+  Acrylics: `PANEL_A=214`, `CARD_A=236`, new per-chip
+  **`CHIP_A=238`**; radii `RAD_TILE 14`, `RAD_PANEL 12`. Every
+  functional surface, glyph, chrome, serial proof string and the
+  "made by GLM 5.3" attribution preserved. Desktop watermark deleted (About/Settings popup copies
+  keep the version line); Settings popup shows "Shelf chip shelf,
+  48px strip".
+- [x] **Chip shelf** (48px strip, no shared pill): per-chip
+  `acrylic_round_clip` chips — launcher G (x=16), wide search stadium
+  (64..210), Files pin (218, azure folder), Terminal pin (266, lime
+  `>_`), then one chip per running client at 48px pitch
+  (`x=314+48k`, max `SHELF_MAX_CLIENTS=4`). Hover lifts a chip with a
+  `HOVER@150` `chip_round_clip` tint over the composed back buffer;
+  launcher/search tint `ACTIVE@230` while the panel shows; open/running
+  state = a 3px lime underline. Client chips map **id ASC** (never Vec
+  z-order; `nclients()` excludes the Terminal/Files system windows, so
+  the demo chip never moves when the terminal opens).
+- [x] **All apps panel** replaces the centered Start card: left
+  acrylic panel (16,241,200,500), "All apps" header, rows
+  `(28,289+54i,176,50)` in order **Settings / Terminal / Files /
+  Demo**, footer icon buttons (About center (46,671), Settings gear
+  center (46,711)) with `fill_ring` annuli. `APPS` reordered,
+  `recent` fields deleted.
+- [x] **Live search, one query**: the `[u8;32]` search buffer is
+  shared shelf chip ↔ panel; typing/backspace invalidates both
+  surfaces; non-UTF8 (fuzz) queries fall back to the "Search"
+  placeholder; row order is filtered-length-driven.
+- [x] **Bright tray + date**: pill (1060,753,196,46), chevron/wifi/
+  volume/battery glyphs in `WHITE`; tray shows a two-line RTC clock
+  `HH:MM` over `YYYY-MM-DD` — `rtc::snapshot()` gained
+  `(year:u16,month,day)`, `BOOT_DATE` packs `y<<16|m<<8|d`, and
+  `now_date(uptime_secs)` rolls the day over (`[rtc] boot time HH:MM,
+  date YYYY-MM-DD` boot line).
+- [x] **PNG wallpaper drop-in**: `userland/wallpaper/build.rs` picks
+  the asset `.png` → `.jpeg` → `.jpg` (notifies on both dir + file
+  changes) and emits `GREENLIME_WALLPAPER` + `GREENLIME_WALL_FMT`;
+  `zune-png 0.5.2` added (lean decode: one exact-size Vec,
+  16-bit downshift, alpha-drop, direct RGB3 conversion — the naive
+  samples-copy chain OOM'd the 16 MiB userspace heap before the
+  rewrite); a heap guard (`output + 3·w·h ≤ 13MB`) exits politely
+  instead of dying. Default asset: generated dark-navy blue wave
+  `wallpaper.png` (1600×900, ~292 KiB), channels clamped ≤238.
+  Shader rules unchanged: wallpaper pixels still never allow an
+  all-channel ≥239 blob (cursor uniqueness).
+- [x] **All pixel tests re-baselined** to the new chrome with NEW
+  contracts: desktop — launcher lime underline ≥40 px in
+  (22,786)-(50,794) (paints 54), demo client azure strip ≥100 in
+  (316,760)-(356,798) (paints 112), popup `TITLE_BG` strip ≥8000 in
+  (412,297)-(858,323) (paints 10862), dismiss → 0/0; tablet/test/net/
+  disk/multi re-pointed to launcher (36,776) → rows (116, 314+54i);
+  multitest demo chip (334,776) + `TITLE_BG(38,40,46)`/
+  `TITLE_BG2(30,32,36)` counts — 18/18. Full proof: desktop 5/5,
+  tablet 4/4 stages, type 5/5, multi 18/18, disk 12/12 + 3/3 (fresh
+  image, same-image phase 2), net shell PASS (release), B3 suite 5/5,
+  release desktop pixel counts identical to debug.
+- Exit: ✅ met — the desktop reads like the reference (floating chips,
+  azure Files, bright tray, blue wave + lime accents), every suite
+  green, both ISOs build 0-warning.
+- Note: M15 (below) stacks on this rework.
+
+### v1.1 · M15 — App graphics API ✓ DONE
+- [x] `WIN_BLIT`: a client sends RGB pixel runs (3 B/px triples, same run
+  shape as the wallpaper service) into its own window; winsrv keeps a
+  per-client canvas. Additive ABI kinds: `WIN_BLIT_SETUP=10`, `WIN_BLIT=11`,
+  `WIN_BLIT_END=12` — RGB triples, not RGBA (the compositor is XRGB anyway,
+  and 3 B/px reuses the proven `WIN_WALL_ROWS` payload shape).
+- [x] Compositor composes client canvases under the theme: the canvas is
+  anchored at the content viewport's top-left, 1:1 opaque, clipped to the
+  viewport (rounded frame, shadow ring, taskbar untouched — and the canvas
+  REPLACES the window's text lines while present, text mode returns on
+  `WIN_BLIT_END`, synced by its `REPLY_OK`). Owner-checked (kernel-stamped
+  sender must be the `WIN_CREATE` owner), bounds-checked runs
+  (out-of-range drops silently), budget-capped at `CANVAS_BUDGET_PX = 1<<20`
+  px total across all windows (4 MiB of the kernel heap; `try_reserve_exact`
+  failure answers `REPLY_ERR` instead of OOM-ing the compositor).
+- [x] Demo app draws live custom graphics in its window: 40 Park-paced
+  frames (10 ticks/frame — ~7 fps measured on the release build, ~1 s per
+  frame on the debug build under TCG) of navy gradient + azure ridge wave
+  + a bouncing lime ball, streaming only dirty rows — zero heap (a 1536 B
+  row buffer + a 256 B dirty mask on the stack, one reused `Message`)
+  Proof strings:
+  `[winsrv] canvas: win 2 512x256 (owner 5)`, `[demo] m15: canvas open
+  512x256 live`, per-frame `[demo] m15: frame N ball X,Y` (the headless
+  test's motion ground truth), `[winsrv] canvas: win 2 released (N msgs)`,
+  `[demo] m15: canvas released, text mode`.
+- [x] Exit: met — `scripts/qmp_m15_test.py` (new headless proof): 15/15 on
+  the release AND debug ISO — canvas lifecycle on serial, screendump color
+  asserts inside the content box (lime ball ≥250 px, azure wave ≥600 px,
+  zero all-channels ≥239 px = the cursor-uniqueness predicate), two
+  in-flight samples ≥6 frames apart with ≥500 px differing inside the
+  window, ball motion between samples ≥5 px, then teardown → the window is
+  a console again (click focuses it, keys land as `[demo] got: ok`) and X
+  closes it (`win 2 closed` + demo EOF). All prior suites stay green:
+  multitest 18/18 (canvas coexists with the console demo), desktop, tablet
+  ×3 boots, type, disk 12/12 + 3/3, input, tray hover 8/8, net PASS, smp
+  7/7.
+- [x] Compositor polish this milestone forced: winsrv no longer blanks the
+  mouse cursor for a WHOLE lap (the old blanket lap-start undraw flickered
+  visibly under the canvas message flood). Now `pointer` undoes the
+  sprite's save-under at the old spot on a move, `steady_cursor` undoes it
+  only when the pending damage intersects the sprite zone, and
+  `draw_cursor` saves the under-bg only when the sprite wasn't already
+  drawn (a re-save over a drawn sprite leaks its own ink into `mouse_buf`;
+  the next undraw ghost-replants it — the tablet pixel test caught this).
+
+### v1.1 · M15.1 — Start-card launcher + task-slot reap ✓ DONE
+- [x] The start card's **Demo tile is a real launcher** now (was: focus
+  only, one-shot demo forever). Semantics: demo window alive → focus it
+  (no duplicates); demo **exited** → winsrv spawns a fresh demo user
+  task straight from the baked-in ELF (`sched::spawn_user_task("demo",
+  DEMO_ELF)`) and prints `[winsrv] launch Demo (respawned task 5)` —
+  confirmed on glass by the human run (window pops back at the same
+  spot, canvas re-runs, second X-close + exit). Verified headless by
+  `qmp_m15_test.py`, now **21 checks** (phase 9: launch + task-5
+  respawn + fresh `owner 5` canvas + 40 new frames + X-close + second
+  EOF/exit), with **windowed markers** (serial byte-offset snapshot:
+  the respawn run's lines are judged only among lines that arrive
+  after it — boot's identical-looking lines can no longer fake passes).
+- [x] **Task-slot reap** (the kernel prerequisite, `sched/mod.rs`):
+  task ids were monotonic with `MAX_TASKS = 9` slots — every id burns
+  at boot, so `task 5 exited` used to be the slot's death; a respawn
+  asserted `too many tasks`. Now a *reaper* owns slot recycling:
+  `take_id()` pops the free list (only under `TASKS.lock()`), else
+  takes `NEXT_ID`; `exit_current`/`kill_task` push the Dead task's id
+  back through `release_id` (self-guarded against double release).
+  The slot trio is **id-addressed** — `KSTACKS[id]`, `FX_SAVE[id]`
+  (seeded once at boot for all slots, so a reused slot inherits a
+  clean FPU image for free), mailbox port = id — so `kstack_top_for`
+  replaced the allocation cursor and reuse costs nothing. Its
+  `install()` keeps the invariant `tasks[id].id == id` everywhere
+  (fresh ids append, reused ids replace in place). **LIFO** lifo pop
+  → the respawned demo comes back at its boot id: the serial proof
+  reads `spawned user task 5 (demo)` exactly like boot.
+- [x] **Port hygiene on reuse**: a reused id inherits its predecessor's
+  mailbox port, so `ipc::reset_port(id)` clears queued self-messages
+  and wakes anyone parked on the port. Lock discipline: the port reset
+  never runs while `TASKS` is held (its wake nests the table) — spawn
+  is two-phase (id pick under lock → drop → ELF load + maps →
+  re-lock for `install`), exits release under the already-held lock.
+- [x] **Zero-warning userland** (was the milestone's second ask): every
+  warning traced to ONE root cause — userland was compiled against the
+  stock soft-float `x86_64-unknown-none` target while RUSTFLAGS forced
+  `+sse,+sse2,-soft-float`: the CLI-vs-spec fight tripped the
+  rust#162235 ABI-mismatch trio on every crate and put `core`,
+  `zune-png` (`#[target_feature(enable="ssse3")]` etc.) and
+  `simd-adler32` (stdarch) on the future-incompat list (rust#117938 —
+  SSE is illegal on a soft-float target; updating crates was a dead
+  end, both are newest on crates.io). Fix = a **JSON target spec**,
+  `targets/x86_64-greenlime-sse.json` — stock spec verbatim, but SSE/SSE2
+  baked INTO the target ("features": "-mmx,+sse,+sse2", no
+  `rustc-abi: "softfloat"`): Makefile drives it via `UE_TARGET` +
+  `-Zjson-target-spec`, `kernel/build.rs` locates the ELFs through
+  `GREENLIME_UE_DIR` (cargo keys a JSON-target build dir by the file
+  stem). Result: userland builds emit **zero warnings** on debug and
+  release. The kernel **stays** on `x86_64-unknown-none` by design
+  (M13 trust shape: IRQ paths can never touch XMM), so its single
+  `core v0.0.0` future-incompat note remains — expected, documented
+  here once. Also modernized: `greenlime-fuzz`'s panic hook uses
+  `info.message().as_str()` (stable 1.81) instead of deprecated
+  `payload()` ("never returns anything useful"), falling back to
+  `(formatted)` since alloc-free panics can't materialize args.
+- Note: the taskbar cluster centers on `(n−1)·44+40` with n = 4 +
+  clients — with the demo window CLOSED the start button sits at
+  (574,776), not the boot-time (552,776). Tests must mirror the
+  formula (GUI.md), and the start card now prints
+  `[winsrv] start card open` / `[winsrv] start card closed` so dead
+  clicks vs. open cards are distinguishable in serial forever.
+
+## After 1.1 — 1.2 candidates (no promises, rough order)
+- **M16 · `.gle` app format + EXEC** — the third-party app truck: a
+  lunchbox file (ELF payload + sticker header: name / version / icon /
+  requested caps), a `gle-pack` CLI, a `greenlime-app-template` repo, a
+  `greenlime-client` dev crate (open window / blit frame / read input),
+  `docs/GLE.md`, and the kernel-side EXEC syscall so a dropped
+  `name.gle` runs and shows up in the start card. Kernel keeps parsing
+  plain ELF — it unwraps the container, checks the caps, then execs.
+- **virtio-gpu 2D driver** — QEMU's real paravirtual display device:
+  dirty-rect flushes instead of full-frame presents, a hardware cursor
+  plane (retires the hand-composited cursor), EDID / runtime resolution.
+- **"GLite"** — our own SSE2 software-3D pipeline (vertex transform +
+  rasterizer) exposed to apps like `WIN_BLIT` is: a real rotating cube.
+- **virgl / OpenGL passthrough** — long-term; needs a Mesa-class guest
+  driver stack. Written down so nobody accidentalizes it.
+- **Browser ladder** — M17 mini browser (fetch → small HTML → layout →
+  `WIN_BLIT` canvas, http-only at first) → QuickJS / JavaScriptCore port
+  → WebKit-adapter engine port (Haiku's road). Chrome/Brave/Firefox
+  *themselves* need a full GreenPOSIX floor first (mmap, threads+futex,
+  dynamic linking, gigabytes) — that's the M18–M20 class of work.
 
 ## After 1.0
 * aarch64 port (`arch/aarch64/`), UEFI self-host, package manager, POSIX shim,

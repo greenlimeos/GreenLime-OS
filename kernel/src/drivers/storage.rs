@@ -17,3 +17,8 @@ pub fn init() {
 pub fn read_block(lba: u64, out: &mut [u8; 512]) -> bool {
     virtio_blk::read_block(lba, out)
 }
+
+/// Write a 512-byte buffer to LBA (M14: FAT32 needs a real write path).
+pub fn write_block(lba: u64, src: &[u8; 512]) -> bool {
+    virtio_blk::write_block(lba, src)
+}

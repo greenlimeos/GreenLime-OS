@@ -34,9 +34,11 @@ bitflags = "2"
 linked_list_allocator = "0.10"
 pic8259 = "0.11"
 fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
-# Pure-Rust JPEG decode (userland wallpaper task): both the SIMD ("x86")
-# and std features off — the scheduler swaps no FP state.
+# Pure-Rust image decode (userland wallpaper task): both the SIMD ("x86")
+# and std features off — the scheduler swaps no FP state. JPEG + PNG so the
+# user can drop either wallpaper format under assets/wallpapers/.
 zune-jpeg = { version = "0.5", default-features = false }
+zune-png = { version = "0.5", default-features = false }
 zune-core = { version = "0.5", default-features = false }
 smoltcp = { version = "0.14", default-features = false, features = [
   "alloc",

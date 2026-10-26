@@ -1,5 +1,12 @@
 [toolchain]
-channel = "nightly"
+# EXACT toolchain pin — nightlies are identified by dist *date*, so this name
+# is frozen forever: nightly-2026-10-25 == rustc 1.101.0-nightly (12433c307
+# 2026-10-24) / cargo 1.101.0-nightly (cad07cf8e 2026-10-23). Every cargo/rustc
+# run in this tree picks THIS build (no "+nightly" selectors anywhere — those
+# would bypass the pin). scripts/setup-wsl.sh installs it and verifies the
+# compiler matches. To move to a newer nightly: change the date here AND
+# RUST_EXPECT in scripts/setup-wsl.sh, run setup once, then make run-release.
+channel = "nightly-2026-10-25"
 components = ["rust-src", "rust-analyzer", "llvm-tools-preview", "rustfmt", "clippy"]
 targets = ["x86_64-unknown-none"]
 profile = "minimal"

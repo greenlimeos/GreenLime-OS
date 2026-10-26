@@ -1,28 +1,48 @@
 //! Window server (kernel task): owns the screen after fb takeover.
+//! v1.1 — Windows 11 "Fluent dark" desktop, rebuilt from scratch.
 //! Damage-rect compositor over a back buffer: state changes invalidate
 //! rects; each lap composes ONLY the damage into the back buffer (layers
-//! in z-order: wallpaper desktop, windows, taskbar, start menu, popup)
-//! and blits it. The on-screen mouse cursor never lives in the back
-//! buffer: it is undrawn before present and redrawn on top after, so
-//! compositing can never stomp it.
+//! in z-order: wallpaper desktop, windows, taskbar, start card) and
+//! blits it. The on-screen mouse cursor never lives in the back buffer
+//! and stays DRAWN between laps: a move undoes its save-under at the
+//! old spot (pointer), and a blit that would run over the sprite zone
+//! undoes it just before present (steady_cursor) — under message floods
+//! (canvas streaming) the compositor no longer blanks it every lap.
 //!
-//! UI theme (v1.2 "Fluent dark" — Windows 11 mica/acrylic design language):
-//! deep-charcoal surfaces over a userspace-streamed wallpaper
-//! (assets/wallpapers/wallpaper.jpeg, decoded by the ring-3 wallpaper task
-//! and streamed via WIN_WALL_* IPC; the kernel only converts + blits),
-//! floating acrylic dock pill + weather/tray pills, centered start card
-//! (greeting, pinned tile grid, bottom search; no Recent), quick-settings
-//! panel (tray click) + Settings/About popups. Windows are rounded,
-//! soft-shadowed, and fade-and-rise on open. Real translucency: every
-//! panel is alpha-blended with the wallpaper pixels beneath it (mica
-//! simulation — the wallpaper vec is the shared backdrop). Window content
-//! stays text-only: terminal (id 0, line discipline, opens on demand from
-//! the launcher — never at boot) + client windows (WIN_CREATE, raw keys
-//! while focused), focus follows clicks, titlebar drag moves, corner grip
-//! resizes, taskbar icons focus/raise, double-click titlebar maximizes.
-//! Keys arrive via PS/2 or virtio-tablet pointer; while the Start menu
-//! is open keys filter its search instead. Hybrid note: in-kernel like
-//! vfs/dev were at first; migrates out with shared-memory windows later.
+//! Design (Windows 11 dark, minimal — no bloat):
+//!   * Full-width translucent taskbar: one CENTERED cluster of 40px
+//!     rounded buttons — start (brand-lime G), Files / Terminal /
+//!     Settings pins, then one button per running client — and a right
+//!     tray (just the two-line wall clock — icon glyphs removed).
+//!     Open apps wear a rounded underline under their button (brand lime
+//!     when focused, soft gray when merely running); hover lifts any
+//!     button with a subtle rounded tint.
+//!   * Start menu: a centered acrylic card floating above the bar —
+//!     search field on top (typing live-filters the pinned grid),
+//!     a 4-wide pinned-tile grid, and a footer with a user chip (lime
+//!     avatar) and a power button. Nothing else — clean and minimal.
+//!   * Windows: dark mica panels, 8px rounded corners (square while
+//!     maximized, Windows 11 behavior), 1px border, 34px titlebar with
+//!     the left-aligned title and flat maximize/close buttons (close
+//!     hovers red, Windows 11 style), soft 4-ring drop shadow, and the
+//!     120ms fade+rise open animation. Client and system windows share
+//!     the exact same chrome — no browser-style tab strips.
+//!   * Every floating surface is glass: alpha-blended with the wallpaper
+//!     pixels beneath it (the wallpaper vec is the shared backdrop; the
+//!     ring-3 wallpaper task streams the real image,
+//!     assets/wallpapers/wallpaper.{png,jpeg,jpg}, via WIN_WALL_* IPC and
+//!     the kernel only converts + blits).
+//!
+//! Window content stays text-only: terminal (id 0, line discipline,
+//! opens on demand from the start menu — never at boot), Files (id 1,
+//! vfs explorer), Settings (id 2, info card) + client windows
+//! (WIN_CREATE, raw keys while focused). Focus follows clicks, titlebar
+//! drag moves, corner grip resizes, taskbar buttons focus/raise,
+//! double-click titlebar (or the maximize button) toggles maximize,
+//! the left Windows key toggles the start card. Keys arrive via PS/2 or
+//! virtio-tablet pointer; while the start card is open keys filter its
+//! search instead. Hybrid note: in-kernel like vfs/dev; migrates out
+//! with shared-memory windows later.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -33,75 +53,94 @@ use greenlime_font::{FontSystem, Framebuffer, Rgb};
 use spin::Mutex;
 
 use crate::arch::x86_64::idt;
+use crate::arch::x86_64::simd;
 use crate::drivers::{fb, input, virtio_input};
 use crate::servers::vfs;
 use crate::{ipc, kprintln, sched};
 
 const FONT_PX: f32 = 16.0;
-// ---- Palette: "Fluent dark" (the Windows 11 mica concept target) --------
-// RULE: every painted pixel stays strictly < 239 on ALL channels. The
-// mouse cursor (240,240,240) must remain the only >=239 blob on screen —
+// ---- Palette: Windows 11 dark theme (charcoal mica, brand lime accent) --
+// RULE: every painted pixel keeps ALL channels strictly < 239. The mouse
+// cursor (240,240,240) must remain the only >=239 blob on screen —
 // qmp_input_test / qmp_tablet_test locate the cursor by that predicate,
-// and the wallpaper task clamps its own pixels the same way. A dark theme
-// still draws bright text and accents, so every bright constant is capped
-// just under the cursor by design (visually reads as near-white).
-const BG: Rgb = Rgb(32, 34, 38); // window body (mica dark)
-const FG: Rgb = Rgb(208, 214, 224); // window text
-const TITLE_BG: Rgb = Rgb(44, 46, 52); // focused titlebar (tests exact-count it)
-const TITLE_BG2: Rgb = Rgb(33, 35, 40); // unfocused titlebar (tests exact-count it)
-const TITLE_FG: Rgb = Rgb(214, 220, 232);
-const FRAME: Rgb = Rgb(74, 79, 90); // focused window border
-const FRAME_UNFOC: Rgb = Rgb(48, 52, 60); // unfocused window border
-const CLOSE_BG: Rgb = Rgb(56, 58, 66);
-const CLOSE_HOVER: Rgb = Rgb(196, 43, 28);
-const HOVER: Rgb = Rgb(62, 66, 76); // hover fill on dark panels
-const ACTIVE: Rgb = Rgb(50, 58, 74); // pressed / open pill (accent-tinted)
-const ACCENT: Rgb = Rgb(76, 194, 255); // fluent dark cyan-blue
-const ACCENT_FILL: Rgb = Rgb(44, 78, 110); // accent-tinted fills (LED bars, strips)
-const MENU_BG: Rgb = Rgb(38, 41, 48); // acrylic panel tint (dock/tray/weather)
-const CARD: Rgb = Rgb(34, 37, 44); // acrylic card tint (start menu / popups)
-const MENU_BG2: Rgb = Rgb(52, 56, 64); // solid tiles / search / quick rows (tests count it)
-const MENU_FG: Rgb = Rgb(226, 230, 238);
-const SUB_FG: Rgb = Rgb(126, 136, 154); // hints / dim labels
-const DESK_FG: Rgb = Rgb(148, 166, 196); // watermark over the dark wallpaper
+// and the wallpaper task clamps its own pixels the same way. Bright
+// constants are capped just under the cursor by design.
+const BG: Rgb = Rgb(32, 32, 32); // window body (#202020, Win11 mica dark)
+const TITLE: Rgb = Rgb(43, 43, 43); // focused titlebar band (#2B2B2B)
+const TITLE_UNFOC: Rgb = Rgb(37, 37, 38); // unfocused titlebar band
+const FG: Rgb = Rgb(222, 226, 230); // window content text
+const TITLE_FG: Rgb = Rgb(222, 226, 230); // focused title text
+const FRAME: Rgb = Rgb(74, 78, 88); // focused window border
+const FRAME_UNFOC: Rgb = Rgb(47, 49, 55); // unfocused window border
+const BTN_HOVER: Rgb = Rgb(58, 60, 66); // titlebar button hover
+const CLOSE_HOVER: Rgb = Rgb(196, 44, 30); // close button hover (#C42B1C)
+const ICON_FG: Rgb = Rgb(200, 204, 210); // titlebar button glyph strokes
+const SUB_FG: Rgb = Rgb(150, 154, 162); // hints / dim labels / clock date
+const WHITE: Rgb = Rgb(232, 236, 242); // bright glyphs (tray, terminal)
+const LABEL_FG: Rgb = Rgb(216, 220, 228); // tiles / tray text
 const CURSOR: Rgb = Rgb(240, 240, 240); // tests detect >= 239 in ALL channels
-const ICON_BG: Rgb = Rgb(60, 64, 74); // icon wells
-const SHADOW: Rgb = Rgb(2, 3, 8); // window/panel drop shadow tint (reserved)
-const INK: Rgb = Rgb(198, 204, 216); // tray glyph strokes
-const FOLDER_BG: Rgb = Rgb(206, 160, 78); // amber folder body
-const FOLDER_HI: Rgb = Rgb(240, 216, 140); // folder flap highlight
-const PANEL_BORDER: Rgb = Rgb(66, 72, 84); // pill hairline
-const CARD_BORDER: Rgb = Rgb(62, 68, 80); // card / dialog hairline
+// Glass tints: surfaces blend these over the wallpaper at the alphas below.
+const BAR_TINT: Rgb = Rgb(20, 22, 27); // taskbar
+const PANEL_TINT: Rgb = Rgb(18, 20, 26); // start card
+const PANEL_BORDER: Rgb = Rgb(56, 60, 70); // card hairline
+const SEARCH_BG: Rgb = Rgb(44, 46, 52); // search field fill
+const HOVER: Rgb = Rgb(58, 61, 68); // hover lift on dark surfaces
+const ACTIVE: Rgb = Rgb(48, 50, 58); // pressed / open state fill
+const HAIRLINE: Rgb = Rgb(56, 58, 66); // taskbar top line + separators
+// Brand + app icon colors.
+const LIME: Rgb = Rgb(170, 232, 64); // brand accent: start logo + focus bar
+const UND_SOFT: Rgb = Rgb(146, 150, 158); // running (unfocused) underline
+const BLUE: Rgb = Rgb(76, 148, 244); // Files folder back panel
+const BLUE_HI: Rgb = Rgb(122, 180, 250); // folder front sheet
+const BALL_RED: Rgb = Rgb(225, 74, 58); // browser ball wedges
+const BALL_GRN: Rgb = Rgb(52, 168, 83);
+const BALL_YEL: Rgb = Rgb(244, 180, 6);
+const BALL_BLU: Rgb = Rgb(66, 133, 244);
+const BALL_WHITE: Rgb = Rgb(238, 240, 246);
+const GEAR: Rgb = Rgb(158, 163, 172); // settings gear
+const TERM_SQ: Rgb = Rgb(56, 58, 64); // terminal tile square
+const FOOT_FG: Rgb = Rgb(176, 180, 188); // search / power strokes
+const AVATAR_INK: Rgb = Rgb(30, 36, 18); // avatar initial on lime
 
-/// Acrylic panel strengths (Q8 alpha): how opaque the tint sits over the
-/// wallpaper backdrop. 214 ≈ 84% — glassy but very readable.
-const PANEL_A: u32 = 214; // dock / tray / weather pills
-const CARD_A: u32 = 226; // start card / popups / quick settings
+/// Glass strengths (Q8 alpha).
+const BAR_A: u32 = 205; // taskbar (~0.80)
+const PANEL_A: u32 = 216; // start card (~0.84)
 
-/// Corner radii (px) — the W11 rounding scale.
-const RAD_WIN: u32 = 10; // windows (outer border)
-const RAD_PANEL: u32 = 10; // floating pills + cards
-const RAD_TILE: u32 = 8; // tiles + buttons inside panels
+/// Corner radii (px).
+const RAD_WIN: u32 = 8; // Win11 window corners (square while maximized)
+const RAD_PANEL: u32 = 12; // start card
+const RAD_CELL: u32 = 6; // taskbar buttons + tray
+const RAD_TILE: u32 = 8; // start pinned tiles
 
 /// Per-band drop-shadow strength for the 4 shadow rings (inner -> outer).
-const SHADOW_A: [u32; 4] = [120, 76, 42, 24];
+const SHADOW_A: [u32; 4] = [110, 70, 40, 22];
 
 /// Open animation: length in scheduler ticks (10 ms each) + how far a
-/// window rises from (in px). 12 ticks = 120 ms — quick, never in the way.
+/// window/card rises from (in px). 12 ticks = 120 ms.
 const ANIM_TICKS: u64 = 12;
 const ANIM_RISE: i32 = 14;
 /// One compose lap can take LONGER than the whole animation (a loaded
 /// debug VM laps at ~1 s), so the fade invalidation keeps animating
 /// surfaces alive for this much longer: the first post-expiry lap paints
-/// the final crisp (p=256) frame. Release laps at ~10 ms, so the tail is
-/// a few invisible crisp frames — no UX difference.
+/// the final crisp (p=256) frame.
 const ANIM_TAIL: u64 = 180;
 
-const TITLE_H: u32 = 30;
-const TASKBAR_H: u32 = 48;
-const DOCK_H: u32 = 44; // floating pill height inside the strip
-const SLOT: u32 = 40; // taskbar icon slot
-const SLOT_GAP: u32 = 8;
+const TITLE_H: u32 = 34; // Win11-ish titlebar height
+const TASKBAR_H: u32 = 48; // full-width bottom bar
+const CELL: u32 = 40; // taskbar button
+const PITCH: u32 = 44; // button pitch (4px gap)
+/// Buttons after the pins (running clients), capped so the centered
+/// cluster can never collide with the tray.
+const MAX_CLIENTS: usize = 4;
+const TRAY_W: u32 = 84; // clock zone (two-line clock; icon glyphs removed)
+
+// Start card geometry.
+const MENU_W: u32 = 560;
+const MENU_H: u32 = 300;
+const MENU_GAP: u32 = 12; // air between the card and the bar
+const TILE_W: u32 = 126;
+const TILE_H: u32 = 100;
+
 const SCROLLBACK: usize = 200;
 const CUR_W: u32 = 12;
 const CUR_H: u32 = 14;
@@ -110,28 +149,27 @@ const TERM_X0: u32 = 150;
 const TERM_Y0: u32 = 100;
 const TERM_X1: u32 = 1130;
 const TERM_Y1: u32 = 640;
-// Start menu: centered floating card (concept layout) — greeting header,
-// one grid of pinned tiles, search pill at the very bottom. No Recent.
-const MENU_W: u32 = 560;
-const MENU_H: u32 = 436;
-/// Pinned-tile grid (relative to the card): 5 columns.
-const GRID_Y: u32 = 100;
-const TILE: u32 = 92;
-const TILE_PITCH: u32 = 100;
-const TILE_PITCH_Y: u32 = 106;
-/// Bottom search pill (relative to the card).
-const SEARCH_Y: u32 = 372;
-const SEARCH_H: u32 = 44;
 
 const TERM_ID: u32 = 0;
 /// Files window (system window, like the terminal): browsing the vfs.
 const FILES_ID: u32 = 1;
+/// Settings window (system window): static info card. Uses a HIGH
+/// sentinel id on purpose: the serial contract is `[winsrv] win 2 open
+/// at 700,120 540x330` — the first WIN_CREATE client (the demo) must be
+/// id 2, so Settings must never occupy the low id space (it was a
+/// non-window popup back when that contract was frozen).
+const SETTINGS_ID: u32 = u32::MAX - 1;
 /// No window focused (clean desktop: terminal opens on demand, never at boot).
 const NO_FOCUS: u32 = u32::MAX;
 /// Longest single terminal line (heap guard: the open line is uncapped by
 /// SCROLLBACK, which only limits the line *count*).
 const MAX_LINE: usize = 4096;
 const MAX_WINS: usize = 8;
+/// M15 canvas budget: max TOTAL canvas pixels across all windows (1 Mi px
+/// = 4 MiB of u32 — the kernel heap also carries the 4 MiB back buffer +
+/// the wallpaper cache; this keeps canvases a bounded share of it). A
+/// SETUP beyond the budget answers REPLY_ERR instead of OOM-ing.
+const CANVAS_BUDGET_PX: u64 = 1 << 20;
 const GRIP: u32 = 16;
 const MIN_W: u32 = 200;
 const MIN_H: u32 = 120;
@@ -211,14 +249,13 @@ fn point_in(x: u32, y: u32, r: Rect) -> bool {
     x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
-/// Start-menu apps (pinned row + search filter over the same list).
+/// Start menu pinned apps (tile grid + search filter over the same list).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum App {
     Files,
     Terminal,
-    Demo,
     Settings,
-    About,
+    Demo,
 }
 
 impl App {
@@ -226,28 +263,18 @@ impl App {
         match self {
             App::Files => "Files",
             App::Terminal => "Terminal",
-            App::Demo => "Demo",
             App::Settings => "Settings",
-            App::About => "About",
+            App::Demo => "Demo",
         }
     }
 }
 
-const APPS: [(&str, App); 5] = [
+const APPS: [(&str, App); 4] = [
     ("Files", App::Files),
     ("Terminal", App::Terminal),
-    ("Demo", App::Demo),
     ("Settings", App::Settings),
-    ("About", App::About),
+    ("Demo", App::Demo),
 ];
-
-/// Popup dialog kind (top layer; quick is interactive, rest dismiss).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Popup {
-    About,
-    Settings,
-    Quick,
-}
 
 /// Case-insensitive prefix/substring filter over an app name.
 fn name_matches(name: &str, q: &[u8]) -> bool {
@@ -263,11 +290,11 @@ fn name_matches(name: &str, q: &[u8]) -> bool {
 }
 
 /// One window's geometry + state. Z-order = position in WinSrv::windows.
+/// Every window (system + IPC client) wears the same Windows 11 chrome.
 struct Window {
     id: u32,
-    client: bool, // false = the terminal (system window, no X button)
     /// Creating task (kernel-stamped sender at WIN_CREATE; u32::MAX for
-    /// the terminal). Client ops require sender == owner (GLS-006).
+    /// system windows). Client ops require sender == owner (GLS-006).
     owner: u32,
     x: u32,
     y: u32,
@@ -280,6 +307,13 @@ struct Window {
     title: String,
     /// Text content (console rules; wrapped at render time).
     lines: VecDeque<String>,
+    /// M15 graphics mode: Some((pixels, w, h)) — a per-client canvas
+    /// anchored at the content viewport's top-left, 1:1 pixels (never
+    /// scaled: integer-only compositor), painted OVER the window body and
+    /// REPLACING the text lines while present. Owned + fed only by the
+    /// window's owner over IPC (WIN_BLIT_*); freed by WIN_BLIT_END or
+    /// when the window dies.
+    canvas: Option<(Vec<u32>, u32, u32)>,
     /// Client-only raw input ring + at most one waiting reader.
     ring: [u8; 128],
     head: usize,
@@ -294,6 +328,7 @@ impl Window {
     fn title_rect(&self) -> Rect {
         (self.x + 2, self.y + 2, self.w.saturating_sub(4), TITLE_H)
     }
+    /// Content viewport: below the titlebar.
     fn content_rect(&self) -> Rect {
         (
             self.x + 8,
@@ -302,9 +337,13 @@ impl Window {
             self.h.saturating_sub(TITLE_H + 16),
         )
     }
-    /// Close button (top-right of the titlebar, client windows only).
+    /// Flat close button (top-right in the titlebar).
     fn close_rect(&self) -> Rect {
-        (self.x + self.w - 30, self.y + 6, 22, 18)
+        (self.x + self.w - 26, self.y + 4, 20, 22)
+    }
+    /// Flat maximize toggle (left of the close button).
+    fn max_rect(&self) -> Rect {
+        (self.x + self.w - 46, self.y + 4, 20, 22)
     }
     /// Resize grip (bottom-right corner).
     fn grip_rect(&self) -> Rect {
@@ -340,6 +379,8 @@ struct WinSrv {
     wallpaper: Vec<u32>,
     /// Wallpaper rows received since SETUP (for the DONE proof line).
     wall_msgs: u32,
+    /// M15 canvas pixel-runs received since the last SETUP (proof line).
+    canvas_msgs: u64,
     font: FontSystem,
     line_h: u32,
     /// Windows, bottom-to-top. The terminal (id 0) is NOT here at boot —
@@ -359,22 +400,13 @@ struct WinSrv {
     pkt: [u8; 3],
     pkt_i: usize,
     prev_btn: u8,
-    // Start menu / popup.
-    menu_open: bool,
-    /// Tick the start menu opened (open animation fade/slide-in).
-    anim_menu: u64,
-    /// Open dialog: kind + the tick it opened (open animation).
-    popup: Option<(Popup, u64)>,
+    // Start card.
+    start_open: bool,
+    /// Scheduler tick the card was opened at (fade+rise animation).
+    anim_start: u64,
+    /// Start search query (filters the pinned tile grid live).
     search: [u8; 32],
     search_len: usize,
-    recent: Vec<App>, // last launched, most recent first (max 3)
-    // Quick settings panel (tray click): W11-style toggles + sliders.
-    qs_wifi: bool,
-    qs_bt: bool,
-    qs_night: bool,
-    qs_saver: bool,
-    qs_volume: u32,
-    qs_bright: u32,
     // Canonical line discipline (set-1 scancodes -> line-buffered stdin).
     /// The line being typed (not yet committed with Enter).
     line_buf: [u8; 120],
@@ -394,6 +426,10 @@ struct WinSrv {
     next_id: u32,
     /// Double-click detector: last titlebar click (window id, tick).
     last_click: Option<(u32, u64)>,
+    /// M15 canvas budget: total canvas pixels live across all windows
+    /// (each pixel = one xrgb u32 from the 16 MiB kernel heap — 4 MiB of
+    /// back buffer + 4 MiB cached wallpaper already live there).
+    canvas_used: u64,
 }
 
 static SRV: Mutex<Option<WinSrv>> = Mutex::new(None);
@@ -413,8 +449,8 @@ impl WinSrv {
         // wallpaper of the 16 MiB kernel heap).
         let wallpaper = render_wallpaper(w, h);
         // Clean desktop: NO windows at boot. The terminal (shell console)
-        // opens on demand from the launcher; the demo client opens its own
-        // window when it starts. Early terminal text is buffered in
+        // opens on demand from the start menu; the demo client opens its
+        // own window when it starts. Early terminal text is buffered in
         // term_hist until then (serial mirror stays live regardless).
         let mut srv = Self {
             fb,
@@ -422,6 +458,7 @@ impl WinSrv {
             back,
             wallpaper,
             wall_msgs: 0,
+            canvas_msgs: 0,
             font,
             line_h: 20,
             windows: alloc::vec![],
@@ -436,18 +473,10 @@ impl WinSrv {
             pkt: [0; 3],
             pkt_i: 0,
             prev_btn: 0,
-            menu_open: false,
-            anim_menu: 0,
-            popup: None,
+            start_open: false,
+            anim_start: 0,
             search: [0; 32],
             search_len: 0,
-            recent: Vec::new(),
-            qs_wifi: true,
-            qs_bt: false,
-            qs_night: false,
-            qs_saver: false,
-            qs_volume: 65,
-            qs_bright: 80,
             line_buf: [0; 120],
             line_len: 0,
             in_ring: [0; 128],
@@ -458,8 +487,9 @@ impl WinSrv {
             shift: false,
             caps: false,
             e0: false,
-            next_id: 2, // 0/1 are system windows (terminal, Files)
+            next_id: 2, // 0/1 are system windows (terminal, Files); first client = id 2 (contract)
             last_click: None,
+            canvas_used: 0,
         };
         srv.line_h = srv.font.line_height(FONT_PX);
         Some(srv)
@@ -500,7 +530,9 @@ impl WinSrv {
         for row in r.1..(r.1 + r.3) {
             let src = unsafe { back_base.add(row as usize * back_stride + r.0 as usize) };
             let dst = unsafe { scr_base.add(row as usize * scr_stride + r.0 as usize) };
-            unsafe { core::ptr::copy_nonoverlapping(src, dst, r.2 as usize) };
+            // M13: SSE2 span copy (4 px/iter) — present() is the single
+            // highest-bandwidth path in the compositor.
+            simd::copy_span(dst, src, r.2 as usize);
         }
     }
 
@@ -519,27 +551,19 @@ impl WinSrv {
             windows,
             last_clock,
             line_h,
-            next_id,
             focus,
-            menu_open,
-            anim_menu,
-            popup,
+            start_open,
+            anim_start,
             search,
             search_len,
             mx,
             my,
-            qs_wifi,
-            qs_bt,
-            qs_night,
-            qs_saver,
-            qs_volume,
-            qs_bright,
+            next_id,
             ..
         } = self;
         let wall: &[u32] = wallpaper;
         // 1. Desktop: cached wallpaper rows (integer-rendered once at
-        //    takeover — this target has no SSE, so per-pixel f32 here
-        //    would be soft-float builtin calls: ~350s at -O0).
+        //    takeover — SSE2 span copy per row, see simd.rs).
         let q = r_clip(r, (0, 0, sw, sh));
         if q.2 > 0 && q.3 > 0 {
             let stride = (back.pitch() / 4) as usize;
@@ -547,24 +571,12 @@ impl WinSrv {
             for y in q.1..q.1 + q.3 {
                 let src = unsafe { wall.as_ptr().add(y as usize * stride + q.0 as usize) };
                 let dst = unsafe { back_base.add(y as usize * stride + q.0 as usize) };
-                unsafe { core::ptr::copy_nonoverlapping(src, dst, q.2 as usize) };
+                // M13: SSE2 span copy (4 px/iter).
+                simd::copy_span(dst, src, q.2 as usize);
             }
         }
-        // Watermark (blended, no solid cell box over the gradient).
-        let wm = (sw.saturating_sub(300), sh.saturating_sub(TASKBAR_H + 34), 300, 24);
-        if r_inter(r, wm) {
-            draw_text_blended(
-                back,
-                font,
-                wm.0,
-                wm.1,
-                "GreenLime OS v1.1",
-                FONT_PX,
-                DESK_FG,
-            );
-        }
         // 2. Windows, bottom-to-top (z-order): soft shadow ring first
-        //    (blended over whatever is beneath), then the rounded chrome.
+        //    (blended over whatever is beneath), then the rounded frame.
         //    A freshly created window rises + fades in (wallpaper scrim).
         for w in windows.iter() {
             if !r_inter(r, w.rect()) && !r_inter(r, pad(w.rect())) {
@@ -574,9 +586,9 @@ impl WinSrv {
             window_shadow(back, wall, r, w.rect(), p);
             draw_window(back, font, wall, w, *focus, r, *line_h, *mx, *my, now);
         }
-        // 3. Taskbar (floating acrylic pills: weather garnish, dock, tray).
-        let tb = strip_rect(sw, sh);
-        if r_inter(r, tb) {
+        // 3. Taskbar: full-width acrylic bar — centered cluster + tray.
+        let strip = strip_rect(sw, sh);
+        if r_inter(r, strip) {
             let secs = now / 100;
             draw_taskbar(
                 back,
@@ -585,7 +597,7 @@ impl WinSrv {
                 windows,
                 *next_id,
                 *focus,
-                *menu_open,
+                *start_open,
                 secs,
                 r,
                 sh,
@@ -594,54 +606,27 @@ impl WinSrv {
             );
             *last_clock = secs;
         }
-        // 4. Start menu (acrylic card above the dock, fade-in on open).
-        if *menu_open {
+        // 4. Start card (acrylic above everything, fade-in).
+        if *start_open {
             let m = menu_rect(sw, sh);
             if r_inter(r, m) {
-                draw_menu(
+                draw_start(
                     back,
                     font,
                     wall,
                     r,
-                    sw,
                     sh,
                     now,
-                    *anim_menu,
+                    *anim_start,
                     &search[..*search_len],
                     *mx,
                     *my,
                 );
             }
         }
-        // 5. Popup (top layer: About / Settings / Quick settings).
-        if let Some((kind, born)) = *popup {
-            let p = popup_rect(kind, sw, sh);
-            if r_inter(r, p) {
-                let nwin = windows.len();
-                draw_popup(
-                    back,
-                    font,
-                    wall,
-                    r,
-                    sw,
-                    sh,
-                    kind,
-                    born,
-                    nwin,
-                    [
-                        *qs_wifi,
-                        *qs_bt,
-                        *qs_night,
-                        *qs_saver,
-                    ],
-                    *qs_volume,
-                    *qs_bright,
-                );
-            }
-        }
     }
 
-    /// The taskbar is stale when the clock ticks.
+    /// The tray is stale when the clock ticks.
     fn tick_taskbar(&mut self) {
         let secs = idt::ticks() / 100;
         if secs != self.last_clock {
@@ -649,17 +634,12 @@ impl WinSrv {
             self.invalidate(strip_rect(sw, sh));
         }
     }
-    /// True while any open animation is still in flight (windows, start
-    /// card, popup): those laps must compose + blit every tick.
+    /// True while any open animation is still in flight (windows, card):
+    /// those laps must compose + blit every tick.
     fn anim_active(&self) -> bool {
         let now = idt::ticks();
-        if self.menu_open && now.saturating_sub(self.anim_menu) < ANIM_TICKS + ANIM_TAIL {
+        if self.start_open && now.saturating_sub(self.anim_start) < ANIM_TICKS + ANIM_TAIL {
             return true;
-        }
-        if let Some((_, born)) = self.popup {
-            if now.saturating_sub(born) < ANIM_TICKS + ANIM_TAIL {
-                return true;
-            }
         }
         self.windows
             .iter()
@@ -670,19 +650,9 @@ impl WinSrv {
     /// dirty is cleared by every present(), this regenerates it.
     fn tick_anim(&mut self) {
         let now = idt::ticks();
-        if self.menu_open && now.saturating_sub(self.anim_menu) < ANIM_TICKS + ANIM_TAIL {
+        if self.start_open && now.saturating_sub(self.anim_start) < ANIM_TICKS + ANIM_TAIL {
             let (sw, sh) = (self.fb.width, self.fb.height);
             self.invalidate(pad(menu_rect(sw, sh)));
-        }
-        let mut pop = None;
-        if let Some((kind, born)) = self.popup {
-            if now.saturating_sub(born) < ANIM_TICKS + ANIM_TAIL {
-                let (sw, sh) = (self.fb.width, self.fb.height);
-                pop = Some(pad(popup_rect(kind, sw, sh)));
-            }
-        }
-        if let Some(p) = pop {
-            self.invalidate(p);
         }
         let mut young: Vec<Rect> = Vec::new();
         for w in &self.windows {
@@ -710,7 +680,8 @@ impl WinSrv {
         self.windows.iter().position(|w| w.id == id)
     }
 
-    /// Focus + raise (click routing; the focused titlebar brightens).
+    /// Focus + raise (click routing; the focused titlebar brightens and
+    /// the taskbar underline turns lime).
     fn focus_window(&mut self, id: u32) {
         let Some(i) = self.idx_of(id) else {
             return;
@@ -730,7 +701,7 @@ impl WinSrv {
                 let t = self.windows[j].title_rect();
                 self.invalidate(t);
             }
-            // Taskbar accent underline follows focus.
+            // Taskbar running underlines follow focus.
             let (sw, sh) = (self.fb.width, self.fb.height);
             self.invalidate(strip_rect(sw, sh));
             kprintln!("[winsrv] focus win {}", id);
@@ -745,6 +716,10 @@ impl WinSrv {
         if let Some(to) = self.windows[idx].pending.take() {
             let m = Message::new(REPLY_ERR);
             ipc::send(to, m, sched::current_id().unwrap_or(u32::MAX));
+        }
+        // Free the canvas back to the budget before the window drops.
+        if let Some((cv, _, _)) = self.windows[idx].canvas.as_ref() {
+            self.canvas_used -= cv.len() as u64;
         }
         let rect = pad(self.windows[idx].rect());
         self.windows.remove(idx);
@@ -838,12 +813,22 @@ impl WinSrv {
     }
 
     fn draw_cursor(&mut self) {
+        // Save-under: only trustworthy when the sprite was NOT on the fb
+        // while we read (a drawn sprite in the zone would leak its ink
+        // into mouse_buf — a later undraw would then ghost-replant those
+        // pixels). steady_cursor undrew exactly whenever this lap's blit
+        // ran over the zone — so if the sprite is already drawn AND its
+        // pixels were untouched, the saved background is still exact and
+        // must NOT be re-read from an fb that holds the sprite itself.
+        let fresh = !self.mouse_drawn;
         for row in 0..CUR_H as usize {
             for col in 0..CUR_W as usize {
                 let x = self.mx + col as u32;
                 let y = self.my + row as u32;
                 if x < self.fb.width && y < self.fb.height {
-                    self.mouse_buf[row * CUR_W as usize + col] = read_pixel(&mut self.fb, x, y);
+                    if fresh {
+                        self.mouse_buf[row * CUR_W as usize + col] = read_pixel(&mut self.fb, x, y);
+                    }
                     if CURSOR_BITS[row] & (1 << (11 - col)) != 0 {
                         self.fb.put_pixel(x, y, CURSOR);
                     }
@@ -853,17 +838,61 @@ impl WinSrv {
         self.mouse_drawn = true;
     }
 
+    /// Undraw the sprite only when this lap's present would run over it
+    /// (pending damage ∩ sprite zone). Keeps the cursor steady on screen
+    /// while the server drains message floods (M15 canvas stream, drag
+    /// damage): nothing erases it unless its own pixels are being replaced
+    /// — the blit writes exactly the damage rect, so the sprite zone
+    /// outside it keeps the true composed background between laps.
+    fn steady_cursor(&mut self) {
+        if !self.mouse_drawn {
+            return; // pointer() already undrew it (a move undoes the paint)
+        }
+        let Some(r) = self.dirty else {
+            return; // nothing blitted this lap: the zone keeps its pixels
+        };
+        let zone = (self.mx, self.my, CUR_W as u32, CUR_H as u32);
+        if r_inter(r, zone) {
+            self.undraw_cursor();
+        }
+    }
+
     // ---- input ------------------------------------------------------------
 
     /// Unified pointer event (PS/2 deltas resolve here too): press edge =
-    /// click, held+motion = drag, release = drop.
+    /// click, held+motion = drag, release = drop. Every move damages the
+    /// full hovered-widget rects at the old + new position so hover
+    /// states (taskbar buttons, tray, tiles, titlebar buttons) stay live
+    /// everywhere — see hover_damage.
     fn pointer(&mut self, x: u32, y: u32, btn: u8) {
         let moved = (x, y) != (self.mx, self.my);
         let (ox, oy) = (self.mx, self.my);
+        if moved {
+            // The save-under belongs to the OLD sprite position: restore
+            // the background there BEFORE mx/my move (undraw_cursor reads
+            // mx/my). The old zone needs no damage entry: the restore
+            // writes back the exact pixels it covered, and any damage
+            // already pending under it composes over the restored
+            // background — correct either way.
+            self.undraw_cursor();
+        }
         self.mx = x;
         self.my = y;
         if moved {
-            self.hover_invalidate(ox, oy, x, y);
+            // Hover chips paint on full widget rects: damage the whole
+            // hovered-widget set at both the old and new spot so a hover
+            // flip paints (and erases) cleanly in one present — no seams
+            // and no stale patches when the cursor leaves a wide widget.
+            for r in self.hover_damage(ox, oy) {
+                if let Some(r) = r {
+                    self.invalidate(r);
+                }
+            }
+            for r in self.hover_damage(x, y) {
+                if let Some(r) = r {
+                    self.invalidate(r);
+                }
+            }
         }
         let pressed = btn & 1 != 0;
         let was = self.prev_btn & 1 != 0;
@@ -878,84 +907,126 @@ impl WinSrv {
         }
     }
 
-    /// Hover feedback: entering/leaving the taskbar or an open menu panel
-    /// marks them stale (icons/rows highlight under the cursor).
-    fn hover_invalidate(&mut self, ox: u32, oy: u32, nx: u32, ny: u32) {
-        let (sw, sh) = (self.fb.width, self.fb.height);
-        let ty = sh - TASKBAR_H;
-        if oy >= ty || ny >= ty {
-            self.invalidate((0, ty, sw, TASKBAR_H));
-        }
-        if self.menu_open {
-            let m = menu_rect(sw, sh);
-            if point_in(ox, oy, m) || point_in(nx, ny, m) {
-                self.invalidate(m);
+    /// Hover damage: the full rect of every widget whose hover chip
+    /// depends on the point — bar cell, tray, start tiles + power button,
+    /// window titlebar buttons. Chips paint inside the compose clip, so
+    /// damaging a small cursor-following box would repaint only a slice
+    /// of wide widgets (the 168px tray, start tiles): seams at the slice
+    /// edge and stale highlight patches left where the cursor walked off.
+    /// Damage always covers the whole widget, so a hover flip is painted
+    /// (and erased) complete in a single present.
+    fn hover_damage(&self, x: u32, y: u32) -> [Option<Rect>; 6] {
+        let mut out = [None; 6];
+        let mut n = 0usize;
+        {
+            let mut push = |r: Rect| {
+                if n < out.len() {
+                    out[n] = Some(r);
+                    n += 1;
+                }
+            };
+            let (sw, sh) = (self.fb.width, self.fb.height);
+            // Taskbar: cells and the tray are disjoint; at most one matches.
+            if y >= sh - TASKBAR_H {
+                let nclient = self.nclients();
+                let nc = bar_cell_count(nclient);
+                for i in 0..nc {
+                    let c = bar_cell_rect(i, sw, sh, nclient);
+                    if point_in(x, y, c) {
+                        push(c);
+                    }
+                }
+                if point_in(x, y, tray_rect(sw, sh)) {
+                    push(tray_rect(sw, sh));
+                }
+                return out;
+            }
+            // Start card tiles + power button (same filtered walk as draw).
+            if self.start_open {
+                let mut gi = 0u32;
+                for (name, _) in APPS.iter() {
+                    if !name_matches(name, &self.search[..self.search_len]) {
+                        continue;
+                    }
+                    let t = tile_rect(gi, sw, sh);
+                    gi += 1;
+                    if point_in(x, y, t) {
+                        push(t);
+                    }
+                }
+                let pb = power_rect(sw, sh);
+                if point_in(x, y, pb) {
+                    push(pb);
+                }
+            }
+            // Titlebar hover chips (maximize + close): draw_window's exact
+            // geometry, including the birth rise, for the fading frames.
+            let now = idt::ticks();
+            for w in &self.windows {
+                if w.w < 70 {
+                    continue;
+                }
+                let p = anim_p(now, w.born);
+                let rise = (((256 - p) * ANIM_RISE as u32) >> 8) as u32;
+                for (bx, by) in [
+                    (w.x + w.w - 46, w.y + rise + 4), // maximize (BTN_HOVER)
+                    (w.x + w.w - 26, w.y + rise + 4), // close (CLOSE_HOVER)
+                ] {
+                    if point_in(x, y, (bx, by, 20, 22)) {
+                        push((bx, by, 20, 22));
+                    }
+                }
             }
         }
+        out
     }
 
     /// Left-click edge handling. Coordinates in screen pixels.
     fn click(&mut self, x: u32, y: u32) {
         let (sw, sh) = (self.fb.width, self.fb.height);
-        // Popup (top layer): the quick panel is interactive inside; any
-        // other dialog dismisses on any click.
-        if let Some((kind, _)) = self.popup {
-            let p = popup_rect(kind, sw, sh);
-            let inside = point_in(x, y, p);
-            if !inside {
-                self.popup = None;
-                self.invalidate(pad(p));
-                return;
-            }
-            if self.quick_click(x, y, p) {
-                return;
-            }
-            return; // inside panel, not on a control: keep it open
-        }
-        // Taskbar slots (usable with the menu open too). Clicks on the
-        // strip but off a slot/pill are dead space: close the menu.
+        // Taskbar usable with the start card open too. Clicks on the bar
+        // but off a button are dead space: close the card.
         if y >= sh - TASKBAR_H {
-            let n = slot_count(self.windows.len());
+            let nclient = self.nclients();
+            let n = bar_cell_count(nclient);
             for i in 0..n {
-                let s = dock_slot_rect(i, sw, sh, self.windows.len());
-                if point_in(x, y, s) {
-                    self.taskbar_slot(i);
+                if point_in(x, y, bar_cell_rect(i, sw, sh, nclient)) {
+                    self.bar_cell(i);
                     return;
                 }
             }
-            // Tray: W11-style quick settings flyout toggles here.
+            // Tray: interactive hover only — no flyout by design.
             if point_in(x, y, tray_rect(sw, sh)) {
-                self.toggle_quick();
                 return;
             }
-            // Weather garnish: harmless shortcut to Settings.
-            if point_in(x, y, weather_rect(sw, sh)) {
-                self.menu_launch(App::Settings);
-                return;
-            }
-            self.close_menu(); // empty strip space closes the menu
+            self.close_start(); // empty bar space closes the card
             return;
         }
-        // Menu open: panel interactions, else dismiss (click consumed).
-        if self.menu_open {
+        // Start card open: tiles + power, else dismiss (click consumed).
+        if self.start_open {
             let (mx0, my0, mw, mh) = menu_rect(sw, sh);
-            // Pinned tiles (filtered order must match draw_menu).
-            let mut tile = 0u32;
-            for (name, app) in APPS {
+            // Tiles (filtered order must match draw_start).
+            let mut gi = 0u32;
+            for (name, app) in APPS.iter() {
                 if !name_matches(name, &self.search[..self.search_len]) {
                     continue;
                 }
-                let t = tile_rect(tile, sw, sh);
+                let t = tile_rect(gi, sw, sh);
                 if point_in(x, y, t) {
-                    self.menu_launch(app);
+                    self.menu_launch(*app);
                     return;
                 }
-                tile += 1;
+                gi += 1;
+            }
+            // Footer: power button (right), user chip is inert.
+            if point_in(x, y, power_rect(sw, sh)) {
+                kprintln!("[winsrv] power");
+                return;
             }
             if point_in(x, y, (mx0, my0, mw, mh)) {
-                return; // inside panel (incl. search box): keep it open
+                return; // inside card: keep it open
             }
-            self.close_menu();
+            self.close_start();
             return;
         }
         // Windows, topmost first.
@@ -970,13 +1041,20 @@ impl WinSrv {
                 continue;
             }
             let id = self.windows[i].id;
-            // Close button (every window has one now, terminal included).
+            // Close button (every window has one).
             {
                 let c = self.windows[i].close_rect();
                 if x >= c.0 && x < c.0 + c.2 && y >= c.1 && y < c.1 + c.3 {
                     self.destroy_window(id);
                     return;
                 }
+            }
+            // Maximize button.
+            let mb = self.windows[i].max_rect();
+            if x >= mb.0 && x < mb.0 + mb.2 && y >= mb.1 && y < mb.1 + mb.3 {
+                self.focus_window(id);
+                self.toggle_max(id);
+                return;
             }
             // Resize grip.
             let g = self.windows[i].grip_rect();
@@ -1023,31 +1101,34 @@ impl WinSrv {
         // Desktop click: nothing.
     }
 
-    /// Taskbar slot i: 0 = Start, 1.. = window (id order).
-    fn taskbar_slot(&mut self, i: u32) {
-        let (sw, sh) = (self.fb.width, self.fb.height);
-        let open = |s: &mut Self| {
-            s.menu_open = true;
-            s.anim_menu = idt::ticks();
-            let (sw, sh) = (s.fb.width, s.fb.height);
-            s.invalidate(pad(menu_rect(sw, sh)));
-            s.invalidate(strip_rect(sw, sh));
-        };
+    /// Running client windows (not the Files/Terminal/Settings system
+    /// windows): each gets its own taskbar button, id order.
+    fn nclients(&self) -> usize {
+        self.windows
+            .iter()
+            .filter(|w| w.id != TERM_ID && w.id != FILES_ID && w.id != SETTINGS_ID)
+            .count()
+    }
+
+    /// Taskbar button i: 0 = start, 1..3 = pins, 4.. = running clients.
+    fn bar_cell(&mut self, i: u32) {
         match i {
-            0 => {
-                if self.menu_open {
-                    self.close_menu();
-                } else {
-                    open(self);
-                }
-            }
-            1.. => {
-                self.close_menu();
-                let target = (i - 1) as usize;
+            0 => self.toggle_start(),
+            1 => self.menu_launch(App::Files),
+            2 => self.menu_launch(App::Terminal),
+            3 => self.menu_launch(App::Settings),
+            _ => {
+                self.close_start();
+                // Client buttons map in id ASC order (NOT Vec z-order —
+                // the same walk the taskbar drawing's button count assumes).
+                let target = (i - 4) as usize;
                 let mut k = 0;
                 for id in 0..self.next_id {
+                    if id == TERM_ID || id == FILES_ID || id == SETTINGS_ID {
+                        continue; // system windows: no client button
+                    }
                     if self.idx_of(id).is_none() {
-                        continue; // destroyed window: no slot, no gap
+                        continue; // destroyed window: no button, no gap
                     }
                     if k == target {
                         self.focus_window(id);
@@ -1055,108 +1136,69 @@ impl WinSrv {
                     }
                     k += 1;
                 }
-                let _ = (sw, sh);
             }
         }
     }
 
-    fn close_menu(&mut self) {
-        if !self.menu_open {
+    fn toggle_start(&mut self) {
+        if self.start_open {
+            self.close_start();
+        } else {
+            self.start_open = true;
+            self.anim_start = idt::ticks();
+            let (sw, sh) = (self.fb.width, self.fb.height);
+            self.invalidate(pad(menu_rect(sw, sh)));
+            self.invalidate(strip_rect(sw, sh));
+            // Card flip prints: the card itself has no pixels-in-serial
+            // story, so these two lines are how a test (or a human
+            // reading the log) knows a start click actually landed —
+            // without them a dead click and an open card look identical.
+            kprintln!("[winsrv] start card open");
+        }
+    }
+
+    fn close_start(&mut self) {
+        if !self.start_open {
             return;
         }
-        self.menu_open = false;
+        self.start_open = false;
         self.search_len = 0;
+        kprintln!("[winsrv] start card closed");
         let (sw, sh) = (self.fb.width, self.fb.height);
         self.invalidate(pad(menu_rect(sw, sh)));
         self.invalidate(strip_rect(sw, sh));
     }
 
-    /// Tray click: open the quick settings flyout (and close anything else
-    /// that's open — one flyout at a time, like Windows 11), or close it
-    /// if it was already up. Clicks outside the panel dismiss it.
-    fn toggle_quick(&mut self) {
-        let (sw, sh) = (self.fb.width, self.fb.height);
-        if let Some((k, _)) = self.popup {
-            let p = popup_rect(k, sw, sh);
-            self.popup = None;
-            self.invalidate(pad(p));
-            if k != Popup::Quick {
-                // A dialog was up: just close it, the click toggles nothing.
-                return;
-            }
-            return;
-        }
-        if self.menu_open {
-            self.close_menu();
-        }
-        self.popup = Some((Popup::Quick, idt::ticks()));
-        self.invalidate(pad(popup_rect(Popup::Quick, sw, sh)));
-        self.invalidate(strip_rect(sw, sh));
-    }
-
-    /// A click inside the open quick panel: routing for toggles, slider
-    /// tracks, and the "All settings" shortcut. Returns true when the
-    /// press was consumed (panel stays open).
-    fn quick_click(&mut self, x: u32, y: u32, p: Rect) -> bool {
-        let (sw, sh) = (self.fb.width, self.fb.height);
-        // Toggle tiles (2 x 2 grid at the top).
-        if let Some(i) = (0u32..4).find(|i| point_in(x, y, quick_tile_rect(*i, sw, sh))) {
-            match i {
-                0 => self.qs_wifi = !self.qs_wifi,
-                1 => self.qs_bt = !self.qs_bt,
-                2 => self.qs_night = !self.qs_night,
-                _ => self.qs_saver = !self.qs_saver,
-            }
-            self.invalidate(pad(p));
-            return true;
-        }
-        // Slider tracks: click sets the level directly (W11 seek style).
-        if let Some(i) = (0u32..2).find(|i| point_in(x, y, quick_slider_rect(*i, sw, sh))) {
-            let s = quick_slider_rect(i, sw, sh);
-            let frac = (x - s.0).min(s.2) * 100 / s.2.max(1);
-            if i == 0 {
-                self.qs_volume = frac;
-            } else {
-                self.qs_bright = frac;
-            }
-            self.invalidate(pad(p));
-            return true;
-        }
-        // "All settings" row: swap this flyout for the Settings dialog.
-        if point_in(x, y, quick_footer_rect(sw, sh)) {
-            self.invalidate(pad(p));
-            self.popup = Some((Popup::Settings, idt::ticks()));
-            self.invalidate(pad(popup_rect(Popup::Settings, sw, sh)));
-            return true;
-        }
-        false
-    }
-
-    /// Launch a Start-menu app: record it in Recent, close the menu,
-    /// then perform its action.
+    /// Launch a start-menu app: close the card, then perform its action.
     fn menu_launch(&mut self, app: App) {
-        self.recent.retain(|a| *a != app);
-        self.recent.insert(0, app);
-        self.recent.truncate(3);
-        self.close_menu();
-        let (sw, sh) = (self.fb.width, self.fb.height);
+        self.close_start();
         match app {
             App::Files => self.ensure_files(),
             App::Terminal => self.ensure_terminal(),
             App::Demo => {
-                let demo = self.windows.iter().find(|w| w.client).map(|w| w.id);
-                if let Some(id) = demo {
+                // Demo = the demo client's window (it names itself "GreenLime
+                // Demo"): focus it while its task is alive. M15.1 slot reap:
+                // once the demo has EXITED (its task slot orbits back to the
+                // spawner's free list), the tile boots a fresh demo user
+                // task straight from the baked-in ELF — the start card is a
+                // real launcher now, not a one-shot. The respawned demo
+                // reuses its boot id (freelist LIFO), so the serial proof
+                // line reads exactly like boot ("owner 5").
+                let id = self
+                    .windows
+                    .iter()
+                    .filter(|w| w.id != TERM_ID && w.id != FILES_ID && w.id != SETTINGS_ID)
+                    .map(|w| w.id)
+                    .next();
+                if let Some(id) = id {
                     self.focus_window(id);
+                } else {
+                    let tid =
+                        crate::sched::spawn_user_task("demo", crate::userspace::DEMO_ELF);
+                    kprintln!("[winsrv] launch {} (respawned task {})", app.name(), tid);
                 }
             }
-            App::Settings => {
-                self.popup = Some((Popup::Settings, idt::ticks()));
-                self.invalidate(pad(popup_rect(Popup::Settings, sw, sh)));
-            }
-            App::About => {
-                self.popup = Some((Popup::About, idt::ticks()));
-                self.invalidate(pad(popup_rect(Popup::About, sw, sh)));
-            }
+            App::Settings => self.ensure_settings(),
         }
         kprintln!("[winsrv] launch {}", app.name());
     }
@@ -1172,7 +1214,6 @@ impl WinSrv {
             }
             self.windows.push(Window {
                 id: TERM_ID,
-                client: false,
                 owner: u32::MAX, // system window: no IPC client owns it
                 x: TERM_X0,
                 y: TERM_Y0,
@@ -1180,8 +1221,9 @@ impl WinSrv {
                 h: TERM_Y1 - TERM_Y0,
                 born: idt::ticks(),
                 maxim: None,
-                title: String::from("Terminal - greenlime-shell"),
+                title: String::from("Terminal"),
                 lines,
+                canvas: None,
                 ring: [0; 128],
                 head: 0,
                 len: 0,
@@ -1207,9 +1249,51 @@ impl WinSrv {
         self.focus_window(FILES_ID);
     }
 
-    /// Toggle maximized geometry (double-click on a titlebar): save the
-    /// current rect once, stretch to the full work area; toggling again
-    /// restores. Shadows repaint via pad().
+    /// Open the Settings window (system window): a static info card.
+    fn ensure_settings(&mut self) {
+        if self.idx_of(SETTINGS_ID).is_none() {
+            let (sw, sh) = (self.fb.width, self.fb.height);
+            let secs = idt::ticks() / 100;
+            let lines: Vec<String> = alloc::vec![
+                alloc::format!("Display       {} x {}", sw, sh),
+                alloc::format!(
+                    "Uptime        {:02}:{:02}:{:02}",
+                    secs / 3600,
+                    (secs % 3600) / 60,
+                    secs % 60
+                ),
+                alloc::format!("Windows       {} open", self.windows.len()),
+                String::from("GreenLime OS v1.1"),
+                String::from("made by GLM 5.3"),
+            ];
+            let (x, y) = (sw / 2 - 210, 170u32);
+            self.windows.push(Window {
+                id: SETTINGS_ID,
+                owner: u32::MAX,
+                x,
+                y,
+                w: 420,
+                h: 300,
+                born: idt::ticks(),
+                maxim: None,
+                title: String::from("Settings"),
+                lines: lines.into_iter().collect(),
+                canvas: None,
+                ring: [0; 128],
+                head: 0,
+                len: 0,
+                pending: None,
+            });
+            kprintln!("[winsrv] settings open");
+            self.invalidate(pad((x, y, 420, 300)));
+            self.invalidate(strip_rect(sw, sh));
+        }
+        self.focus_window(SETTINGS_ID);
+    }
+
+    /// Toggle maximized geometry (double-click on a titlebar or the
+    /// maximize button): save the current rect once, stretch to the full
+    /// work area; toggling again restores. Shadows repaint via pad().
     fn toggle_max(&mut self, id: u32) {
         let Some(i) = self.idx_of(id) else {
             return;
@@ -1268,7 +1352,6 @@ impl WinSrv {
         } else {
             self.windows.push(Window {
                 id: FILES_ID,
-                client: false,
                 owner: u32::MAX,
                 x: 230,
                 y: 140,
@@ -1278,6 +1361,7 @@ impl WinSrv {
                 maxim: None,
                 title,
                 lines,
+                canvas: None,
                 ring: [0; 128],
                 head: 0,
                 len: 0,
@@ -1353,6 +1437,7 @@ impl WinSrv {
         }
     }
 
+    /// Enter inside the start card: launch the first filtered app.
     fn menu_enter(&mut self) {
         let q = &self.search[..self.search_len];
         for (name, app) in APPS {
@@ -1428,6 +1513,10 @@ impl WinSrv {
         if self.e0 {
             // Extended key (arrows/nav): not text, swallow it + its break.
             self.e0 = false;
+            if sc == 0x5B {
+                // Left Windows key: toggles the start card (Windows 11).
+                self.toggle_start();
+            }
             return;
         }
         if sc & 0x80 != 0 {
@@ -1447,14 +1536,14 @@ impl WinSrv {
                 return;
             }
             0x01 => {
-                // Esc closes an open Start menu.
-                if self.menu_open {
-                    self.close_menu();
+                // Esc closes an open start card.
+                if self.start_open {
+                    self.close_start();
                 }
                 return;
             }
             0x1C => {
-                if self.menu_open {
+                if self.start_open {
                     self.menu_enter();
                 } else {
                     self.press_enter();
@@ -1462,7 +1551,7 @@ impl WinSrv {
                 return;
             }
             0x0E => {
-                if self.menu_open {
+                if self.start_open {
                     if self.search_len > 0 {
                         self.search_len -= 1;
                         let (sw, sh) = (self.fb.width, self.fb.height);
@@ -1478,8 +1567,9 @@ impl WinSrv {
         let Some(ch) = scancode_ascii(sc, self.shift, self.caps) else {
             return;
         };
-        if self.menu_open {
-            // Start menu grabs typing: filter the app list.
+        if self.start_open {
+            // The card grabs typing: the search field shows the query,
+            // the pinned grid filters live.
             if (ch.is_ascii_graphic() || ch == b' ') && self.search_len < self.search.len() {
                 self.search[self.search_len] = ch.to_ascii_lowercase();
                 self.search_len += 1;
@@ -1729,20 +1819,19 @@ impl WinSrv {
                 }
                 let title = match core::str::from_utf8(msg.payload_bytes()) {
                     Ok(t) if !t.is_empty() => String::from(t),
-                    _ => String::from("Window"),
+                    _ => String::from("Untitled"),
                 };
                 let (sw, sh) = (self.fb.width, self.fb.height);
                 let w = 540u32.min(sw.saturating_sub(8));
                 let h = 330u32.min(sh.saturating_sub(TASKBAR_H + 8));
                 // Cascade down-right per existing client window.
-                let k = self.windows.iter().filter(|w| w.client).count() as u32;
+                let k = self.nclients() as u32;
                 let x = (sw / 2 + 60).min(sw.saturating_sub(w + 4));
                 let y = (120 + 40 * k).min(sh.saturating_sub(TASKBAR_H + h + 4));
                 let id = self.next_id;
                 self.next_id += 1;
                 self.windows.push(Window {
                     id,
-                    client: true,
                     // GLS-006: stamped creator owns this window. Only the
                     // owner may read its keys, write its text, or destroy
                     // it over IPC (the titlebar X uses the direct path).
@@ -1755,6 +1844,7 @@ impl WinSrv {
                     maxim: None,
                     title,
                     lines: VecDeque::new(),
+                    canvas: None,
                     ring: [0; 128],
                     head: 0,
                     len: 0,
@@ -1813,6 +1903,146 @@ impl WinSrv {
             WIN_WALL_SETUP | WIN_WALL_ROWS | WIN_WALL_DONE => {
                 self.handle_wall(msg);
             }
+            // M15 app graphics API: the owning client streams RGB runs
+            // into its own window's canvas. Owner-checked (like
+            // WIN_CLIENT_*), budget-capped; the kernel only converts +
+            // blits — same trust shape as the wallpaper service.
+            WIN_BLIT_SETUP | WIN_BLIT | WIN_BLIT_END => {
+                self.handle_blit(msg);
+            }
+            _ => {}
+        }
+    }
+
+    /// M15 canvas ops. SETUP allocates a canvas clamped to the content
+    /// viewport (budget-capped across all windows; allocation failure
+    /// answers REPLY_ERR instead of OOM-ing the server). BLIT lands one
+    /// RGB run (owner-checked, bounds-checked, fire-and-forget). END
+    /// frees the canvas and hands the window back to text mode with a
+    /// synced REPLY_OK.
+    fn handle_blit(&mut self, msg: Message) {
+        let id = msg.arg0 as u32;
+        match msg.kind {
+            WIN_BLIT_SETUP => {
+                // The content viewport is the upper bound for a canvas:
+                // clamping here (instead of rejecting) lets a client ask
+                // for "as big as my window" and trust the reply dims.
+                let (cw_max, ch_max, cr0, cr1) = match self.idx_of(id) {
+                    Some(i) if self.windows[i].owner == msg.sender => {
+                        let c = self.windows[i].content_rect();
+                        (c.2, c.3, c.0, c.1)
+                    }
+                    _ => {
+                        self.reply(msg.sender, REPLY_ERR, 0, &[]);
+                        return;
+                    }
+                };
+                if cw_max == 0 || ch_max == 0 {
+                    self.reply(msg.sender, REPLY_ERR, 0, &[]);
+                    return;
+                }
+                let w = ((msg.arg1 & 0xFFFF_FFFF) as u32).clamp(1, cw_max);
+                let h = ((msg.arg1 >> 32) as u32).clamp(1, ch_max);
+                let n = w as u64 * h as u64;
+                // Replace-or-allocate: a re-SETUP frees the old canvas
+                // first so the budget never double-counts one window.
+                if let Some((cv, _, _)) = self
+                    .idx_of(id)
+                    .and_then(|i| self.windows[i].canvas.as_ref())
+                {
+                    self.canvas_used -= cv.len() as u64;
+                    if let Some(i) = self.idx_of(id) {
+                        self.windows[i].canvas = None;
+                    }
+                }
+                if self.canvas_used + n > CANVAS_BUDGET_PX {
+                    self.reply(msg.sender, REPLY_ERR, 0, &[]);
+                    return;
+                }
+                // Failure-proof alloc: try_reserve first, so a full or
+                // fragmented heap answers REPLY_ERR instead of panicking
+                // via the OOM handler INSIDE the compositor task.
+                let mut pix: Vec<u32> = Vec::new();
+                if pix.try_reserve_exact(n as usize).is_err() {
+                    self.reply(msg.sender, REPLY_ERR, 0, &[]);
+                    return;
+                }
+                pix.resize(n as usize, ((BG.0 as u32) << 16) | ((BG.1 as u32) << 8) | BG.2 as u32);
+                let Some(i) = self.idx_of(id) else {
+                    return;
+                };
+                self.windows[i].canvas = Some((pix, w, h));
+                self.canvas_used += n;
+                self.canvas_msgs = 0;
+                // Fresh canvas: erase the viewport once (a re-SETUP may be
+                // smaller than the previous canvas' damage rows).
+                self.invalidate((cr0, cr1, cw_max, ch_max));
+                kprintln!("[winsrv] canvas: win {} {}x{} (owner {})", id, w, h, msg.sender);
+                self.reply(msg.sender, REPLY_OK, w as u64 | ((h as u64) << 32), &[]);
+            }
+            WIN_BLIT => {
+                let Some(i) = self
+                    .idx_of(id)
+                    .filter(|&i| self.windows[i].owner == msg.sender)
+                else {
+                    return; // not the owner / gone: drop silently (no reply owed)
+                };
+                // Viewport first (immutable borrow ends at the copy), then
+                // the canvas by &mut — the pixel run lands directly in the
+                // cached canvas; the compose pass copies it out later.
+                let cr = self.windows[i].content_rect();
+                let Some((pix, cw, ch)) = self.windows[i].canvas.as_mut() else {
+                    return; // text mode: no canvas to paint
+                };
+                let (cw, ch) = (*cw as usize, *ch as usize);
+                let px = msg.payload_bytes();
+                let run = px.len() / 3; // trailing partial pixels drop (chunks_exact)
+                if run == 0 {
+                    return;
+                }
+                let total = cw * ch;
+                let base = msg.arg1 as usize;
+                if base >= total || base + run > total {
+                    return; // out-of-bounds junk: drop silently
+                }
+                // Convert + blit into the cached canvas (the compose pass
+                // copies it later; the kernel never interprets pixels).
+                for (k, c) in px[..run * 3].chunks_exact(3).enumerate() {
+                    pix[base + k] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+                }
+                // Damage the affected ROW strip (run may wrap rows; the x
+                // extent is the canvas width either way — cheap + correct).
+                let row0 = base / cw;
+                let row1 = (base + run - 1) / cw;
+                let rows = (row1 - row0 + 1) as u32;
+                let y = cr.1 + row0 as u32;
+                // Columns clip to the viewport (a shrunken window may be
+                // narrower than the canvas — never paint outside its body).
+                let wvis = (cw as u32).min(cr.2);
+                self.invalidate((cr.0, y, wvis, rows.min(ch as u32 - row0 as u32)));
+                self.canvas_msgs += 1;
+            }
+            WIN_BLIT_END => {
+                let owned = self
+                    .idx_of(id)
+                    .is_some_and(|i| self.windows[i].owner == msg.sender);
+                if !owned {
+                    self.reply(msg.sender, REPLY_ERR, 0, &[]);
+                    return;
+                }
+                if let Some(i) = self.idx_of(id) {
+                    if let Some((cv, cw, _)) = self.windows[i].canvas.take() {
+                        self.canvas_used -= cv.len() as u64;
+                        let cr = self.windows[i].content_rect();
+                        self.invalidate((cr.0, cr.1, cw.min(cr.2), cr.3));
+                    }
+                }
+                kprintln!(
+                    "[winsrv] canvas: win {} released ({} msgs)",
+                    id, self.canvas_msgs
+                );
+                self.reply(msg.sender, REPLY_OK, 0, &[]);
+            }
             _ => {}
         }
     }
@@ -1824,79 +2054,60 @@ fn unpack(v: u32) -> Rgb {
 
 // ---- geometry shared by draw + hit-testing -------------------------------
 
-/// Taskbar slot count: Start + one per window.
-fn slot_count(nwin: usize) -> u32 {
-    1 + nwin as u32
+/// Taskbar buttons: 0 = start, 1 = Files pin, 2 = Terminal pin,
+/// 3 = Settings pin, then one button per running client (id order),
+/// capped so the centered cluster can never reach the tray.
+fn bar_cell_count(nclient: usize) -> u32 {
+    4 + (nclient as u32).min(MAX_CLIENTS as u32)
 }
 
-/// Bottom-strip layout (concept): a centered floating dock pill plus a
-/// left weather pill and a right tray pill, all floating inside the
-/// TASKBAR_H strip with dead margins at the strip edges.
-fn strip_y(sh: u32) -> u32 {
-    sh - TASKBAR_H + (TASKBAR_H - DOCK_H) / 2
+/// Cluster width: (n-1) pitches + one button (no trailing gap).
+fn bar_cluster_w(n: u32) -> u32 {
+    (n - 1) * PITCH + CELL
 }
 
-/// The strip repaint rect including the pills' drop-shadow overhang
-/// (shadows rise ~SHADOW_PAD px above the strip line — partial repaints
-/// must cover it or stale ring pixels linger over the wallpaper).
+/// Button `i` of the centered cluster (40px square, 4px air below the
+/// bar's top line).
+fn bar_cell_rect(i: u32, sw: u32, sh: u32, nclient: usize) -> Rect {
+    let n = bar_cell_count(nclient);
+    let x0 = (sw - bar_cluster_w(n)) / 2;
+    (x0 + i * PITCH, sh - TASKBAR_H + 4, CELL, CELL)
+}
+
+/// The bar repaint rect (full width, flush bottom).
 fn strip_rect(sw: u32, sh: u32) -> Rect {
-    (
-        0,
-        sh - TASKBAR_H - SHADOW_PAD,
-        sw,
-        TASKBAR_H + SHADOW_PAD,
-    )
+    (0, sh - TASKBAR_H, sw, TASKBAR_H)
 }
 
-/// The centered dock pill: Start + one slot per window.
-fn dock_rect(sw: u32, sh: u32, nwin: usize) -> Rect {
-    let n = slot_count(nwin);
-    let w = 16 + n * (SLOT + SLOT_GAP) - SLOT_GAP + 16;
-    ((sw - w) / 2, strip_y(sh), w, DOCK_H)
-}
-
-/// Slot `i` (0 = Start) inside the dock pill.
-fn dock_slot_rect(i: u32, sw: u32, sh: u32, nwin: usize) -> Rect {
-    let (px, py, _, _) = dock_rect(sw, sh, nwin);
-    (
-        px + 16 + i * (SLOT + SLOT_GAP),
-        py + (DOCK_H - SLOT) / 2,
-        SLOT,
-        SLOT,
-    )
-}
-
-/// Right tray pill: wifi/volume/battery glyphs + wall clock. Click opens
-/// the quick settings flyout (W11 tray gesture).
-fn tray_rect(sw: u32, sh: u32) -> Rect {
-    (sw - 12 - 160, strip_y(sh), 160, DOCK_H)
-}
-
-/// Left weather pill (decorative garnish — no live weather feed).
-fn weather_rect(_sw: u32, sh: u32) -> Rect {
-    (14, strip_y(sh), 124, DOCK_H)
-}
-
-/// Start menu: centered floating card above the dock.
+/// Start card: horizontally centered, floating MENU_GAP above the bar.
 fn menu_rect(sw: u32, sh: u32) -> Rect {
-    ((sw - MENU_W) / 2, sh - TASKBAR_H - 12 - MENU_H, MENU_W, MENU_H)
+    ((sw - MENU_W) / 2, sh - TASKBAR_H - MENU_GAP - MENU_H, MENU_W, MENU_H)
 }
 
-/// Search pill: docked at the bottom of the card.
-fn search_rect(sw: u32, sh: u32) -> Rect {
-    let (mx0, my0, _, _) = menu_rect(sw, sh);
-    (mx0 + 20, my0 + SEARCH_Y, MENU_W - 40, SEARCH_H)
-}
-
-/// Pinned tile `i` (index in the *filtered* app list): 5-column grid.
-fn tile_rect(i: u32, sw: u32, sh: u32) -> Rect {
-    let (mx0, my0, _, _) = menu_rect(sw, sh);
+/// Pinned tile `gi` in the FILTERED grid (4 columns). Same walk as
+/// draw_start's, so clicks and pixels always agree.
+fn tile_rect(gi: u32, sw: u32, sh: u32) -> Rect {
+    let (mx, my, _, _) = menu_rect(sw, sh);
+    let col = gi % 4;
+    let row = gi / 4;
     (
-        mx0 + 24 + (i % 5) * TILE_PITCH,
-        my0 + GRID_Y + (i / 5) * TILE_PITCH_Y,
-        TILE,
-        TILE + 8,
+        mx + 16 + col * (TILE_W + 8),
+        my + 88 + row * (TILE_H + 8),
+        TILE_W,
+        TILE_H,
     )
+}
+
+/// Footer power button (card-relative geometry, right side).
+fn power_rect(sw: u32, sh: u32) -> Rect {
+    let (mx, my, mw, _) = menu_rect(sw, sh);
+    (mx + mw - 60, my + MENU_H - 54, 44, 40)
+}
+
+/// Right clock zone: the two-line wall clock (time over date,
+/// right-aligned); the hover chip covers the whole zone.
+fn tray_rect(sw: u32, sh: u32) -> Rect {
+    (sw - TRAY_W - 12, sh - TASKBAR_H + 4, TRAY_W, CELL)
 }
 
 /// Console-rules append into a line deque (shared by window lines and the
@@ -1929,62 +2140,23 @@ fn push_text(lines: &mut VecDeque<String>, text: &str) {
     }
 }
 
-/// Quick settings flyout geometry: right-anchored above the tray.
-const QS_W: u32 = 240;
-const QS_H: u32 = 280;
-
-/// Dialog rects: About/Settings centered; Quick settings anchored right.
-fn popup_rect(kind: Popup, sw: u32, sh: u32) -> Rect {
-    match kind {
-        Popup::Quick => (sw - 12 - QS_W, sh - TASKBAR_H - 12 - QS_H, QS_W, QS_H),
-        _ => {
-            let (pw, ph) = (460u32, 210u32);
-            ((sw - pw) / 2, (sh - ph) / 2, pw, ph)
-        }
-    }
-}
-
-/// Toggle tile i (0..4) inside the quick panel: 2x2 grid.
-fn quick_tile_rect(i: u32, sw: u32, sh: u32) -> Rect {
-    let (px, py, _, _) = popup_rect(Popup::Quick, sw, sh);
-    (
-        px + 16 + (i % 2) * 104,
-        py + 40 + (i / 2) * 64,
-        96,
-        56,
-    )
-}
-
-/// Slider row i (0 = volume, 1 = brightness): the CLICK band; the drawn
-/// track sits inside it, label above.
-fn quick_slider_rect(i: u32, sw: u32, sh: u32) -> Rect {
-    let (px, py, _, _) = popup_rect(Popup::Quick, sw, sh);
-    (px + 16, py + 164 + i * 44, 208, 30)
-}
-
-/// "All settings" footer row in the quick panel (opens Settings).
-fn quick_footer_rect(sw: u32, sh: u32) -> Rect {
-    let (px, py, _, _) = popup_rect(Popup::Quick, sw, sh);
-    (px + 16, py + QS_H - 34, 208, 24)
-}
-
 // ---- wallpaper -----------------------------------------------------------
 
 /// Placeholder wallpaper: a dark "bloom" gradient rendered ONCE at
 /// takeover, until the ring-3 wallpaper task streams the real image
-/// (assets/wallpapers/wallpaper.jpeg, decoded in userspace) over IPC —
-/// the kernel never parses image data. Windows 11 dark desktop vibe:
-/// deep charcoal-blue with two soft teal/lime blooms + a corner vignette.
-/// All channels stay < 239 so the white mouse cursor remains the only
-/// >=239 blob on screen (the input/tablet test predicate).
+/// (assets/wallpapers/wallpaper.png, decoded in userspace) over IPC —
+/// the kernel never parses image data. Matches the Windows 11 mood:
+/// deep navy with a big blue bloom center-right and a faint purple glow
+/// upper-left. All channels stay < 239 so the white mouse cursor remains
+/// the only >=239 blob on screen (the input/tablet test predicate).
 fn render_wallpaper(w: u32, h: u32) -> Vec<u32> {
     let mut out: Vec<u32> = alloc::vec![0u32; (w * h) as usize];
     let ww = w.max(1) as u64;
     let hh = h.max(1) as u64;
     // Per-column dx^2 tables (distances to both bloom centers, Q16).
-    // Bloom A: deep teal-blue, big, lower right. Bloom B: brand lime,
-    // small, upper left. Base: vertical charcoal gradient.
-    let (ax, ay) = (ww * 3 / 4, hh * 3 / 4);
+    // Bloom A: deep blue, big, center. Bloom B: purple, small, upper
+    // left. Base: vertical navy gradient.
+    let (ax, ay) = (ww / 2, hh * 3 / 5);
     let (bx, by) = (ww / 4, hh / 3);
     let rad_a = ((ww + hh) / 3).max(1); // Q0 radii squared below
     let rad_b = ((ww + hh) / 5).max(1);
@@ -1994,11 +2166,11 @@ fn render_wallpaper(w: u32, h: u32) -> Vec<u32> {
         let dxb = (bx as i64 - x64 as i64) * (bx as i64 - x64 as i64);
         for y in 0..h {
             let y64 = y as u64;
-            // Vertical base: (14,17,26) -> (28,34,50), Q16 lerp.
+            // Vertical base: (14,15,26) -> (26,28,46), Q16 lerp.
             let t = ((y64 << 16) / hh) as u32;
-            let mut r = (14 * 65536 + 14 * t) >> 16;
-            let mut g = (17 * 65536 + 17 * t) >> 16;
-            let mut b = (26 * 65536 + 24 * t) >> 16;
+            let mut r = (14 * 65536 + 12 * t) >> 16;
+            let mut g = (15 * 65536 + 13 * t) >> 16;
+            let mut b = (26 * 65536 + 20 * t) >> 16;
             // Radiance = max(0, 1 - d2/rad2), linear in d2 (no sqrt).
             let da = dxa + (ay as i64 - y64 as i64) * (ay as i64 - y64 as i64);
             let db = dxb + (by as i64 - y64 as i64) * (by as i64 - y64 as i64);
@@ -2012,13 +2184,13 @@ fn render_wallpaper(w: u32, h: u32) -> Vec<u32> {
             } else {
                 0
             } as u32;
-            // A adds teal-blue light, B adds the brand lime accent.
-            let ar = (qa * 24) >> 12;
-            let ag = (qa * 68) >> 12;
-            let ab = (qa * 96) >> 12;
-            let br = (qb * 40) >> 12;
-            let bg = (qb * 92) >> 12;
-            let bb = (qb * 70) >> 12;
+            // A adds deep blue light, B a faint purple glow.
+            let ar = (qa * 26) >> 12;
+            let ag = (qa * 78) >> 12;
+            let ab = (qa * 146) >> 12;
+            let br = (qb * 66) >> 12;
+            let bg = (qb * 40) >> 12;
+            let bb = (qb * 92) >> 12;
             r += ar + br;
             g += ag + bg;
             b += ab + bb;
@@ -2050,10 +2222,11 @@ fn isqrt(n: u32) -> u32 {
     x
 }
 
-// ---- acrylic / shadow / rounded-fill engine (v1.2 Fluent dark) -----------
+// ---- acrylic / shadow / rounded-fill engine ------------------------------
 
-/// One blended pixel: wallpaper + tint at Q8 alpha (0..256). Integer math
-/// only — this target soft-floats, so the compositors stay fixed-point.
+/// One blended pixel: wallpaper + tint at Q8 alpha (0..256). Scalar
+/// fixed-point REFERENCE for the SSE2 blend kernel (simd.rs); the compositor
+/// calls the vector path, tests keep this around for bit-exact comparison.
 #[inline(always)]
 fn blend_px(w: u32, tint: Rgb, a: u32) -> u32 {
     let wr = ((w >> 16) & 0xFF) as u32;
@@ -2077,7 +2250,8 @@ fn anim_p(now: u64, born: u64) -> u32 {
 /// damage rect `r`. Writes straight to the back buffer — compose() has
 /// already stamped the wallpaper there, but the blend reads the WALL (not
 /// the buffer) so panel pixels stay perfectly repeatable on partial
-/// repaints: mica = tint*(a) + wallpaper*(1-a), always.
+/// repaints: glass = tint*(a) + wallpaper*(1-a), always. rad 0 = square
+/// (the taskbar uses that).
 fn acrylic_round_clip(
     back: &mut Framebuffer,
     wall: &[u32],
@@ -2119,10 +2293,9 @@ fn acrylic_round_clip(
         unsafe {
             let dst = base.add(vy as usize * stride + xs as usize);
             let src = wall.as_ptr().add(vy as usize * stride + xs as usize);
-            for x in 0..(xe - xs) {
-                let wp = *src.add(x as usize);
-                *dst.add(x as usize) = blend_px(wp, tint, a);
-            }
+            // M13: SSE2 blend (4 px/iter), bit-exact vs blend_px.
+            let tint_px = (tint.0 as u32) << 16 | (tint.1 as u32) << 8 | tint.2 as u32;
+            simd::blend_const_span(src, dst, (xe - xs) as usize, tint_px, a);
         }
     }
 }
@@ -2136,7 +2309,7 @@ fn scrim_rect_clip(back: &mut Framebuffer, wall: &[u32], r: Rect, area: Rect, a:
     }
     let width = back.width;
     let stride = width as usize;
-    let base = unsafe { back.base_mut() as *mut u32 };
+    let base = back.base_mut() as *mut u32;
     let (x0, y0, w, h) = area;
     let y_lo = y0.max(r.1);
     let y_hi = (y0 + h).min(r.1 + r.3);
@@ -2149,11 +2322,10 @@ fn scrim_rect_clip(back: &mut Framebuffer, wall: &[u32], r: Rect, area: Rect, a:
         unsafe {
             let dst = base.add(vy as usize * stride + x_lo as usize);
             let src = wall.as_ptr().add(vy as usize * stride + x_lo as usize);
-            for x in 0..(x_hi - x_lo) {
-                let cur = core::ptr::read_volatile(dst.add(x as usize));
-                *dst.add(x as usize) =
-                    blend_px(cur, unpack(core::ptr::read(src.add(x as usize))), a);
-            }
+            // M13: SSE2 blend (4 px/iter), bit-exact vs blend_px. The base
+            // pixel is the already-composed back buffer (read before write,
+            // same as the scalar loop).
+            simd::blend_over_span(dst, src, (x_hi - x_lo) as usize, a);
         }
     }
 }
@@ -2248,108 +2420,249 @@ fn fill_arc_top(back: &mut Framebuffer, cx: u32, cy: u32, r_out: u32, r_in: u32,
     }
 }
 
-/// Filled triangle, apex up at x = cx, top y = y0 (BT glyph halves).
-fn fill_tri_up(back: &mut Framebuffer, cx: i32, y0: i32, h: u32, half: u32, c: Rgb) {
-    if y0 < 0 || cx < half as i32 {
+/// Bottom quarter-annulus rows below (cx, cy) on one side — used by the
+/// browser ball icon's colored wedges.
+fn fill_quarter_bottom(
+    back: &mut Framebuffer,
+    cx: u32,
+    cy: u32,
+    r_out: u32,
+    r_in: u32,
+    right: bool,
+    c: Rgb,
+) {
+    if r_out <= r_in || cy >= back.height {
         return;
     }
-    for row in 0..h {
-        let hw = (row * half) / h;
-        back.fill_rect((cx - hw as i32).max(0) as u32, (y0 + row as i32) as u32, hw * 2 + 1, 1, c);
+    let cxi = cx as i32;
+    for dy in 1..=r_out as i32 {
+        let rest = (r_out * r_out) as i32 - dy * dy;
+        if rest < 0 {
+            continue;
+        }
+        let hw_out = isqrt(rest as u32) as i32;
+        let hw_in = if dy >= r_in as i32 {
+            0
+        } else {
+            isqrt(((r_in * r_in) as i32 - dy * dy).max(0) as u32) as i32
+        };
+        let y = cy as i32 + dy;
+        if y < 0 {
+            continue;
+        }
+        let (a, b) = if right {
+            (cxi + hw_in, cxi + hw_out)
+        } else {
+            (cxi - hw_out + 1, cxi - hw_in)
+        };
+        let a = a.max(0) as u32;
+        let b = b.max(0) as u32;
+        if b > a {
+            back.fill_rect(a, y as u32, b - a, 1, c);
+        }
     }
 }
 
-/// Filled triangle, apex down (base at y0) — mirrors fill_tri_up.
-fn fill_tri_down(back: &mut Framebuffer, cx: i32, y0: i32, h: u32, half: u32, c: Rgb) {
-    if y0 < 0 || cx < half as i32 {
+/// Annulus ring around (cx, cy): full-circle outline-style mark, used for
+/// the magnifier, gear, and power glyphs.
+fn fill_ring(back: &mut Framebuffer, cx: u32, cy: u32, r_out: u32, r_in: u32, c: Rgb) {
+    if r_out <= r_in {
         return;
     }
-    for row in 0..h {
-        let hw = (half * (h - row)) / h;
-        back.fill_rect((cx - hw as i32).max(0) as u32, (y0 + row as i32) as u32, hw * 2 + 1, 1, c);
-    }
-}
-
-/// Shrink one px per side (rounded panels keep borders via insets).
-fn inner(r: Rect, d: u32) -> Rect {
-    (
-        r.0 + d,
-        r.1 + d,
-        r.2.saturating_sub(2 * d),
-        r.3.saturating_sub(2 * d),
-    )
-}
-
-/// A floating panel: shadow ring, 1px hairline border, acrylic interior.
-/// Everything on the desktop that floats (dock/weather/tray) goes through
-/// this so the whole chrome shares one visual recipe.
-fn pill(back: &mut Framebuffer, wall: &[u32], r: Rect, rect: Rect, a: u32) {
-    window_shadow(back, wall, r, rect, 256);
-    fill_round_clip(back, r, rect, RAD_PANEL, PANEL_BORDER);
-    acrylic_round_clip(back, wall, r, inner(rect, 1), RAD_PANEL - 1, MENU_BG, a);
-}
-
-/// Magnifier glyph: ring + diagonal handle.
-fn draw_magnifier(back: &mut Framebuffer, cx: u32, cy: u32, fg: Rgb, bg: Rgb) {
-    fill_circle(back, cx, cy, 7, fg);
-    fill_circle(back, cx, cy, 5, bg);
-    for i in 0..4 {
-        back.fill_rect(cx + 5 + i, cy + 5 + i, 2, 2, fg);
-    }
-}
-
-/// Start mark: 2x2 accent squares — the Windows 11 logo shape, our own
-/// mark in the fluent palette (rows provide the damage clip).
-fn draw_start_mark(back: &mut Framebuffer, r: Rect, sx: u32, sy: u32) {
-    for (ox, oy) in [(4u32, 4u32), (23u32, 4u32), (4u32, 23u32), (23u32, 23u32)] {
-        fill_round_clip(back, r, (sx + ox, sy + oy, 13, 13), 3, ACCENT);
-    }
-}
-
-/// 40x40 app icon at (x, y): glyph only, no box (rows draw their own bg).
-fn draw_app_icon(back: &mut Framebuffer, font: &mut FontSystem, app: App, x: u32, y: u32) {
-    match app {
-        App::Files => {
-            // Folder: tab + body + flap highlights (amber, tuned for dark).
-            back.fill_rect(x + 4, y + 6, 14, 4, FOLDER_BG);
-            back.fill_rect(x + 4, y + 10, 32, 22, FOLDER_BG);
-            back.fill_rect(x + 8, y + 18, 24, 3, FOLDER_HI);
-            back.fill_rect(x + 8, y + 24, 24, 3, FOLDER_HI);
+    let cxi = cx as i32;
+    let cyi = cy as i32;
+    for dy in 1..=r_out as i32 {
+        let rest = (r_out * r_out) as i32 - dy * dy;
+        if rest < 0 {
+            continue;
         }
-        App::Terminal => {
-            let s = 32.0f32;
-            let tw = font.char_advance('>', s) + font.char_advance('_', s);
-            draw_text_blended(back, font, x + (40 - tw) / 2, y + 6, ">_", s, ACCENT);
-        }
-        App::Demo => {
-            // Mini window: dark well + accent title strip.
-            back.fill_rect(x, y + 4, 40, 30, ICON_BG);
-            back.fill_rect(x, y + 4, 40, 8, ACCENT_FILL);
-            back.fill_rect(x + 5, y + 18, 30, 2, SUB_FG);
-            back.fill_rect(x + 5, y + 24, 20, 2, SUB_FG);
-        }
-        App::Settings => {
-            // Sliders glyph: rails + accent knobs.
-            for (i, knob) in [(0u32, 6u32), (1, 24), (2, 14)] {
-                let yy = y + 6 + i * 12;
-                back.fill_rect(x, yy + 3, 40, 2, SUB_FG);
-                back.fill_rect(x + knob, yy, 7, 8, ACCENT);
+        let hw_out = isqrt(rest as u32) as i32;
+        let hw_in = if dy as i32 >= r_in as i32 {
+            0
+        } else {
+            isqrt(((r_in * r_in) as i32 - dy * dy).max(0) as u32) as i32
+        };
+        for y in [cyi - dy, cyi + dy] {
+            if y < 0 {
+                continue;
+            }
+            for (a, b) in [(cxi - hw_out, cxi - hw_in), (cxi + hw_in, cxi + hw_out)] {
+                let a = a.max(0) as u32;
+                let b = b.max(0) as u32;
+                if b > a {
+                    back.fill_rect(a, y as u32, b - a, 1, c);
+                }
             }
         }
-        App::About => {
-            fill_circle(back, x + 20, y + 18, 16, ICON_BG);
-            draw_text_blended(back, font, x + 17, y + 8, "i", 24.0, ACCENT);
+    }
+}
+
+/// Rounded-corner filled rect, clipped to the damage rect `r`: scanline
+/// fill with quarter-circle insets (isqrt). Core primitive for every
+/// rounded surface in the theme (windows, pills, tiles, buttons).
+fn fill_round_clip(back: &mut Framebuffer, r: Rect, rect: Rect, rad: u32, c: Rgb) {
+    let (x0, y0, w, h) = rect;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let rad = rad.min(w / 2).min(h / 2) as i32;
+    for row in 0..h {
+        let rad_u = rad as u32;
+        let dy: i32 = if row < rad_u {
+            rad as i32 - row as i32 // rows 0..rad: grows to full shave at 0
+        } else if row >= h - rad_u {
+            (row as i32) - (h as i32 - rad as i32 - 1)
+        } else {
+            0 // middle of the rect: no inset
+        };
+        let sq = rad * rad - dy * dy;
+        let inset = if sq <= 0 { rad } else { rad - isqrt(sq as u32) as i32 };
+        let ry = y0 + row;
+        if ry < r.1 || ry >= r.1 + r.3 {
+            continue;
+        }
+        let x1 = x0 + inset as u32;
+        let x2 = x0 + w - inset as u32;
+        let rx0 = x1.max(r.0);
+        let rx1 = x2.min(r.0 + r.2);
+        if rx1 <= rx0 {
+            continue;
+        }
+        back.fill_rect(rx0, ry, rx1 - rx0, 1, c);
+    }
+}
+
+/// Rounded corners on the TOP rows only (window titlebar band above a
+/// straight body edge).
+fn fill_round_top_clip(back: &mut Framebuffer, r: Rect, rect: Rect, rad: u32, c: Rgb) {
+    let (x0, y0, w, h) = rect;
+    if w == 0 || h == 0 || h <= rad + 1 {
+        fill_clip(back, r, rect, c);
+        return;
+    }
+    let rad = rad.min(w / 2) as i32;
+    for row in 0..h {
+        let rad_u = rad as u32;
+        let dy: i32 = if row < rad_u {
+            rad as i32 - row as i32
+        } else {
+            0
+        };
+        let sq = rad * rad - dy * dy;
+        let inset = if sq <= 0 { rad } else { rad - isqrt(sq as u32) as i32 };
+        let ry = y0 + row;
+        if ry < r.1 || ry >= r.1 + r.3 {
+            continue;
+        }
+        let x1 = x0 + inset as u32;
+        let x2 = x0 + w - inset as u32;
+        let rx0 = x1.max(r.0);
+        let rx1 = x2.min(r.0 + r.2);
+        if rx1 <= rx0 {
+            continue;
+        }
+        back.fill_rect(rx0, ry, rx1 - rx0, 1, c);
+    }
+}
+
+/// Blend a rounded chip of `c` at Q8 alpha `a` over the ALREADY-composed
+/// back buffer (rows clipped to the damage rect). Unlike the acrylic
+/// helpers this does not punch through to the wallpaper cache — it layers
+/// one tint step on top of whatever the surface has painted, which is
+/// what hover states on buttons, tiles, and rows need.
+fn chip_round_clip(back: &mut Framebuffer, r: Rect, rect: Rect, rad: u32, c: Rgb, a: u32) {
+    let (x0, y0, w, h) = rect;
+    if w == 0 || h == 0 || a == 0 {
+        return;
+    }
+    let rad = rad.min(w / 2).min(h / 2) as i32;
+    for row in 0..h {
+        let rad_u = rad as u32;
+        let dy: i32 = if row < rad_u {
+            rad as i32 - row as i32
+        } else if row >= h - rad_u {
+            (row as i32) - (h as i32 - rad as i32 - 1)
+        } else {
+            0
+        };
+        let sq = rad * rad - dy * dy;
+        let inset = if sq <= 0 { rad } else { rad - isqrt(sq as u32) as i32 };
+        let ry = y0 + row;
+        if ry < r.1 || ry >= r.1 + r.3 {
+            continue;
+        }
+        let x1 = x0 + inset as u32;
+        let x2 = x0 + w - inset as u32;
+        let rx0 = x1.max(r.0);
+        let rx1 = x2.min(r.0 + r.2);
+        if rx1 <= rx0 {
+            continue;
+        }
+        for x in rx0..rx1 {
+            let px = unpack(blend_px(read_pixel(back, x, ry), c, a));
+            back.put_pixel(x, ry, px);
         }
     }
 }
 
 // ---- drawing (compose layers) --------------------------------------------
 
+/// Flat minimize/close glyph strokes.
+
+/// Close glyph: two 9px diagonals crossing at (cx, cy), 2px thick.
+fn draw_x_glyph(back: &mut Framebuffer, cx: u32, cy: u32, c: Rgb) {
+    for t in -4i32..=4i32 {
+        let x = (cx as i32 + t).max(0) as u32;
+        let y1 = (cy as i32 + t).max(0) as u32;
+        let y2 = (cy as i32 - t).max(0) as u32;
+        back.put_pixel(x, y1, c);
+        back.put_pixel(x, y2, c);
+        if t < 4 {
+            back.put_pixel(x, y1.saturating_sub(1), c);
+            back.put_pixel(x, y2 + 1, c);
+        }
+    }
+}
+
+/// Maximize glyph: 9x8 hollow square (1px stroke).
+fn draw_square_glyph(back: &mut Framebuffer, cx: u32, cy: u32, c: Rgb) {
+    back.fill_rect(cx - 4, cy - 4, 9, 1, c);
+    back.fill_rect(cx - 4, cy + 3, 9, 1, c);
+    back.fill_rect(cx - 4, cy - 3, 1, 6, c);
+    back.fill_rect(cx + 4, cy - 3, 1, 6, c);
+}
+
+/// Glyph-walking text with a right-edge clip: the next character that
+/// would cross `limit` terminates the run (titles, search query).
+fn draw_text_clip(
+    fb: &mut Framebuffer,
+    font: &mut FontSystem,
+    x: u32,
+    y: u32,
+    s: &str,
+    px: f32,
+    fg: Rgb,
+    limit: u32,
+) {
+    let mut cx = x;
+    for ch in s.chars() {
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        let adv = font.char_advance(ch, px);
+        if cx + adv > limit {
+            break;
+        }
+        cx += font.draw_char_blended(fb, cx, y, ch, px, fg);
+    }
+}
+
 /// Compose one window: 1px border + rounded silhouette (focused = lighter
-/// border + slightly lighter titlebar), close button (red on hover),
-/// content lines, and the open-animation scrim (wallpaper dissolves in
-/// from the bottom-left as the window rises into place). The soft shadow
-/// is drawn by compose() just before this (under the chrome).
+/// border + lighter titlebar; maximized windows square their corners),
+/// flat maximize/close buttons (close hovers red), left title text,
+/// content lines, and the open-animation scrim (wallpaper dissolves in as
+/// the window rises into place). The soft shadow is drawn by compose()
+/// just before this.
 #[allow(clippy::too_many_arguments)]
 fn draw_window(
     back: &mut Framebuffer,
@@ -2367,41 +2680,63 @@ fn draw_window(
     let rise: u32 = (((256 - p) * ANIM_RISE as u32) >> 8) as u32;
     let (x, y, w, h) = (win.x, win.y + rise, win.w, win.h);
     let focused = win.id == focus;
+    // Win11: maximized windows square their corners.
+    let rad = if win.maxim.is_some() { 0 } else { RAD_WIN };
     // Border: silhouette fill, then the inner silhouette is overlaid by
     // the titlebar + body fills — leaves a 1px border ring.
     let border = if focused { FRAME } else { FRAME_UNFOC };
-    fill_round_clip(back, r, (x, y, w, h), RAD_WIN, border);
-    let tbg = if focused { TITLE_BG } else { TITLE_BG2 };
-    fill_round_clip(back, r, (x + 1, y + 1, w - 2, h - 2), RAD_WIN - 1, tbg);
-    // Close button (every window, terminal included): neutral, red while
-    // hovered. The terminal is a system window but closable — the shell
-    // keeps running and it reopens from the launcher with buffered text.
-    let close = (x + w - 30, y + 6, 22, 18);
-    let hover = point_in(mx, my, close);
-    let cbg = if hover { CLOSE_HOVER } else { CLOSE_BG };
-    fill_round_clip(back, r, close, 5, cbg);
-    if r_inter(r, close) {
-        draw_text(back, font, close.0 + 6, close.1 + 2, "X", 14.0, TITLE_FG, cbg);
-    }
-    // Body band below the titlebar: BG fill with rounded bottom corners
-    // (top edge meets the titlebar cleanly).
-    fill_round_bottom_clip(
+    fill_round_clip(back, r, (x, y, w, h), rad, border);
+    // Body: full rounded fill under everything.
+    fill_round_clip(back, r, (x + 1, y + 1, w - 2, h - 2), rad.saturating_sub(1), BG);
+    // Titlebar band: rounded top corners only.
+    let tbg = if focused { TITLE } else { TITLE_UNFOC };
+    fill_round_top_clip(
         back,
         r,
-        (x + 1, y + 1 + TITLE_H, w - 2, h - 2 - TITLE_H),
-        RAD_WIN - 1,
-        BG,
+        (x + 1, y + 1, w - 2, TITLE_H),
+        rad.saturating_sub(1),
+        tbg,
     );
-    // Title text (titlebar was fully painted above).
-    if r_inter(r, (x + 2, y + 2, w - 4, TITLE_H)) {
-        draw_text(back, font, x + 12, y + 7, &win.title, FONT_PX, TITLE_FG, tbg);
+    // Hairline under the titlebar.
+    fill_clip(back, r, (x + 1, y + 1 + TITLE_H, w.saturating_sub(2), 1), HAIRLINE);
+    // Flat window buttons: maximize + close (rounded hover tiles).
+    if w >= 70 {
+        let crect = (x + w - 26, y + 4, 20, 22);
+        let mrect = (x + w - 46, y + 4, 20, 22);
+        if point_in(mx, my, crect) {
+            chip_round_clip(back, r, crect, 6, CLOSE_HOVER, 256);
+        }
+        if point_in(mx, my, mrect) {
+            chip_round_clip(back, r, mrect, 6, BTN_HOVER, 256);
+        }
+        draw_x_glyph(back, x + w - 16, y + 15, ICON_FG);
+        draw_square_glyph(back, x + w - 36, y + 15, ICON_FG);
     }
-    // Content text (content_rect keeps its geometry for hit-testing; the
-    // rise shifts only the drawing during the open animation).
+    // Title text, left-aligned, vertically centered (unfocused dims).
+    let lh = font.line_height(12.0);
+    draw_text_clip(
+        back,
+        font,
+        x + 14,
+        y + (TITLE_H - lh) / 2 + 1,
+        &win.title,
+        12.0,
+        if focused { TITLE_FG } else { SUB_FG },
+        x + w.saturating_sub(56),
+    );
+    // Content area: graphics mode blits the per-client canvas (M15),
+    // text mode renders console lines. content_rect keeps its geometry
+    // for hit-testing; the rise shifts only the drawing during the open
+    // animation.
     let cr = win.content_rect();
     let crd = (cr.0, cr.1 + rise, cr.2, cr.3);
     if r_inter(r, crd) {
-        draw_lines(back, font, win, crd, r, line_h);
+        match win.canvas.as_ref() {
+            Some((pix, cw, ch)) => {
+                blit_canvas(back, pix, *cw, *ch, crd, r);
+            }
+            None => draw_lines(back, font, win, crd, r, line_h),
+        }
     }
     // Open fade: the whole rect dissolves out of the wallpaper as p -> 1.
     if p < 256 {
@@ -2458,11 +2793,192 @@ fn draw_lines(
     }
 }
 
-/// Bottom strip (concept layout): floating acrylic pills — left weather
-/// garnish, centered dock (2x2 accent start mark + one icon per window
-/// with a round focus LED), right tray (wifi/speaker/battery strokes +
-/// RTC wall clock). Hover/active states paint denser rounded slot fills;
-/// clicks route through the same dock_slot_rect/tray_rect walk as here.
+/// M15: copy a client canvas over the content viewport (crd = content
+/// rect as drawn, rise shift included; r = damage). Opaque 1:1 pixel
+/// copy — the canvas is anchored at the viewport's top-left, clipped to
+/// the viewport (a shrunken window may be smaller; maximize just
+/// reveals body BG around it). Same per-row shape as the desktop
+/// wallpaper copy: M13 SSE2 span copy, integer-only.
+fn blit_canvas(back: &mut Framebuffer, pix: &[u32], cw: u32, ch: u32, crd: Rect, r: Rect) {
+    let stride = back.width as usize;
+    let base = back.base_mut() as *mut u32;
+    // Visible area: viewport ∩ canvas, then rows ∩ damage.
+    let vis_w = cw.min(crd.2);
+    let vis_h = ch.min(crd.3);
+    let y_lo = crd.1.max(r.1);
+    let y_hi = (crd.1 + vis_h).min(r.1 + r.3);
+    let x0 = crd.0.max(r.0);
+    let x1 = (crd.0 + vis_w).min(r.0 + r.2);
+    if x1 <= x0 || y_hi <= y_lo {
+        return;
+    }
+    if cw == 0 {
+        return;
+    }
+    let cx = (x0 - crd.0) as usize; // first visible canvas column
+    for sy in y_lo..y_hi {
+        let cy = (sy - crd.1) as usize;
+        // SAFETY: cy < vis_h <= ch, so cy*cw+cx stays inside pix; the
+        // screen row sy and column x0..x1 are inside the back buffer
+        // (the viewport lives inside the window, the window on screen).
+        let src = unsafe { pix.as_ptr().add(cy * cw as usize + cx) };
+        let dst = unsafe { base.add(sy as usize * stride + x0 as usize) };
+        simd::copy_span(dst, src, (x1 - x0) as usize);
+    }
+}
+
+/// Rounded running/focused indicator under a taskbar button: a 16x3
+/// rounded pill (brand lime when focused, soft gray when running).
+fn underline(back: &mut Framebuffer, r: Rect, cx: u32, y: u32, c: Rgb) {
+    fill_round_clip(back, r, (cx - 8, y, 16, 3), 1, c);
+}
+
+/// Brand "G" launcher mark — the taskbar start chip's glyph, in the
+/// brand lime. Font-rendered at a 22 px em (ink ≈16 px tall) and
+/// centered horizontally; +2 px vertical optical nudge because capital
+/// letters hang high in the line box. The size is chosen so the glyph's
+/// ink ends by y≈782 — keeping the exact-LIME underline probe boxes
+/// (y 786+) clean for the headless pixel tests (see qmp_desktop_test /
+/// qmp_tablet_test launch_px asserts).
+fn draw_start_g(
+    back: &mut Framebuffer,
+    font: &mut FontSystem,
+    cx: u32,
+    cy: u32,
+    c: Rgb,
+) {
+    let px = 22.0_f32;
+    let adv = font.char_advance('G', px);
+    let lh = font.line_height(px);
+    let x = cx.saturating_sub(adv / 2);
+    let top = cy.saturating_sub(lh / 2) + 2;
+    draw_text_blended(back, font, x, top, "G", px, c);
+}
+
+/// Magnifier glyph: 9px ring + 2px-thick diagonal handle. Paints only its
+/// own pixels — safe over the acrylic search field.
+fn draw_glass(back: &mut Framebuffer, cx: u32, cy: u32, c: Rgb) {
+    fill_ring(back, cx, cy, 4, 2, c);
+    for i in 0..3u32 {
+        back.put_pixel(cx + 4 + i, cy + 4 + i, c);
+        back.put_pixel(cx + 5 + i, cy + 4 + i, c);
+    }
+}
+
+/// Files folder glyph in an `s` box centered at (cx, cy): darker back
+/// panel, lighter front sheet.
+fn draw_folder(back: &mut Framebuffer, r: Rect, cx: u32, cy: u32, s: u32) {
+    let half = s / 2;
+    let rad = (s / 6).max(2);
+    fill_round_clip(back, r, (cx - half, cy - half + 1, s, s * 2 / 3), rad, BLUE);
+    fill_round_clip(
+        back,
+        r,
+        (
+            cx.saturating_sub(half + 1),
+            cy - half + s * 3 / 10,
+            s + 2,
+            s * 6 / 11,
+        ),
+        rad,
+        BLUE_HI,
+    );
+}
+
+/// Terminal glyph in an `s` box: rounded dark square + ">_" prompt.
+fn draw_term_icon(
+    back: &mut Framebuffer,
+    r: Rect,
+    font: &mut FontSystem,
+    cx: u32,
+    cy: u32,
+    s: u32,
+) {
+    let half = s / 2;
+    fill_round_clip(back, r, (cx - half, cy - half, s, s), 3, TERM_SQ);
+    let px = (s as f32) * 0.55;
+    let total = font.char_advance('>', px) + font.char_advance('_', px);
+    let lh = font.line_height(px);
+    draw_text_blended(
+        back,
+        font,
+        cx.saturating_sub(total / 2),
+        cy.saturating_sub(lh / 2),
+        ">_",
+        px,
+        WHITE,
+    );
+}
+
+/// Settings gear in an `s` box: ring + 4 teeth + hub.
+fn draw_gear(back: &mut Framebuffer, cx: u32, cy: u32, s: u32) {
+    let r_out = s * 5 / 12; // ~10 for s=24
+    let r_in = (s / 4).max(3); // ~6
+    fill_ring(back, cx, cy, r_out, r_in, GEAR);
+    let t = (s / 10).max(2); // tooth thickness
+    let tooth = 4;
+    back.fill_rect(
+        cx.saturating_sub(t / 2),
+        cy.saturating_sub(r_out + tooth),
+        t,
+        tooth + 2,
+        GEAR,
+    );
+    back.fill_rect(cx.saturating_sub(t / 2), cy + r_in, t, tooth + 1, GEAR);
+    back.fill_rect(
+        cx.saturating_sub(r_out + tooth),
+        cy.saturating_sub(t / 2),
+        tooth + 2,
+        t,
+        GEAR,
+    );
+    back.fill_rect(cx + r_in, cy.saturating_sub(t / 2), tooth + 1, t, GEAR);
+    fill_circle(back, cx, cy, r_in / 3 + 1, GEAR);
+}
+
+/// Demo-app ball glyph in an `s` box (the Demo pin): blue ball, red top
+/// arc, green/yellow bottom wedges, white hub.
+fn draw_ball(back: &mut Framebuffer, cx: u32, cy: u32, s: u32) {
+    let rad = s * 5 / 12; // ~10 for s=24
+    fill_circle(back, cx, cy, rad, BALL_BLU);
+    fill_arc_top(back, cx, cy, rad, rad / 2, BALL_RED);
+    fill_quarter_bottom(back, cx, cy, rad, rad / 2, true, BALL_GRN);
+    fill_quarter_bottom(back, cx, cy, rad, rad / 2, false, BALL_YEL);
+    fill_circle(back, cx, cy, rad * 3 / 10, BALL_WHITE);
+    fill_circle(back, cx, cy, rad * 3 / 20, BALL_BLU);
+}
+
+/// Tile icon dispatch (28px box in start tiles).
+fn draw_tile_icon(
+    back: &mut Framebuffer,
+    r: Rect,
+    font: &mut FontSystem,
+    app: App,
+    cx: u32,
+    cy: u32,
+    s: u32,
+) {
+    match app {
+        App::Settings => draw_gear(back, cx, cy, s),
+        App::Demo => draw_ball(back, cx, cy, s),
+        App::Files => draw_folder(back, r, cx, cy, s),
+        App::Terminal => draw_term_icon(back, r, font, cx, cy, s),
+    }
+}
+
+/// Power glyph: ring + vertical stroke poking out the top.
+fn draw_power_glyph(back: &mut Framebuffer, cx: u32, cy: u32, c: Rgb) {
+    fill_ring(back, cx, cy, 5, 3, c);
+    back.fill_rect(cx.saturating_sub(1), cy.saturating_sub(9), 2, 7, c);
+}
+
+/// The Windows 11 taskbar: full-width acrylic bar (square corners, flush
+/// to the bottom edge, hairline top), one CENTERED cluster of 40px
+/// rounded buttons — start, Files/Terminal/Settings pins, then one per
+/// running client — and the right clock zone (two-line wall clock only;
+/// the wifi/volume/battery glyphs were removed). Open apps wear a
+/// rounded underline under their button; hover lifts any button. Clicks route through the same bar_cell_rect
+/// walk as here.
 #[allow(clippy::too_many_arguments)]
 fn draw_taskbar(
     back: &mut Framebuffer,
@@ -2471,7 +2987,7 @@ fn draw_taskbar(
     windows: &[Window],
     next_id: u32,
     focus: u32,
-    menu_open: bool,
+    start_open: bool,
     secs: u64,
     r: Rect,
     sh: u32,
@@ -2479,238 +2995,166 @@ fn draw_taskbar(
     my: u32,
 ) {
     let sw = back.width;
+    let bar = (0, sh - TASKBAR_H, sw, TASKBAR_H);
+    // Acrylic bar: full-rect blend over the wallpaper (rad 0 = square).
+    acrylic_round_clip(back, wall, r, bar, 0, BAR_TINT, BAR_A);
+    // Top hairline.
+    fill_clip(back, r, (0, sh - TASKBAR_H, sw, 1), HAIRLINE);
 
-    // ---- left weather garnish (clickable -> Settings) ----
-    let wpx = weather_rect(sw, sh);
-    if r_inter(r, wpx) {
-        pill(back, wall, r, wpx, PANEL_A);
-        if point_in(mx, my, wpx) {
-            fill_round_clip(back, r, inner(wpx, 1), RAD_PANEL - 1, HOVER);
-        }
-        let cy = wpx.1 + wpx.3 / 2;
-        fill_circle(back, wpx.0 + 20, cy - 2, 5, Rgb(63, 122, 46));
-        fill_circle(back, wpx.0 + 20, cy - 2, 4, Rgb(230, 188, 82));
-        fill_circle(back, wpx.0 + 20, cy - 2, 3, Rgb(240, 208, 120));
-        draw_text_blended(back, font, wpx.0 + 34, wpx.1 + 8, "18", FONT_PX, MENU_FG);
-        let w18: u32 = "18".chars().map(|c| font.char_advance(c, FONT_PX)).sum();
-        // Degree glyph: tiny solid dot (the font has no '°').
-        fill_circle(back, wpx.0 + 34 + w18 + 3, wpx.1 + 13, 2, SUB_FG);
-        draw_text_blended(back, font, wpx.0 + 34, wpx.1 + 25, "Tokyo", 12.0, SUB_FG);
-    }
+    let nclient: usize = windows
+        .iter()
+        .filter(|w| w.id != TERM_ID && w.id != FILES_ID && w.id != SETTINGS_ID)
+        .count();
+    let files_open = windows.iter().any(|w| w.id == FILES_ID);
+    let term_open = windows.iter().any(|w| w.id == TERM_ID);
+    let set_open = windows.iter().any(|w| w.id == SETTINGS_ID);
 
-    // ---- centered dock pill (acrylic) ----
-    let dock = dock_rect(sw, sh, windows.len());
-    if r_inter(r, dock) {
-        pill(back, wall, r, dock, PANEL_A);
-    }
-    let n = slot_count(windows.len());
+    // ---- centered cluster ----
+    let n = bar_cell_count(nclient);
     for i in 0..n {
-        let (sx, sy, _, _) = dock_slot_rect(i, sw, sh, windows.len());
-        let s = (sx, sy, SLOT, SLOT);
-        if !r_inter(r, s) {
+        let c = bar_cell_rect(i, sw, sh, nclient);
+        if !r_inter(r, c) {
             continue;
         }
-        let hover = point_in(mx, my, s);
-        let active = i == 0 && menu_open;
-        let slot_bg = if active {
-            ACTIVE
-        } else if hover {
-            HOVER
-        } else {
-            MENU_BG
-        };
-        if slot_bg != MENU_BG {
-            fill_round_clip(back, r, s, SLOT / 4, slot_bg);
+        let cx = c.0 + CELL / 2;
+        let cy = c.1 + 18; // glyph center sits high; the underline lives below
+        let hover = point_in(mx, my, c);
+        if hover {
+            chip_round_clip(back, r, c, RAD_CELL, HOVER, 170);
         }
         match i {
-            0 => draw_start_mark(back, r, sx, sy),
-            _ => {
-                // nth window in id order (same mapping as click handling).
-                let target = (i - 1) as usize;
-                let mut k = 0;
-                let mut wid = None;
+            0 => {
+                // Start button: brand-lime G mark; pressed tile + lime
+                // underline while the start card is open.
+                if start_open {
+                    chip_round_clip(back, r, c, RAD_CELL, ACTIVE, 256);
+                }
+                draw_start_g(back, font, cx, cy, LIME);
+                if start_open {
+                    underline(back, r, cx, sh - 10, LIME);
+                }
+            }
+            1 => {
+                // Files pin: blue folder glyph.
+                draw_folder(back, r, cx, cy, 24);
+                if files_open {
+                    underline(
+                        back,
+                        r,
+                        cx,
+                        sh - 10,
+                        if focus == FILES_ID { LIME } else { UND_SOFT },
+                    );
+                }
+            }
+            2 => {
+                // Terminal pin: dark square with the prompt glyph.
+                draw_term_icon(back, r, font, cx, cy, 24);
+                if term_open {
+                    underline(
+                        back,
+                        r,
+                        cx,
+                        sh - 10,
+                        if focus == TERM_ID { LIME } else { UND_SOFT },
+                    );
+                }
+            }
+            3 => {
+                // Settings pin: gear glyph.
+                draw_gear(back, cx, cy, 24);
+                if set_open {
+                    underline(
+                        back,
+                        r,
+                        cx,
+                        sh - 10,
+                        if focus == SETTINGS_ID { LIME } else { UND_SOFT },
+                    );
+                }
+            }
+            k => {
+                // nth running client (id ASC, same walk as click()):
+                // mini rounded-window glyph with an azure title strip.
+                let target = (k - 4) as usize;
+                let mut seen = 0usize;
+                let mut focused_client = false;
                 for id in 0..next_id {
-                    if !windows.iter().any(|w| w.id == id) {
+                    if id == TERM_ID || id == FILES_ID || id == SETTINGS_ID {
                         continue;
                     }
-                    if k == target {
-                        wid = Some(id);
+                    if !windows.iter().any(|w| w.id == id) {
+                        continue; // destroyed window: no button, no gap
+                    }
+                    if seen == target {
+                        focused_client = focus == id;
                         break;
                     }
-                    k += 1;
+                    seen += 1;
                 }
-                if let Some(id) = wid {
-                    if id == TERM_ID {
-                        draw_text_blended(back, font, sx + 11, sy + 13, ">_", 14.0, ACCENT);
-                    } else if id == FILES_ID {
-                        // Mini amber folder in the dock.
-                        fill_clip(back, r, (sx + 10, sy + 11, 9, 4), FOLDER_BG);
-                        fill_round_clip(back, r, (sx + 8, sy + 14, 22, 14), 3, FOLDER_BG);
-                        fill_clip(back, r, (sx + 11, sy + 20, 15, 2), FOLDER_HI);
-                        fill_clip(back, r, (sx + 11, sy + 24, 15, 2), FOLDER_HI);
-                    } else {
-                        // Mini window: dark well + accent title strip.
-                        fill_round_clip(back, r, (sx + 9, sy + 10, 22, 19), 3, ICON_BG);
-                        fill_round_clip(back, r, (sx + 9, sy + 10, 22, 6), 3, ACCENT_FILL);
-                    }
-                    if id == focus {
-                        // Accent LED under the running app (W11 style).
-                        fill_round_clip(back, r, (sx + 10, sy + 34, 20, 3), 1, ACCENT);
-                    }
-                }
+                fill_round_clip(back, r, (cx - 9, cy - 8, 18, 15), 3, Rgb(62, 64, 72));
+                fill_clip(back, r, (cx - 9, cy - 8, 18, 5), BLUE_HI);
+                underline(
+                    back,
+                    r,
+                    cx,
+                    sh - 10,
+                    if focused_client { LIME } else { UND_SOFT },
+                );
             }
         }
     }
 
-    // ---- right tray pill (acrylic): glyphs + wall clock ----
+    // ---- right clock zone: two-line wall clock (icon glyphs removed;
+    //      the hover chip is the whole zone) ----
     let tr = tray_rect(sw, sh);
     if r_inter(r, tr) {
-        pill(back, wall, r, tr, PANEL_A);
         if point_in(mx, my, tr) {
-            fill_round_clip(back, r, inner(tr, 1), RAD_PANEL - 1, HOVER);
+            chip_round_clip(back, r, tr, RAD_CELL, HOVER, 170);
         }
+        // Two-line clock, right-aligned: "HH:MM AM" over "M/D/YYYY".
         let minute = crate::drivers::rtc::now_minute(secs);
-        let clock = alloc::format!("{:02}:{:02}", minute / 60, minute % 60);
-        let cw: u32 = clock
-            .chars()
-            .map(|c| font.char_advance(c, FONT_PX))
-            .sum();
-        let cxr = tr.0 + tr.2 - 14 - cw;
-        draw_text_blended(back, font, cxr, tr.1 + 13, &clock, FONT_PX, MENU_FG);
-        // wifi: dot + two rising arcs (stroke-style, no bg punching —
-        // every glyph paints pure pixels over the acrylic).
-        let (wx, wcy) = (tr.0 + 22, tr.1 + 32);
-        fill_circle(back, wx, wcy, 2, INK);
-        fill_arc_top(back, wx, wcy, 11, 8, INK);
-        fill_arc_top(back, wx, wcy, 6, 3, INK);
-        // speaker: body + right-fanning wedge.
-        let (vx, vy) = (tr.0 + 44, tr.1 + 16);
-        back.fill_rect(vx, vy + 4, 4, 6, INK);
-        for i in 0..4u32 {
-            back.fill_rect(vx + 4 + i, vy + 4 - i, 1, 7 + 2 * i, INK);
-        }
-        // battery: stroked shell + nub + charge bar.
-        let (bx, by) = (tr.0 + 64, tr.1 + 17);
-        back.fill_rect(bx, by, 20, 2, INK);
-        back.fill_rect(bx, by + 8, 20, 2, INK);
-        back.fill_rect(bx, by + 2, 2, 6, INK);
-        back.fill_rect(bx + 18, by + 2, 2, 6, INK);
-        back.fill_rect(bx + 20, by + 4, 2, 4, INK);
-        back.fill_rect(bx + 3, by + 3, 11, 5, INK);
+        let (hh, mm) = (minute / 60, minute % 60);
+        let (h12, ap) = (
+            if hh % 12 == 0 { 12 } else { hh % 12 },
+            if hh < 12 { "AM" } else { "PM" },
+        );
+        let (dy, dm, dd) = crate::drivers::rtc::now_date(secs);
+        let time_s = alloc::format!("{:02}:{:02} {}", h12, mm, ap);
+        let date_s = alloc::format!("{}/{}/{}", dm, dd, dy);
+        let tw: u32 = time_s.chars().map(|c| font.char_advance(c, 11.0)).sum();
+        draw_text_blended(
+            back,
+            font,
+            tr.0 + TRAY_W - 10 - tw,
+            tr.1 + 4,
+            &time_s,
+            11.0,
+            WHITE,
+        );
+        let dw: u32 = date_s.chars().map(|c| font.char_advance(c, 8.0)).sum();
+        draw_text_blended(
+            back,
+            font,
+            tr.0 + TRAY_W - 10 - dw,
+            tr.1 + 22,
+            &date_s,
+            8.0,
+            SUB_FG,
+        );
     }
 }
 
-/// Rounded-corner filled rect, clipped to the damage rect `r`: scanline
-/// fill with quarter-circle insets (isqrt). Core primitive for every
-/// rounded surface in the theme (windows, pills, tiles, buttons).
-fn fill_round_clip(back: &mut Framebuffer, r: Rect, rect: Rect, rad: u32, c: Rgb) {
-    let (x0, y0, w, h) = rect;
-    if w == 0 || h == 0 {
-        return;
-    }
-    let rad = rad.min(w / 2).min(h / 2) as i32;
-    for row in 0..h {
-        let rad_u = rad as u32;
-        let dy: i32 = if row < rad_u {
-            rad as i32 - row as i32 // rows 0..rad: grows to full shave at 0
-        } else if row >= h - rad_u {
-            (row as i32) - (h as i32 - rad as i32 - 1)
-        } else {
-            0 // middle of the rect: no inset
-        };
-        let sq = rad * rad - dy * dy;
-        let inset = if sq <= 0 { rad } else { rad - isqrt(sq as u32) as i32 };
-        let ry = y0 + row;
-        if ry < r.1 || ry >= r.1 + r.3 {
-            continue;
-        }
-        let x1 = x0 + inset as u32;
-        let x2 = x0 + w - inset as u32;
-        let rx0 = x1.max(r.0);
-        let rx1 = x2.min(r.0 + r.2);
-        if rx1 <= rx0 {
-            continue;
-        }
-        back.fill_rect(rx0, ry, rx1 - rx0, 1, c);
-    }
-}
-
-/// Rounded corners on the TOP rows only (title bars, strips that sit on a
-/// straight bottom edge).
-fn fill_round_top_clip(back: &mut Framebuffer, r: Rect, rect: Rect, rad: u32, c: Rgb) {
-    let (x0, y0, w, h) = rect;
-    if w == 0 || h == 0 {
-        return;
-    }
-    let rad = rad.min(w / 2).min(h / 2) as i32;
-    for row in 0..h {
-        let rad_u = rad as u32;
-        let dy: i32 = if row < rad_u {
-            rad as i32 - row as i32
-        } else {
-            0
-        };
-        let sq = rad * rad - dy * dy;
-        let inset = if sq <= 0 { rad } else { rad - isqrt(sq as u32) as i32 };
-        let ry = y0 + row;
-        if ry < r.1 || ry >= r.1 + r.3 {
-            continue;
-        }
-        let x1 = x0 + inset as u32;
-        let x2 = x0 + w - inset as u32;
-        let rx0 = x1.max(r.0);
-        let rx1 = x2.min(r.0 + r.2);
-        if rx1 <= rx0 {
-            continue;
-        }
-        back.fill_rect(rx0, ry, rx1 - rx0, 1, c);
-    }
-}
-
-/// Rounded corners on the BOTTOM rows only (window bodies under a
-/// straight title edge, sliders that sit inside panels).
-fn fill_round_bottom_clip(back: &mut Framebuffer, r: Rect, rect: Rect, rad: u32, c: Rgb) {
-    let (x0, y0, w, h) = rect;
-    if w == 0 || h == 0 || h <= rad + 1 {
-        fill_clip(back, r, rect, c);
-        return;
-    }
-    let rad = rad.min(w / 2).min(h / 2) as i32;
-    for row in 0..h {
-        let dy: i32 = if row >= h - rad as u32 {
-            (row as i32) - (h as i32 - rad - 1)
-        } else {
-            0
-        };
-        let sq = rad * rad - dy * dy;
-        let inset = if sq <= 0 { rad } else { rad - isqrt(sq as u32) as i32 };
-        let ry = y0 + row;
-        if ry < r.1 || ry >= r.1 + r.3 {
-            continue;
-        }
-        let x1 = x0 + inset as u32;
-        let x2 = x0 + w - inset as u32;
-        let rx0 = x1.max(r.0);
-        let rx1 = x2.min(r.0 + r.2);
-        if rx1 <= rx0 {
-            continue;
-        }
-        back.fill_rect(rx0, ry, rx1 - rx0, 1, c);
-    }
-}
-
-/// Start card (concept layout): centered floating acrylic panel —
-/// greeting header (accent disc + time-of-day + name), "Pinned" label,
-/// one grid of app tiles (filtered by search), search pill at the very
-/// bottom. Fades in (acrylic alpha ramp) when opened. No Recent section:
-/// recents were cut in the redesign.
+/// Windows 11 start menu: a centered acrylic card floating above the bar
+/// — search field on top (typing live-filters the pinned grid), a 4-wide
+/// pinned-tile grid, and a footer with a user chip (lime avatar) and a
+/// power button. Fades in (alpha ramp) + rises with the open animation.
 #[allow(clippy::too_many_arguments)]
-fn draw_menu(
+fn draw_start(
     back: &mut Framebuffer,
     font: &mut FontSystem,
     wall: &[u32],
     r: Rect,
-    sw: u32,
     sh: u32,
     now: u64,
     menu_tick: u64,
@@ -2718,351 +3162,105 @@ fn draw_menu(
     mx: u32,
     my: u32,
 ) {
-    let (mx0, my0, mw, mh) = menu_rect(sw, sh);
+    let sw = back.width;
+    let (px0, py0, pw, ph) = menu_rect(sw, sh);
     let p = anim_p(now, menu_tick);
+    let rise = (((256 - p) * ANIM_RISE as u32) >> 8) as u32;
+    let py = py0 + rise;
     // Acrylic card: soft shadow + hairline border + wallpaper-blended
     // interior whose opacity ramps with the open animation.
-    window_shadow(back, wall, r, (mx0, my0, mw, mh), p);
-    fill_round_clip(back, r, (mx0, my0, mw, mh), RAD_PANEL, CARD_BORDER);
+    window_shadow(back, wall, r, (px0, py, pw, ph), p);
+    fill_round_clip(back, r, (px0, py, pw, ph), RAD_PANEL, PANEL_BORDER);
     acrylic_round_clip(
         back,
         wall,
         r,
-        (mx0 + 1, my0 + 1, mw - 2, mh - 2),
+        (px0 + 1, py + 1, pw - 2, ph - 2),
         RAD_PANEL - 1,
-        CARD,
-        CARD_A * p / 256,
+        PANEL_TINT,
+        PANEL_A * p / 256,
     );
-    // Header: accent disc with the mark + time-of-day greeting.
-    if r_inter(r, (mx0, my0 + 16, mw, 44)) {
-        fill_circle(back, mx0 + 40, my0 + 38, 14, ACCENT);
-        // Near-white G; reads clean over the accent disc and stays under
-        // the all-channel-239 cursor predicate (red channel 232 < 239).
-        draw_text_blended(back, font, mx0 + 34, my0 + 28, "G", 20.0, Rgb(232, 238, 246));
-        draw_text_blended(
+    // Search field on top.
+    let sb = (px0 + 16, py + 16, pw - 32, 36);
+    if r_inter(r, sb) {
+        fill_round_clip(back, r, sb, 18, SEARCH_BG);
+        draw_glass(back, sb.0 + 18, sb.1 + 18, FOOT_FG);
+        let utf8 = core::str::from_utf8(search)
+            .map(|q| q.chars().all(|c| c >= ' ' && c != '\u{7f}'))
+            .unwrap_or(false);
+        let (label, colored) = if search.is_empty() || !utf8 {
+            // Fuzz-injected control bytes have no glyphs — fall
+            // back to the placeholder instead of tofu boxes.
+            ("Search", false)
+        } else {
+            (core::str::from_utf8(search).unwrap_or_default(), true)
+        };
+        draw_text_clip(
             back,
             font,
-            mx0 + 64,
-            my0 + 30,
-            greeting_text(crate::drivers::rtc::now_minute(now / 100)),
-            FONT_PX,
-            MENU_FG,
+            sb.0 + 32,
+            sb.1 + 12,
+            label,
+            10.0,
+            if colored { LABEL_FG } else { SUB_FG },
+            sb.0 + sb.2 - 12,
         );
     }
-    // "Pinned" label + launcher hint.
-    if r_inter(r, (mx0, my0 + 68, mw, 24)) {
-        draw_text_blended(back, font, mx0 + 24, my0 + 70, "Pinned", 13.0, MENU_FG);
-        draw_text_blended(back, font, mx0 + 92, my0 + 71, ">", FONT_PX, SUB_FG);
+    // "Pinned" caption.
+    if r_inter(r, (px0, py + 56, pw, 20)) {
+        draw_text_blended(back, font, px0 + 18, py + 62, "Pinned", 10.0, SUB_FG);
     }
-    // Pinned tiles (filtered by the search query, contiguous indices).
-    // Same order as the click handler's tile_rect walk.
     let ta = (p * 2).min(256); // tiles fade in slightly ahead of the card
-    let mut tile = 0u32;
-    for (name, app) in APPS {
+    // Tiles (filtered; identical walk to the click handler).
+    let mut gi = 0u32;
+    for (name, app) in APPS.iter() {
         if !name_matches(name, search) {
             continue;
         }
-        let t = tile_rect(tile, sw, sh);
-        tile += 1;
+        let t0 = tile_rect(gi, sw, sh);
+        gi += 1;
+        let t = (t0.0, t0.1 + rise, t0.2, t0.3);
         if !r_inter(r, t) {
             continue;
         }
-        let hover = point_in(mx, my, t);
-        let tbg = if hover { HOVER } else { MENU_BG2 };
-        acrylic_round_clip(back, wall, r, t, RAD_TILE, tbg, ta);
+        if ta == 256 && point_in(mx, my, t) {
+            chip_round_clip(back, r, t, RAD_TILE, HOVER, 256);
+        } else if ta < 256 {
+            // Blend-in mirroring the card's alpha ramp (over the card,
+            // not through to the wallpaper).
+            chip_round_clip(back, r, t, RAD_TILE, PANEL_TINT, ta / 8);
+        }
         if ta >= 256 {
-            draw_app_icon(back, font, app, t.0 + (t.2 - 40) / 2, t.1 + 12);
-            let nw: u32 = name.chars().map(|c| font.char_advance(c, 13.0)).sum();
-            draw_text_blended(
-                back,
-                font,
-                t.0 + (t.2 - nw) / 2,
-                t.1 + 62,
-                name,
-                13.0,
-                MENU_FG,
-            );
+            let (tcx, tcy) = (t.0 + TILE_W / 2, t.1 + 40);
+            draw_tile_icon(back, r, font, *app, tcx, tcy, 28);
+            let wpx: u32 = name.chars().map(|c| font.char_advance(c, 10.0)).sum();
+            draw_text_blended(back, font, tcx - wpx / 2, t.1 + 66, name, 10.0, LABEL_FG);
         }
     }
-    // Search pill at the very bottom (full-width rounded, W11 style).
-    let sb = search_rect(sw, sh);
-    if r_inter(r, sb) {
-        acrylic_round_clip(back, wall, r, sb, sb.3 / 2, MENU_BG2, ta);
-        draw_magnifier(back, sb.0 + 18, sb.1 + 20, Rgb(160, 170, 190), MENU_BG2);
-        if search.is_empty() {
-            draw_text_blended(
-                back,
-                font,
-                sb.0 + 36,
-                sb.1 + 12,
-                "Type here to search",
-                FONT_PX,
-                SUB_FG,
-            );
-        } else if let Ok(q) = core::str::from_utf8(search) {
-            // Fuzz-injected control bytes (e.g. the kernel fuzzer's keys
-            // while the menu is open) have no glyphs — fall back to the
-            // placeholder instead of a row of tofu boxes.
-            if q.chars().all(|c| c >= ' ' && c != '\u{7f}') {
-                draw_text_blended(back, font, sb.0 + 36, sb.1 + 12, q, FONT_PX, MENU_FG);
-            } else {
-                draw_text_blended(
-                    back,
-                    font,
-                    sb.0 + 36,
-                    sb.1 + 12,
-                    "Type here to search",
-                    FONT_PX,
-                    SUB_FG,
-                );
-            }
-        }
-    }
-}
-
-/// "Good Morning/Afternoon/Evening/Night, User!" from the wall-clock
-/// minute of day (RTC boot time + uptime). Name comes from the concept
-/// (the user's account); GreenLime ships as a single-user desktop.
-fn greeting_text(minute_of_day: u32) -> &'static str {
-    match minute_of_day / 60 {
-        5..=11 => "Good Morning, User!",
-        12..=16 => "Good Afternoon, User!",
-        17..=21 => "Good Evening, User!",
-        _ => "Good Night, User!",
-    }
-}
-
-/// Quick settings flyout (right-anchored acrylic panel): header, 2x2
-/// accent/DW toggle tiles with drawn glyphs, two sliders with knobs and
-/// live level readouts, and an "All settings" footer that swaps the
-/// flyout for the Settings dialog. Every control's hit rect lives beside
-/// its draw helper (quick_*_rect) so clicks and pixels never drift.
-#[allow(clippy::too_many_arguments)]
-fn draw_quick(
-    back: &mut Framebuffer,
-    font: &mut FontSystem,
-    wall: &[u32],
-    r: Rect,
-    sw: u32,
-    sh: u32,
-    born: u64,
-    data: ([bool; 4], u32, u32),
-) {
-    let now = idt::ticks();
-    let p = anim_p(now, born);
-    let (px, py, _, _) = popup_rect(Popup::Quick, sw, sh);
-    window_shadow(back, wall, r, (px, py, QS_W, QS_H), p);
-    fill_round_clip(back, r, (px, py, QS_W, QS_H), RAD_PANEL, CARD_BORDER);
-    acrylic_round_clip(
-        back,
-        wall,
-        r,
-        (px + 1, py + 1, QS_W - 2, QS_H - 2),
-        RAD_PANEL - 1,
-        CARD,
-        CARD_A * p / 256,
-    );
-    let (states, volume, bright) = data;
-    // Header.
-    draw_text_blended(back, font, px + 20, py + 12, "Quick settings", FONT_PX, MENU_FG);
-    // 2x2 toggle tiles (accent when on, dark ink over accent).
-    let labels = ["Wi-Fi", "Bluetooth", "Night", "Saver"];
-    for i in 0..4u32 {
-        let t = quick_tile_rect(i, sw, sh);
-        if !r_inter(r, t) {
-            continue;
-        }
-        let on = states[i as usize];
-        let tbg = if on { ACCENT } else { MENU_BG2 };
-        fill_round_clip(back, r, t, RAD_TILE, tbg);
-        let ink = if on { Rgb(26, 30, 36) } else { SUB_FG };
-        match i {
-            0 => {
-                let cx = t.0 + 18;
-                let cy = t.1 + 40;
-                fill_circle(back, cx, cy, 2, ink);
-                fill_arc_top(back, cx, cy, 11, 8, ink);
-                fill_arc_top(back, cx, cy, 6, 3, ink);
-            }
-            1 => {
-                let cx = (t.0 + 18) as i32;
-                let cy = (t.1 + 28) as i32;
-                fill_tri_up(back, cx, cy - 9, 9, 4, ink);
-                fill_tri_down(back, cx, cy, 9, 4, ink);
-            }
-            2 => {
-                let cx = t.0 + 20;
-                let cy = t.1 + 28;
-                fill_circle(back, cx, cy, 10, ink);
-                fill_circle(back, cx + 5, cy - 4, 9, tbg);
-            }
-            _ => {
-                let (bx, by) = (t.0 + 10, t.1 + 23);
-                back.fill_rect(bx, by, 18, 2, ink);
-                back.fill_rect(bx, by + 8, 18, 2, ink);
-                back.fill_rect(bx, by + 2, 2, 6, ink);
-                back.fill_rect(bx + 16, by + 2, 2, 6, ink);
-                back.fill_rect(bx + 18, by + 4, 2, 4, ink);
-                back.fill_rect(bx + 3, by + 3, 9, 4, ink);
-            }
-        }
+    // Footer: separator, user chip (lime avatar + name), power button.
+    fill_clip(back, r, (px0 + 16, py + MENU_H - 68, pw - 32, 1), HAIRLINE);
+    if ta >= 160 && r_inter(r, (px0, py + MENU_H - 68, pw, 68)) {
+        let fcy = py + MENU_H - 34;
+        // User chip.
+        fill_circle(back, px0 + 40, fcy, 12, LIME);
+        let gadv = font.char_advance('G', 10.0);
         draw_text_blended(
             back,
             font,
-            t.0 + 34,
-            t.1 + 21,
-            labels[i as usize],
-            11.0,
-            if on { ink } else { MENU_FG },
+            px0 + 40 - gadv / 2,
+            fcy.saturating_sub(6),
+            "G",
+            10.0,
+            AVATAR_INK,
         );
-    }
-    // Sliders: label + rounded track + accent fill + knob + readout.
-    let sil = ["Volume", "Brightness"];
-    let levels = [volume, bright];
-    for i in 0..2u32 {
-        let s = quick_slider_rect(i, sw, sh);
-        if !r_inter(r, s) {
-            continue;
+        draw_text_blended(back, font, px0 + 62, fcy.saturating_sub(6), "GreenLime", 11.0, LABEL_FG);
+        // Power button (hover tile + glyph).
+        let pb0 = power_rect(sw, sh);
+        let pb = (pb0.0, pb0.1 + rise, pb0.2, pb0.3);
+        if point_in(mx, my, pb) {
+            chip_round_clip(back, r, pb, RAD_TILE, HOVER, 256);
         }
-        draw_text_blended(back, font, s.0, s.1 - 4, sil[i as usize], 11.0, SUB_FG);
-        let track = (s.0, s.1 + 12, 176, 14);
-        fill_round_clip(back, r, track, track.3 / 2, MENU_BG2);
-        let v = levels[i as usize].min(100);
-        if v > 0 {
-            let fw = (track.2 * v / 100).max(9);
-            fill_round_clip(back, r, (track.0, track.1, fw, track.3), track.3 / 2, ACCENT);
-        }
-        let kx = track.0 + (track.2 * v / 100).clamp(7, track.2.saturating_sub(17));
-        let ky = track.1 + track.3 / 2;
-        fill_circle(back, kx, ky, 8, ACCENT);
-        fill_circle(back, kx, ky, 4, Rgb(236, 240, 246));
-        draw_text_blended(
-            back,
-            font,
-            s.0 + 184,
-            s.1 + 12,
-            &alloc::format!("{}", v),
-            FONT_PX,
-            MENU_FG,
-        );
-    }
-    // Footer: gear + "All settings" (swaps to the Settings dialog).
-    let f = quick_footer_rect(sw, sh);
-    if r_inter(r, f) {
-        fill_circle(back, f.0 + 11, f.1 + 11, 7, SUB_FG);
-        fill_circle(back, f.0 + 11, f.1 + 11, 3, CARD);
-        draw_text_blended(back, font, f.0 + 26, f.1 + 4, "All settings", 12.0, MENU_FG);
-    }
-}
-
-/// Centered dialogs (About / Settings), plus the right-anchored quick
-/// settings flyout. Acrylic bodies with hairline borders; About/Settings
-/// keep the solid title strip the screen tests exact-count. The quick
-/// flyout is interactive (toggles + sliders); dialogs dismiss on click.
-#[allow(clippy::too_many_arguments)]
-fn draw_popup(
-    back: &mut Framebuffer,
-    font: &mut FontSystem,
-    wall: &[u32],
-    r: Rect,
-    sw: u32,
-    sh: u32,
-    kind: Popup,
-    born: u64,
-    nwin: usize,
-    toggles: [bool; 4],
-    volume: u32,
-    bright: u32,
-) {
-    let now = idt::ticks();
-    let p = anim_p(now, born);
-    let (px, py, pw, ph) = popup_rect(kind, sw, sh);
-    if kind == Popup::Quick {
-        draw_quick(back, font, wall, r, sw, sh, born, (toggles, volume, bright));
-        return;
-    }
-    // Acrylic dialog body.
-    window_shadow(back, wall, r, (px, py, pw, ph), p);
-    fill_round_clip(back, r, (px, py, pw, ph), RAD_PANEL, CARD_BORDER);
-    acrylic_round_clip(
-        back,
-        wall,
-        r,
-        (px + 1, py + 1, pw - 2, ph - 2),
-        RAD_PANEL - 1,
-        CARD,
-        CARD_A * p / 256,
-    );
-    // Title strip: solid (the desktop test exact-counts this color).
-    if r_inter(r, (px + 1, py + 1, pw - 2, TITLE_H)) {
-        fill_round_top_clip(back, r, (px + 1, py + 1, pw - 2, TITLE_H), RAD_PANEL - 1, TITLE_BG);
-        let title = match kind {
-            Popup::About => "About GreenLime OS",
-            Popup::Settings => "Settings",
-            Popup::Quick => unreachable!(),
-        };
-        draw_text(back, font, px + 12, py + 7, title, FONT_PX, TITLE_FG, TITLE_BG);
-        // X mark hints dismissal.
-        let xb = (px + pw - 32, py + 7, 22, 16);
-        fill_round_clip(back, r, xb, 5, CLOSE_BG);
-        draw_text(back, font, xb.0 + 6, xb.1 + 1, "X", 13.0, TITLE_FG, CLOSE_BG);
-    }
-    // Body text — blended over the acrylic card.
-    let body = (px + 2, py + 2 + TITLE_H, pw - 4, ph - 4 - TITLE_H);
-    if r_inter(r, body) {
-        match kind {
-            Popup::About => {
-                let lines = [
-                    "GreenLime OS v1.1",
-                    "modern hybrid kernel, Rust from scratch",
-                    "click anywhere to dismiss",
-                ];
-                for (i, line) in lines.iter().enumerate() {
-                    let fg = match i {
-                        0 => MENU_FG,
-                        1 => FG,
-                        _ => SUB_FG,
-                    };
-                    draw_text_blended(
-                        back,
-                        font,
-                        px + 20,
-                        py + 14 + TITLE_H + i as u32 * 28,
-                        line,
-                        FONT_PX,
-                        fg,
-                    );
-                }
-            }
-            Popup::Settings => {
-                let secs = now / 100;
-                let lines = [
-                    alloc::format!("Display      {} x {}", sw, sh),
-                    alloc::format!(
-                        "Uptime       {:02}:{:02}:{:02}",
-                        secs / 3600,
-                        (secs % 3600) / 60,
-                        secs % 60
-                    ),
-                    alloc::format!("Windows      {} open", nwin),
-                    alloc::format!("Taskbar      dock pill, {}px strip", TASKBAR_H),
-                    String::from("GreenLime OS v1.1"),
-                ];
-                for (i, line) in lines.iter().enumerate() {
-                    let fg = if i < 3 { FG } else { SUB_FG };
-                    draw_text_blended(
-                        back,
-                        font,
-                        px + 20,
-                        py + 14 + TITLE_H + i as u32 * 26,
-                        line,
-                        FONT_PX,
-                        fg,
-                    );
-                }
-            }
-            Popup::Quick => {}
-        }
+        draw_power_glyph(back, pb.0 + 22, fcy, FOOT_FG);
     }
 }
 
@@ -3162,27 +3360,7 @@ fn read_pixel(fb: &mut Framebuffer, x: u32, y: u32) -> u32 {
     }
 }
 
-fn draw_text(
-    fb: &mut Framebuffer,
-    font: &mut FontSystem,
-    mut x: u32,
-    y: u32,
-    s: &str,
-    px: f32,
-    fg: Rgb,
-    bg: Rgb,
-) {
-    // draw_char needs line_h for the opaque cell; our cells are line boxes.
-    let lh = font.line_height(px);
-    for ch in s.chars() {
-        if ch == '\n' || ch == '\r' {
-            continue;
-        }
-        x += font.draw_char(fb, x, y, ch, px, lh, fg, bg);
-    }
-}
-
-/// Opaque-cell-free text (watermark/icons over the wallpaper, hover bgs).
+/// Opaque-cell-free text (tiles, icons over acrylic, hover backgrounds).
 fn draw_text_blended(
     fb: &mut Framebuffer,
     font: &mut FontSystem,
@@ -3204,6 +3382,73 @@ pub fn init() {
     kprintln!("[servers] winsrv: desktop compositor (takes over fb)");
 }
 
+/// M13 one-shot probes from winsrv's task context.
+/// 1. XMM roundtrip: sentinels in XMM0–15, then yield — other tasks run and
+///    would trash the registers if the switch did not FXSAVE/FXRSTOR.
+/// 2. SSE2 blend: bit-exact check vs the scalar `blend_px` reference, plus
+///    cycle timings (RDTSC) for scalar vs vector over the same work.
+fn m13_probes() {
+    extern "C" fn yield_cb() {
+        sched::yield_now();
+    }
+    let bad = simd::fx_roundtrip_probe(yield_cb);
+    if bad == 0 {
+        kprintln!("[m13] xmm: 256/256 sentinel bytes survived a task switch");
+    } else {
+        kprintln!("[m13] xmm: FAIL — {}/256 sentinel bytes changed", bad);
+    }
+
+    const N: usize = 1280 * 16; // full-width strip, desktop-shaped span
+    const A: u32 = 214; // the tray acrylic alpha (Q8)
+    const ITERS: u32 = 20;
+    let tint = Rgb(0x2B, 0x34, 0x46);
+    let tint_px = (tint.0 as u32) << 16 | (tint.1 as u32) << 8 | tint.2 as u32;
+    let mut src: Vec<u32> = Vec::with_capacity(N);
+    let mut refb = alloc::vec![0u32; N];
+    let mut out = alloc::vec![0u32; N];
+    for i in 0..N {
+        // Non-uniform pattern: catches lane-shuffle mistakes a flat fill hides.
+        src.push((i as u32).wrapping_mul(2654435761) & 0x00FF_FFFF);
+    }
+    for i in 0..N {
+        refb[i] = blend_px(src[i], tint, A);
+    }
+    simd::blend_const_span(src.as_ptr(), out.as_mut_ptr(), N, tint_px, A);
+    let mism = refb
+        .iter()
+        .zip(out.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    if mism == 0 {
+        kprintln!("[m13] simd: SSE2 blend bit-exact on {} px", N);
+    } else {
+        kprintln!("[m13] simd: FAIL — {} px differ from scalar", mism);
+    }
+    // Throughput: identical spans, identical iteration count.
+    let t0 = simd::rdtsc();
+    for _ in 0..ITERS {
+        for i in 0..N {
+            refb[i] = blend_px(src[i], tint, A);
+        }
+    }
+    let t_scalar = simd::rdtsc() - t0;
+    let t0 = simd::rdtsc();
+    for _ in 0..ITERS {
+        simd::blend_const_span(src.as_ptr(), out.as_mut_ptr(), N, tint_px, A);
+    }
+    let t_simd = simd::rdtsc() - t0;
+    // Fixed-point speedup x10 (kernel has no float codegen, keep it integer).
+    let x10 = if t_simd > 0 { t_scalar * 10 / t_simd } else { 0 };
+    kprintln!(
+        "[m13] simd: {} px/it — scalar {} Mcyc vs sse2 {} Mcyc -> {}.{}x",
+        N,
+        t_scalar / 1_000_000,
+        t_simd / 1_000_000,
+        x10 / 10,
+        x10 % 10
+    );
+}
+
 /// Kernel task entry: own the screen, serve WIN_* forever.
 pub unsafe extern "C" fn server_main() -> ! {
     {
@@ -3218,7 +3463,7 @@ pub unsafe extern "C" fn server_main() -> ! {
                     // Readers and creators must never wedge: answer err.
                     if matches!(
                         m.kind,
-                        WIN_READ | WIN_CREATE | WIN_CLIENT_READ | WIN_DESTROY
+                        WIN_READ | WIN_CREATE | WIN_CLIENT_READ | WIN_DESTROY | WIN_BLIT_SETUP
                     ) {
                         let r = Message::new(REPLY_ERR);
                         ipc::send(
@@ -3241,6 +3486,9 @@ pub unsafe extern "C" fn server_main() -> ! {
         // (boot-splash assertions must land before it).
         kprintln!("[winsrv] desktop painted");
     }
+    // M13 proofs (one-shot, from real task context): XMM survives a task
+    // switch, and the SSE2 blend path is bit-exact vs the scalar reference.
+    m13_probes();
     loop {
         // Fast idle path: no messages, no input, no damage, clock fresh ->
         // touch nothing (zero framebuffer traffic, zero allocator churn).
@@ -3254,23 +3502,23 @@ pub unsafe extern "C" fn server_main() -> ! {
             sched::yield_now();
             continue;
         }
+        // Lap: message/input damage is composed and blitted, and the
+        // on-screen cursor stays STEADY unless its own pixels are touched
+        // today — see steady_cursor (the old blanket undraw at lap start
+        // left the cursor invisible for every full drain+present lap,
+        // which flickers visibly under a message flood like the M15
+        // canvas stream).
         if let Some(srv) = SRV.lock().as_mut() {
-            // Cursor off first: at lap boundaries the screen must show the
-            // composed state (the cursor itself is not in the back buffer).
-            srv.undraw_cursor();
-        }
-        while let Some(m) = ipc::try_recv(PORT_WINSRV) {
-            // Hold the guard across handle (single task, no nesting).
-            if let Some(srv) = SRV.lock().as_mut() {
+            while let Some(m) = ipc::try_recv(PORT_WINSRV) {
+                // Hold the guard across handle (single task, no nesting).
                 srv.handle(m);
             }
-        }
-        if let Some(srv) = SRV.lock().as_mut() {
             srv.poll_input();
             srv.tick_taskbar();
             srv.tick_anim(); // keeps fades running lap to lap
+            srv.steady_cursor(); // undraw only if present() would stomp it
             srv.present(); // compose damage into back buffer + blit
-            srv.draw_cursor(); // cursor back on top (fresh save-under)
+            srv.draw_cursor(); // cursor on top (fresh save-under)
         }
         // Cooperative yield every lap: keeps latency low, never wedges.
         sched::yield_now();

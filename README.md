@@ -4,12 +4,12 @@ A from-scratch operating system in Rust — custom x86-64 hybrid kernel,
 composited GUI desktop (LimeDE), IPC, ring-3 userland, SMP, and a ring-3
 network stack. Long-term goal: compete with Windows 11.
 
-![GreenLime OS v1.1 desktop in QEMU (1280×800): charcoal glass, the Demo
+![GreenLime OS v1.2.0 desktop in QEMU (1280×800): charcoal glass, the Demo
 client window, and the Windows 11-style taskbar — lime start button,
 Files/Terminal/Settings pins, one button per running client, RTC clock
 tray](OS_screenshot.png)
 
-> Status: **v1.1 ✓** — the 1.0 line (made by GLM 5.3) brought
+> Status: **v1.2.0 ✓** — the 1.0 line (made by GLM 5.3) brought
 > SMP, ring-3 networking (DHCP/ICMP/DNS/TCP) and the Fluent-dark desktop:
 > wallpaper streamed by a userspace service, Files app, rounded acrylic
 > windows with soft shadows and animations.
@@ -36,7 +36,20 @@ tray](OS_screenshot.png)
 > duplicates), demo exited → respawn from the baked-in ELF via a
 > task-slot reap (the demo gets its boot task id right back) — and
 > drops every userland build warning to zero via an SSE-baked JSON
-> target spec (`targets/x86_64-greenlime-sse.json`).
+> target spec (`targets/x86_64-greenlime-sse.json`). **v1.2 opens with
+> M16**: the Files app is reworked into a real Windows-Explorer-style
+> explorer — a sidebar of disk-backed places (Desktop / Documents /
+> Downloads / Recycle Bin), a breadcrumb + Back chip, an icon grid,
+> footer action chips (Delete / Restore / Empty), **real FAT32 long
+> file names** (name truth on the disk byte-exactly, `(ssss)~N` 8.3
+> aliases underneath), and a **persistent Recycle Bin** — trashed
+> files keep an `.orig` sidecar recording their origin and survive
+> full reboots. **M18** adds right-click context menus and Notepad, and
+> **M20** closes the loop on networking: `fetch https://…` is REAL
+> modern HTTPS — TLS 1.3 (rustls 0.23 + RustCrypto provider, vendored)
+> with webpki root-store chain validation, kernel-timed certificate
+> checks (`Rand`/`Now` syscalls, ABI v7), and scheme-gated redirects
+> (http → https chases; the way down is refused).
 
 > 🤖 **Made by GLM 5.3:** every line of this OS — kernel, servers,
 > userland, docs — was written by **GLM 5.3** (the AI model) through
@@ -134,17 +147,58 @@ the serial mirror is the kernel's ground truth for what happened.
   tiles **Files / Terminal / Settings / Demo**. Typing filters the
   tiles live; **Demo** focuses the demo window while it is alive and
   relaunches it from the baked-in ELF once the demo task exited
-  (M15.1). Clicks outside the card dismiss it.
+  (M15.1). Clicks outside the card dismiss it. The footer's red
+  **power button** now powers the whole machine off for real — ACPI S5
+  (QEMU's PM1a at I/O 0x604), so the VM closes cleanly
+  (`[winsrv] shutdown`).
 - **Tray:** right zone with the real RTC two-line clock (`HH:MM` over
   `YYYY-MM-DD`, day rollover handled) — clock only by design; hover
   shows a highlight, nothing opens.
 - **Terminal:** launch from its start-card tile — it never opens at
   boot. Builtins: `help echo cat ps kill ls exit`, plus ring-3
-  network tools `ping` and `fetch` through the IPC net broker. Its ✕
+  network tools `ping` and `fetch` through the IPC net broker —
+  `fetch https://…` is REAL modern HTTPS (M20): TLS 1.3 with webpki
+  root-store chain validation (`fetch http://…`/bare hosts stay plain
+  HTTP; redirects chase http→https but never the way down). Its ✕
   closes it; reopening restores buffered text.
-- **Files:** launch from its start-card tile — the explorer window
-  lists the filesystem with azure folder glyphs; click a directory to
-  enter, `../` pops back.
+- **Files:** launch from its start-card tile — a real explorer (M16):
+  a sidebar with the four disk-backed **places** (Desktop, Documents,
+  Downloads, Recycle Bin), a `< Back` chip + path breadcrumb, an icon
+  grid (dirs first, folders enter on double-click, files select on
+  click, the **Del key** or the footer **Delete** chip moves them to
+  the Recycle Bin), and a footer with `N items` + the selection's
+  size. In the Recycle Bin, **Restore** puts a file back where it came
+  from and **Empty** drains the bin — trash state lives on the disk
+  (`.orig` sidecars), so it survives full reboots. **Right-click**
+  (v1.2.1/M18): over the grid or the *bare desktop* opens a context
+  menu — **New text file** (creates `New file N.txt`, first free name,
+  in the browsed dir or `/disk/Desktop`, then opens it in **Notepad**)
+  and **Refresh** (Files re-lists; desktop recomposites everything).
+  A ramfs view politely refuses new files with an auto-browse to
+  `/disk`.
+- **Notepad (.txt, new in v1.2.1/M18):** double-clicking any `.txt` on
+  the disk — or any New-text-file gesture — binds the file to the
+  built-in editor: a fresh ring-3 task with exactly **CAP_DISK**
+  (save-only powers; no net, no kill), spawned only on demand, never at
+  boot. The window loads the file (4 KiB view cap), and the command
+  line is `save | append <text> | clear | quit` — `quit` and the X
+  button both save-when-dirty. Terminal law:
+  `[notepad] opened <path>` / `[notepad] saved N bytes -> <path>`.
+- **Apps (.gle, v1.2/M17 + v2/M19):** a `.gle` file is a self-contained
+  app — sticker (name/version/author), 28x28 icon, and the compiled
+  program in one flat container, CRC-checked by the kernel. **v2** adds
+  bundled **assets**: the kernel maps them read-only into the app's
+  address space (one descriptor page + the blobs, the
+  `greenlime_abi::app` window contract) and the app reads them as
+  plain memory — no installer, nothing copied. Files double-clicks
+  (or `exec /disk/...`) run it: a fresh ring-3 task in its own
+  address space, its own window on the taskbar, capped at
+  USER_DEFAULT powers — never derived from the sticker. Port your app
+  by copying `userland/hello` (the in-tree template), building for the
+  userland target, and packing with the zero-dependency
+  `scripts/gle-pack.py` (list `"assets"` in the manifest for a v2 box,
+  leave them out for plain v1). The full dev guide (3 steps, format
+  tables, kernel law, caps, limits) is **`docs/GLE.md`**.
 - **Settings:** opens from its start-card tile as a floating acrylic
   info card (430,170,420,300) — drag and ✕ like any window.
 - **Windows:** focus follows clicks, `WIN_CREATE` never steals focus,
@@ -154,6 +208,14 @@ the serial mirror is the kernel's ground truth for what happened.
   (≤1600×900) — `build.rs` picks `.png` → `.jpeg` → `.jpg` at build
   time and the userspace service streams it in; no code changes (the
   repo ships a generated blue-wave default in the same spirit).
+- **Icons:** baked from [icons8](https://icons8.com) ("fluency" style) —
+  PNGs under `assets/icons-src/`, raw RGBA blobs under `assets/icons/`
+  (rebuild with `python3 scripts/bake-icons.py`). Icons by icons8.
+  Since v1.2.1 the **Settings** glyph is the fluency `gear` cog (the
+  old `settings` art read Windows-logo adjacent — swap chosen with
+  `scripts/probe-gear.py`'s shape maps), and the **power button** is
+  original in-tree art via `scripts/bake-icons-original.py` — chrome
+  must never be ambiguous about its origin.
 
 ## Architecture
 
@@ -164,8 +226,10 @@ Limine → kernel (ring 0) → servers (kernel tasks) → userland (ring 3) → 
 
 Hybrid kernel: microkernel-style keyed IPC + servers for structure,
 monolith-style speed (servers start as kernel tasks and can migrate to
-userspace later). Task map: kernel tasks `0=vfs, 1=dev, 2=winsrv, 6=net`;
-user tasks `3=init, 4=shell, 5=demo, 7=fuzz, 8=wallpaper` (max 9).
+userspace later). Task map: kernel tasks `0=vfs, 1=dev, 2=winsrv, 5=net`; boot user tasks
+`3=init, 4=shell` (fuzz 6, wallpaper 7); the Terminal / Files / Notepad,
+the demo and third-party `.gle` apps spawn on demand at recycled slots
+(max 12).
 `kernel/` may use `unsafe` + privileged instructions; `libs/*` +
 `userland/*` are safe-only and reach the kernel only through
 syscalls/IPC. Kernel memory is never mapped into user page tables (SMP
@@ -250,9 +314,9 @@ All loop forever on their service port, replying to the kernel-stamped sender.
 - **net** — ABI net broker on `PORT_NET` (tagged protocol over the same
   frozen IPC gate): NET_OPEN/SENDTO/RESOLVE/CLOSE for UDP,
   NET_CONNECT/SEND/RECV/CLOSE for TCP (polls to ESTABLISHED, streaming
-  in 218-byte chunks, peer FIN → NET_EOF), NET_PING. smoltcp runs only
-  in the kernel net task; leaky sockets, forged senders and duplicate
-  ports all get refused.
+  in up-to-2048-byte chunks, peer FIN → NET_EOF), NET_PING. smoltcp runs
+  only in the kernel net task; leaky sockets, forged senders and
+  duplicate ports all get refused.
 
 ## Drivers
 
@@ -264,36 +328,57 @@ All loop forever on their service port, replying to the kernel-stamped sender.
   This is what makes the cursor track 1:1.
 - **virtio-blk**: queue 256, up to 65536 sectors of 512 B, block
   read/write for the FAT32 disk.
+- **ahci** (v1.2, M19): a real SATA disk on the ICH9 (or any AHCI HBA at
+  PCI BAR5) is claimed by `kernel/src/drivers/ahci.rs` — the driver
+  takes over a firmware-owned port with the full engine stop dance,
+  COMRESET, then IDENTIFY (LBA48 capacity from identify words 100/204)
+  and serves block read/write via READ/WRITE DMA EXT (bounce-frame
+  polling, no IRQs yet). `storage` prefers AHCI; virtio-blk stays the
+  fallback when no SATA drive answers. Proof receipt:
+  `scripts/qemu-ahci-test.sh` — SATA-only identify/claim/mount,
+  AHCI-over-virtio preference, and empty-controller neutrality all pass.
 - **virtio-net**: legacy-transport devices with MSI-X IRQ-driven RX/TX
   wake (entry 0 → vector 0x40, both queue vectors wired; INTx fallback
   via the q35 PIRQ router kept as backup).
 - **rtc**: boot date + time and minute-of-day (feeds the tray two-line
   clock `HH:MM` / `YYYY-MM-DD`, with uptime-based day rollover).
 - **pci**: full bus enumeration (host bridge, `1234:1111` display,
-  virtio input/blk/net, ISA bridge, AHCI (detected), SMBus). AHCI driver
-  proper is future work.
+  virtio input/blk/net, ISA bridge, AHCI (claimed below by the ahci
+  driver), SMBus).
 - **fb**: VBE framebuffer driver, `Framebuffer::from_raw`, handed over
   to winsrv at `[winsrv] desktop painted`.
 
 ## Filesystem
 
 FAT32 (`kernel/src/fs/fat32.rs`) — a **writable filesystem since M14
-(v1.1)**: 512-byte sectors, no LFN, 8.3 uppercase compare, BPB validation
-(signature, `FAT32` magic, nonzero geometry), `.`/`..`/deleted/volume-label
-entries skipped, directory chains capped at 64 KiB, file writes capped at
-1 MiB, FAT-chain cycles broken by hard bounds. The write path (single vfs
-task, so `&mut self` is race-free): first-fit FAT allocation with a resume
-cursor, `EOC`-terminated chain building, file create/delete, `mkdir` with
-`.`/`..` cluster, empty-dir-only deletes, zero-filled extends (holes read
-as zeros), truncate with cluster release, and pwrite-at-offset. Durability
-is simple and real: writes go straight through the polling block driver,
-no cache to lose — `echo m14proof > /disk/m14.txt` then `cat` in a fresh
-boot shows the file back. Single FAT mirror is kept in sync (FAT[0]);
-FSInfo free-counts stay stale, which is legal. Test disk
-(`dist/disk.img`, 32 MiB) is made by `scripts/make-disk.sh` via
-`make disk` (delete the file to rebuild it — the script reuses an existing
-image). Shell and Files app read it; the shell writes it (admin-gated
-server-side — only init/shell hold the disk caps).
+(v1.1)**, with **real long file names since M16**: 512-byte sectors,
+BPB validation (signature, `FAT32` magic, nonzero geometry),
+`.`/`..`/deleted/volume-label entries skipped, directory chains capped
+at 64 KiB, file writes capped at 1 MiB, FAT-chain cycles broken by hard
+bounds. **LFN (M16)**: names keep their typed case on disk — a UTF-16
+entry chain above the 8.3 short entry (spec inventory: ordinals ascend
+toward the short entry, the `0x40` flag on set 1 only, checksummed per
+short entry), `~N` aliases fold under it for external tools, deletes
+sweep the whole set; anything undecodable falls back to the uppercase
+8.3 view. The write path (single vfs task, so `&mut self` is
+race-free): first-fit FAT allocation with a resume cursor,
+`EOC`-terminated chain building, file create/delete, `mkdir` with
+`.`/`..` cluster, empty-dir-only deletes, zero-filled extends (holes
+read as zeros), truncate with cluster release, and pwrite-at-offset.
+Durability is simple and real: writes go straight through the polling
+block driver, no cache to lose — `echo m14proof > /disk/m14.txt` then
+`cat` in a fresh boot shows the file back. Single FAT mirror is kept
+in sync (FAT[0]); FSInfo free-counts stay stale, which is legal. Test
+disk (`dist/disk.img`, 32 MiB) is made by `scripts/make-disk.sh` via
+`make disk` (delete the file to rebuild it — the script reuses an
+existing image). Shell and Files app read it; the shell writes it
+(admin-gated server-side — only init/shell hold the disk caps). At
+boot, vfs **`ensure_places()`** creates the four explorer places
+(Desktop / Documents / Downloads / Recycle Bin) on the volume when
+they're missing (`[vfs] places: N new`), so Files navigation and the
+bin exist for every later boot. The Recycle Bin scheme (payload +
+`.orig` sidecar, name de-dup, restore-to-source, guard rails) is
+detailed in `docs/STORAGE.md`.
 
 ## Userland
 
@@ -303,7 +388,10 @@ Ring 3, built static for the ELF loader, syscalls/IPC only:
 - **shell** (task 4) — interactive shell: line editing with history,
   `help echo cat ps kill ls exit ping fetch rm mkdir` + `echo x > /disk/f`
   for file writes (M14), `ping <host>` / `fetch <url>` through
-  the net broker, reads via dev `term0`, mirrors output to serial (the
+  the net broker — `fetch https://…` does TLS 1.3 with real webpki
+  certificate validation via the `greenlime-tls` lane (M20: shell owns
+  the TCP transport, the crate owns crypto+TLS+HTTP), reads via dev
+  `term0`, mirrors output to serial (the
   test harness' ground truth), checks reply senders and refuses forged
   messages.
 - **demo** (task 5) — second window client: opens its window, writes,
@@ -439,12 +527,13 @@ Plus the **1h syscall-fuzz soak on the release ISO**: clean end to end,
   compositor kernels), and since M15.1 it builds against the SSE-baked
   target spec `targets/x86_64-greenlime-sse.json` — zero build warnings,
   no CLI-vs-target flag fights.
-- **Storage is virtio-blk only**: real disks would need the AHCI
-  driver — deferred by design until real-hardware work; the controller
-  is detected + reported by the PCI scan (`[drivers] ahci: SATA
-  controller present (full driver: later)`), and QEMU's disk goes
-  through virtio-blk instead. The writable FAT32 (M14: writes persist
-  across full reboots) sits on virtio-blk. Story in `docs/STORAGE.md`.
+- **Storage backends are AHCI first, virtio-blk second**: a SATA disk on
+  the ICH9 (or any AHCI HBA at BAR5) is claimed by the ahci driver
+  (`[drivers] storage: ahci ready`); with no SATA drive attached the
+  controller is probed write-free and stays untouched, so virtio keeps
+  the disk (suite truth). The writable FAT32 (M14: writes persist
+  across full reboots) mounts over whichever backend answered.
+  Story in `docs/STORAGE.md`; receipts from `scripts/qemu-ahci-test.sh`.
 - No 1 GiB pages; windows are text + chrome, but any client may flip
   its own window into a budget-capped per-window graphics canvas
   (M15 `WIN_BLIT` — the demo's 40-frame animation is the proof);
@@ -500,7 +589,7 @@ M1–M9 are the pre-1.0 groundwork (boot, memory, userspace, fonts, IPC,
 storage, window server + compositor, identity hardening) — kept as
 history in `docs/ROADMAP.md`.
 
-See `docs/ROADMAP.md`. v1.0 through v1.1 (M15.1) verified in QEMU.
+See `docs/ROADMAP.md`. v1.0 through v1.2.0 (M20, real HTTPS) verified in QEMU.
 
 ## License
 

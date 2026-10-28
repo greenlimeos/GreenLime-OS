@@ -34,20 +34,28 @@ UE_TARGET = targets/x86_64-greenlime-sse.json
 UE_DIR := $(basename $(notdir $(UE_TARGET)))
 UE_RUSTFLAGS = -C relocation-model=static
 
-.PHONY: build iso run run-uefi run-nographic debug diag clean check build-release iso-release run-release disk setup
+.PHONY: build iso run run-uefi run-nographic debug diag clean check build-release iso-release run-release disk hello-gle setup
 
 setup:
 	bash scripts/setup-wsl.sh
 
 build:
-	RUSTFLAGS="$(UE_RUSTFLAGS)" cargo build -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper --target $(UE_TARGET) -Zunstable-options -Zjson-target-spec
+	RUSTFLAGS="$(UE_RUSTFLAGS)" cargo build -p greenlime-tls -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper -p greenlime-client -p greenlime-notepad -p greenlime-hello --target $(UE_TARGET) -Zunstable-options -Zjson-target-spec
 	GREENLIME_UE_DIR=$(UE_DIR) cargo build -p greenlime-kernel --target x86_64-unknown-none
 	cp $(CARGO_TARGET_DIR)/x86_64-unknown-none/debug/greenlime-kernel $(KERNEL_ELF)
 
 build-release:
-	RUSTFLAGS="$(UE_RUSTFLAGS)" cargo build --release -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper --target $(UE_TARGET) -Zunstable-options -Zjson-target-spec
+	RUSTFLAGS="$(UE_RUSTFLAGS)" cargo build --release -p greenlime-tls -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper -p greenlime-client -p greenlime-notepad -p greenlime-hello --target $(UE_TARGET) -Zunstable-options -Zjson-target-spec
 	GREENLIME_UE_DIR=$(UE_DIR) cargo build --release -p greenlime-kernel --target x86_64-unknown-none
 	cp $(CARGO_TARGET_DIR)/x86_64-unknown-none/release/greenlime-kernel $(KERNEL_ELF_RELEASE)
+
+# M17: pack the .gle porting template into dist/hello.gle (build-release
+# first so the template ELF exists under the UE toolchain directory).
+hello-gle: build-release
+	python3 scripts/gle-pack.py mkicon userland/hello/icon.png
+	python3 scripts/gle-pack.py pack userland/hello/app.json \
+		--elf $(CARGO_TARGET_DIR)/$(UE_DIR)/release/greenlime-hello \
+		--out dist/hello.gle
 
 iso-release: build-release
 	mkdir -p iso_root/boot dist
@@ -60,15 +68,19 @@ iso-release: build-release
 	xorriso -as mkisofs -b boot/limine-bios-cd.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
 	  --efi-boot boot/limine-uefi-cd.bin -efi-boot-part --efi-boot-image --protective-msdos-label \
 	  iso_root -o $(ISO_RELEASE)
+	@# The kernel-size tail: iso-hybrid GPT math breaks when the image is
+	@# not 4-sector aligned (limine: "Partition 2 ends past the device").
+	@# Pad to a 1 MiB boundary before the BIOS stage install.
+	python3 -c "import os;p=os.environ.get('ISO_RELEASE') or 'dist/GreenLime-release.iso';s=os.path.getsize(p);ns=(s+1048575)//1048576*1048576;f=open(p,'ab');f.write(b'\0'*(ns-s));f.close()" 2>/dev/null || true
 	$(LIMINE_DIR)/limine bios-install $(ISO_RELEASE)
 
 run-release: iso-release
 	bash scripts/run-qemu.sh bios $(ISO_RELEASE)
 
 check:
-	RUSTFLAGS="$(UE_RUSTFLAGS)" cargo build -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper --target $(UE_TARGET) -Zunstable-options -Zjson-target-spec
+	RUSTFLAGS="$(UE_RUSTFLAGS)" cargo build -p greenlime-tls -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper -p greenlime-client -p greenlime-notepad -p greenlime-hello --target $(UE_TARGET) -Zunstable-options -Zjson-target-spec
 	GREENLIME_UE_DIR=$(UE_DIR) cargo check -p greenlime-kernel --target x86_64-unknown-none
-	GREENLIME_UE_DIR=$(UE_DIR) cargo check -p greenlime-abi -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper -p greenlime-font
+	GREENLIME_UE_DIR=$(UE_DIR) cargo check -p greenlime-abi -p greenlime-tls -p greenlime-init -p greenlime-shell -p greenlime-demo -p greenlime-fuzz -p greenlime-wallpaper -p greenlime-font
 
 iso: build
 	mkdir -p iso_root/boot dist

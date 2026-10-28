@@ -181,7 +181,7 @@ pub extern "C" fn _start() -> ! {    let me = getpid();
 // format as every OS client. Before window RPCs so the net reply stream
 // never interleaves with winsrv replies on our mailbox.
 
-const NET_TASK: u32 = 6; // spawn order in servers::init; kernel-stamped
+const NET_TASK: u32 = 5; // spawn order in servers::init; kernel-stamped (M18)
 const DNS_PORT: u16 = 53;
 
 /// Send a request to the broker and take back its reply. Kernel stamps the

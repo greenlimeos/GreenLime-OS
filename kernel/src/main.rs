@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod arch;
 mod boot;
+mod crypto;
 mod drivers;
 mod fs;
 mod ipc;
@@ -59,11 +60,17 @@ unsafe fn kmain() -> ! {
     // 6. Memory: PMM from Limine map, paging check, self-tests.
     mm::init();
 
+    // 6c. Crypto lane (M20): the ChaCha8 DRBG behind Syscall::Rand. Runs
+    // AFTER mm::init because it folds the freshly pinned KASLR seed with
+    // two live TSC reads — hooking it earlier would fold the fallback
+    // constant instead, and worse, fold the SAME constant every boot.
+    crypto::init();
+
     // 6b. IOAPIC + LAPIC: route device IRQs and map the LAPIC page (B3).
     arch::ioapic::init();
     arch::lapic::init();
 
-    // 7. Storage: PCI scan, virtio-blk claim (needs PMM + heap).
+    // 7. Storage: PCI scan, AHCI (real SATA) else virtio-blk claim.
     drivers::storage::init();
 
     // 7b. Absolute pointer (virtio-tablet): host/guest cursor sync.

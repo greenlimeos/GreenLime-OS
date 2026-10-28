@@ -90,6 +90,21 @@ fn main() {
     }
     println!("cargo:rustc-env=GREENLIME_WALLPAPER_ELF={}", wallp);
 
+    // Notepad ELF, same deal (M18: spawned on demand — right-click New
+    // text file / .txt double-click — never at boot).
+    let notepad = format!(
+        "{}/{}/{}/greenlime-notepad",
+        tdir, ue_dir, profile
+    );
+    println!("cargo:rerun-if-changed={}", notepad);
+    if !std::path::Path::new(&notepad).exists() {
+        panic!(
+            "greenlime-notepad ELF missing at {}. Build userland first: run `make`, not bare `cargo build`.",
+            notepad
+        );
+    }
+    println!("cargo:rustc-env=GREENLIME_NOTEPAD_ELF={}", notepad);
+
     // Default TTF for the framebuffer console (see assets/fonts/README.md).
     let font = format!("{}/../assets/fonts/default-font.ttf", manifest);
     println!("cargo:rerun-if-changed={}", font);
@@ -102,4 +117,29 @@ fn main() {
         );
     }
     println!("cargo:rustc-env=GREENLIME_FONT_TTF={}", font);
+
+    // M16.x UI icons: raw straight-alpha RGBA blobs baked ONCE by
+    // scripts/bake-icons.py from the committed icons8 PNG sources
+    // (assets/icons-src). The kernel never parses image data — these
+    // are plain byte arrays winsrv alpha-blits at exactly their given
+    // size, no runtime scaling or decode.
+    let icons = format!("{}/../assets/icons", manifest);
+    const ICONS: [&str; 14] = [
+        "folder_24", "folder_28", "folder_30",
+        "console_24", "console_28",
+        "settings_24", "settings_28",
+        "monitor_20", "docsfold_20", "dload_20", "bin_20", "page_28",
+        "rocket_28", "power_24",
+    ];
+    for name in ICONS {
+        let p = format!("{}/{}.rgba", icons, name);
+        if !std::path::Path::new(&p).exists() {
+            panic!(
+                "icon blob missing at {}.\nRun scripts/bake-icons.py (network fetches assets/icons-src PNGs once).",
+                p
+            );
+        }
+    }
+    println!("cargo:rerun-if-changed={}", icons);
+    println!("cargo:rustc-env=GREENLIME_ICONS_DIR={}", icons);
 }

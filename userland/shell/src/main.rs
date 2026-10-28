@@ -10,10 +10,22 @@
 
 use core::arch::asm;
 use core::panic::PanicInfo;
-use greenlime_abi::ipc::{Message, PORT_DEV, PORT_VFS, REPLY_OK};
+use greenlime_abi::ipc::{Message, MAX_PAYLOAD, PORT_DEV, PORT_VFS, REPLY_OK};
 use greenlime_abi::net::{self as netab, PORT_NET};
 use greenlime_abi::syscall::Syscall;
 use greenlime_abi::vfs::*;
+use greenlime_tls::fetch as tlsf;
+use linked_list_allocator::LockedHeap;
+
+/// The M20 heap: rustls + webpki chain parsing allocates (client config,
+/// certificate chains, the response header stage). Zero-filled bss,
+/// initialized at _start before the first allocation - same pattern as
+/// the wallpaper service.
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+
+#[global_allocator]
+static ALLOC: LockedHeap = LockedHeap::empty();
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -211,7 +223,7 @@ fn read_line(
 // ===== Phase D net tools (ABI v4 over the port-18 broker) =====
 
 /// Task id of the net broker (spawn order = always 6; kernel-stamped).
-const NET_TASK: u32 = 6;
+const NET_TASK: u32 = 5; // M18: demo left boot; net took its slot (was 6)
 
 /// Send a request to the broker and take its reply. Kernel stamps the
 /// sender; a foreign reply means the IPC path lied — die loud.
@@ -276,10 +288,313 @@ fn ping(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
     out(me, fd, ser, &b[..n]);
 }
 
-/// fetch <host>: bare open + connect + GET + streamed body to the
-/// console. User-Agent: GreenLime/1.0 — this is the string an OS gets
-/// (or doesn't get) counted by. Default GET on port 80, HTTP only.
-fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
+/// fetch <url> — scheme-aware gateway (M20). `fetch host` and
+/// `fetch http://..` stay on the plain HTTP lane; `fetch https://..` is
+/// the M20 lane: TLS 1.3 with REAL webpki chain validation before a
+/// single body byte moves. Redirects are chased above the lanes (both
+/// belong to the shell, which knows the scheme it is on): 5 hops max,
+/// never downward from https to http.
+fn fetch(me: u32, fd: u64, ser: Option<u64>, arg: &[u8]) {
+    fetch_hop(me, fd, ser, arg, 5);
+}
+
+/// One scheme-parsed hop. Recursion depth is taken as `hops` on purpose:
+/// Location chains walk here, one shell call per hop.
+fn fetch_hop(me: u32, fd: u64, ser: Option<u64>, arg: &[u8], hops: u8) {
+    if hops == 0 {
+        out(me, fd, ser, b"fetch: too many redirects\n");
+        return;
+    }
+    // Scheme parse. Without one, it is plain http-80 (the historical lane).
+    let (tls, rest) = if arg.len() >= 8 && arg[..8].eq_ignore_ascii_case(b"https://") {
+        (true, &arg[8..])
+    } else if arg.len() >= 7 && arg[..7].eq_ignore_ascii_case(b"http://") {
+        (false, &arg[7..])
+    } else {
+        (false, arg)
+    };
+    // host[:port][/path] split; the path keeps its leading slash.
+    let (host_raw, path) = match rest.iter().position(|&b| b == b'/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, b"/".as_slice()),
+    };
+    let (host, port) = match split_host_port(host_raw, if tls { 443 } else { 80 }) {
+        (h, Some(p)) => (h, p),
+        _ => {
+            out(me, fd, ser, b"fetch: bad port\n");
+            return;
+        }
+    };
+    if tls {
+        fetch_https(me, fd, ser, host, port, path, hops);
+    } else {
+        fetch_http(me, fd, ser, host, port, path, hops);
+    }
+}
+
+/// host[:port] split. Port must be all digits (1..=5 of them); anything
+/// else is not a port and gets refused before DNS ever sees it.
+fn split_host_port(host: &[u8], dflt: u16) -> (&[u8], Option<u16>) {
+    match host.iter().position(|&b| b == b':') {
+        None => (host, Some(dflt)),
+        Some(i) => {
+            let p = &host[i + 1..];
+            if p.is_empty() || p.len() > 5 || !p.iter().all(|&c| (b'0'..=b'9').contains(&c)) {
+                return (host, None);
+            }
+            let mut v = 0u16;
+            for &d in p {
+                v = v * 10 + (d - b'0') as u16;
+            }
+            (&host[..i], Some(v))
+        }
+    }
+}
+
+/// The M20 lane: one TLS 1.3 GET with REAL certificate validation, then
+/// the redirect chase. The body streams with the 512-B console budget
+/// like the plain lane; every byte is counted either way.
+fn fetch_https(
+    me: u32,
+    fd: u64,
+    ser: Option<u64>,
+    host: &[u8],
+    port: u16,
+    path: &[u8],
+    hops: u8,
+) {
+    out(me, fd, ser, b"fetch: resolving ");
+    out(me, fd, ser, host);
+    out(me, fd, ser, b"\n");
+    // SNI law: the certificate identity is a DNS name. An IP literal has
+    // no name to verify, so the lane refuses it honestly.
+    let ip_lit = !host.is_empty()
+        && host.iter().all(|&c| (b'0'..=b'9').contains(&c) || c == b'.');
+    if ip_lit {
+        out(me, fd, ser, b"fetch: https: no IP literals (SNI needs a DNS name)\n");
+        return;
+    }
+    let Some(ip) = net_resolve(me, host) else {
+        out(me, fd, ser, b"fetch: resolve failed\n");
+        return;
+    };
+    let Some(h) = net_open_connect(me, fd, ser, ip, port) else {
+        return;
+    };
+    let mut link = FetchLink { me, h };
+    let mut shown = 0usize;
+    let mut sink = |chunk: &[u8]| body_sink(me, fd, ser, chunk, &mut shown);
+    let r = tlsf::https_get(&mut link, host, path, &mut sink);
+    match r {
+        Ok(sum) => {
+            // Proof line: tag, status line (byte-for-byte), total wire
+            // bytes, and the TLS-close kind — rustls close_notify vs a
+            // bare TCP FIN. Nothing about the channel is hidden.
+            let mut b = [0u8; 192];
+            let mut n = 0usize;
+            w_cmd(&mut b, &mut n, b"fetch: TLS1.3 ");
+            w_cmd(&mut b, &mut n, &sum.status_line);
+            w_cmd(&mut b, &mut n, b" ");
+            w_dec(&mut b, &mut n, (sum.header_bytes + sum.body_bytes) as u64);
+            w_cmd(&mut b, &mut n, b"B ");
+            w_cmd(
+                &mut b,
+                &mut n,
+                if sum.clean_tls_close { b"close_notify" } else { b"tcp-fin" },
+            );
+            w_cmd(&mut b, &mut n, b"\n");
+            out(me, fd, ser, &b[..n]);
+            close_h(me, h);
+            let redir = if sum.status >= 300 && sum.status < 400 {
+                sum.location.as_deref()
+            } else {
+                None
+            };
+            maybe_chase(me, fd, ser, redir, host, port, true, hops);
+        }
+        Err(e) => {
+            print_fetch_err(me, fd, ser, &e);
+            close_h(me, h);
+        }
+    }
+}
+
+/// Open a client TCP socket via the broker and connect it to ip:port.
+/// Prints and closes on failure; hands back the handle on success.
+fn net_open_connect(me: u32, fd: u64, ser: Option<u64>, ip: u32, port: u16) -> Option<u64> {
+    let mut req = Message::new(netab::NET_OPEN);
+    req.arg0 = netab::NET_KIND_TCP;
+    req.arg1 = 0; // client socket: broker assigns an ephemeral port
+    let rep = net_req(me, &req);
+    if rep.kind != netab::NET_REPLY || rep.arg0 == u64::MAX {
+        out(me, fd, ser, b"fetch: open refused\n");
+        return None;
+    }
+    let h = rep.arg0;
+    let mut req = Message::new(netab::NET_CONNECT);
+    req.arg0 = h;
+    req.arg1 = netab::addr(ip, port);
+    let rep = net_req(me, &req);
+    if rep.kind != netab::NET_REPLY || rep.arg0 != 0 {
+        let mut b = [0u8; 72];
+        let mut n = 0usize;
+        w_cmd(&mut b, &mut n, b"fetch: connect refused (");
+        w_ipq(&mut b, &mut n, ip);
+        w_cmd(&mut b, &mut n, b":");
+        w_dec(&mut b, &mut n, port as u64);
+        w_cmd(&mut b, &mut n, b")\n");
+        out(me, fd, ser, &b[..n]);
+        close_h(me, h);
+        return None;
+    }
+    Some(h)
+}
+
+/// Console body budget shared by both lanes: first 512 bytes straight
+/// in, everything else silently counted.
+fn body_sink(me: u32, fd: u64, ser: Option<u64>, chunk: &[u8], shown: &mut usize) {
+    if *shown < 512 {
+        let take = chunk.len().min(512 - *shown);
+        out(me, fd, ser, &chunk[..take]);
+        *shown += take;
+    }
+}
+
+/// Redirect chase law: 3xx + Location hops at the NEW scheme when hops
+/// remain. https -> http is refused (never downgrade); http -> https is
+/// the accepted upgrade (that is the acceptance target). Full URLs
+/// replay scheme+host+path as-is; a site-relative Location (/new or
+/// //host/new) replays under the current host with the chosen scheme;
+/// anything else is refused loudly.
+fn maybe_chase(
+    me: u32,
+    fd: u64,
+    ser: Option<u64>,
+    redir: Option<&[u8]>,
+    host: &[u8],
+    port: u16,
+    came_tls: bool,
+    hops: u8,
+) {
+    let Some(loc) = redir else { return };
+    if hops == 0 {
+        out(me, fd, ser, b"fetch: redirect chain too long\n");
+        return;
+    }
+    if loc.is_empty() {
+        out(me, fd, ser, b"fetch: redirect: empty Location\n");
+        return;
+    }
+    let dflt_port = if came_tls { 443 } else { 80 };
+    // Site-relative or protocol-relative: rebuild scheme://host[:port]...
+    let rebuild = |loc2: &[u8]| {
+        let mut arg = [0u8; 256];
+        let mut n = 0usize;
+        w_cmd(
+            &mut arg,
+            &mut n,
+            if came_tls { b"https://" } else { b"http://" },
+        );
+        w_cmd(&mut arg, &mut n, host);
+        if port != dflt_port || loc2[..2].eq_ignore_ascii_case(b"//") {
+            w_cmd(&mut arg, &mut n, b":");
+            w_dec(&mut arg, &mut n, port as u64);
+        }
+        // protocol-relative passes the leading //; site-relative passes
+        // the /path straight (double slashes would break the router,
+        // so trim one span).
+        let trimmed = if loc2.starts_with(b"//") { &loc2[1..] } else { loc2 };
+        w_cmd(&mut arg, &mut n, if trimmed.is_empty() { b"/" } else { trimmed });
+        fetch_hop(me, fd, ser, &arg[..n], hops - 1);
+    };
+    if loc.len() >= 8 && loc[..8].eq_ignore_ascii_case(b"https://") {
+        fetch_hop(me, fd, ser, loc, hops - 1);
+    } else if loc.len() >= 7 && loc[..7].eq_ignore_ascii_case(b"http://") {
+        if came_tls {
+            out(me, fd, ser, b"fetch: https -> http refused (no downgrade)\n");
+            return;
+        }
+        fetch_hop(me, fd, ser, loc, hops - 1);
+    } else if loc.first() == Some(&b'/') {
+        rebuild(loc);
+    } else {
+        out(me, fd, ser, b"fetch: redirect: unsupported Location form\n");
+    }
+}
+
+/// The refusal voice of the TLS lane, quoted raw: whoever reads the
+/// console sees exactly why the chain did not verify.
+fn print_fetch_err(me: u32, fd: u64, ser: Option<u64>, e: &tlsf::FetchErr) {
+    let mut b = [0u8; 256];
+    let mut n = 0usize;
+    w_cmd(&mut b, &mut n, b"fetch: https refused: ");
+    let m: &[u8] = match e {
+        tlsf::FetchErr::Setup(s) => s.as_bytes(),
+        tlsf::FetchErr::Tcp => b"tcp: broker refused the socket",
+        tlsf::FetchErr::Tls(s) => s.as_bytes(),
+        tlsf::FetchErr::Http(s) => s.as_bytes(),
+    };
+    w_cmd(&mut b, &mut n, m);
+    w_cmd(&mut b, &mut n, b"\n");
+    out(me, fd, ser, &b[..n]);
+}
+
+/// The M20 transport adapter: greenlime-tls sees a `TcpLink`; the shell
+/// turns every call into the broker's wire protocol. Send splits into
+/// 2048-B broker messages (reply says how many bytes entered the
+/// socket); recv holds ONE parked NET_RECV per slot — the broker's hard
+/// law — where NET_EOF means the peer closed and the buffer drained.
+struct FetchLink {
+    me: u32,
+    h: u64,
+}
+
+impl tlsf::TcpLink for FetchLink {
+    fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+        let mut off = 0usize;
+        while off < data.len() {
+            let take = (data.len() - off).min(MAX_PAYLOAD);
+            let mut req = Message::new(netab::NET_SEND);
+            req.arg0 = self.h;
+            req.set_payload(&data[off..off + take]);
+            let rep = net_req(self.me, &req);
+            if rep.kind != netab::NET_REPLY || rep.arg0 == u64::MAX || rep.arg0 == 0 {
+                return Err(());
+            }
+            off += rep.arg0 as usize;
+        }
+        Ok(())
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> tlsf::Recv {
+        let mut req = Message::new(netab::NET_RECV);
+        req.arg0 = self.h;
+        let rep = net_req(self.me, &req);
+        if rep.kind == netab::NET_EOF {
+            return tlsf::Recv::Fin;
+        }
+        if rep.kind != netab::NET_REPLY {
+            return tlsf::Recv::Broken;
+        }
+        let chunk = rep.payload_bytes();
+        let n = chunk.len().min(buf.len());
+        buf[..n].copy_from_slice(&chunk[..n]);
+        tlsf::Recv::Data(n)
+    }
+}
+
+/// fetch <host> HTTP lane: the pre-M20 plain lane, now with the scheme-
+/// aware redirect chase. User-Agent: GreenLime/1.0 — this is the string
+/// an OS gets (or doesn't get) counted by.
+fn fetch_http(
+    me: u32,
+    fd: u64,
+    ser: Option<u64>,
+    host: &[u8],
+    port: u16,
+    path: &[u8],
+    hops: u8,
+) {
     out(me, fd, ser, b"fetch: resolving ");
     out(me, fd, ser, host);
     out(me, fd, ser, b"\n");
@@ -287,37 +602,16 @@ fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
         out(me, fd, ser, b"fetch: resolve failed\n");
         return;
     };
-    // 1. Open a TCP socket (broker assigns the local port).
-    let mut req = Message::new(netab::NET_OPEN);
-    req.arg0 = netab::NET_KIND_TCP;
-    req.arg1 = 0; // client socket: broker assigns an ephemeral port
-    let rep = net_req(me, &req);
-    if rep.kind != netab::NET_REPLY || rep.arg0 == u64::MAX {
-        out(me, fd, ser, b"fetch: open refused\n");
+    let Some(h) = net_open_connect(me, fd, ser, ip, port) else {
         return;
-    }
-    let h = rep.arg0;
+    };
 
-    // 2. Connect to port 80.
-    let mut req = Message::new(netab::NET_CONNECT);
-    req.arg0 = h;
-    req.arg1 = netab::addr(ip, 80);
-    let rep = net_req(me, &req);
-    if rep.kind != netab::NET_REPLY || rep.arg0 != 0 {
-        let mut b = [0u8; 64];
-        let mut n = 0usize;
-        w_cmd(&mut b, &mut n, b"fetch: connect refused (");
-        w_ipq(&mut b, &mut n, ip);
-        w_cmd(&mut b, &mut n, b":80)\n");
-        out(me, fd, ser, &b[..n]);
-        close_h(me, h);
-        return;
-    }
-
-    // 3. One 240-B-capped request.
+    // 2. One 240-B-capped request.
     let mut req = [0u8; 240];
     let mut rn = 0usize;
-    w_cmd(&mut req, &mut rn, b"GET / HTTP/1.1\r\nHost: ");
+    w_cmd(&mut req, &mut rn, b"GET ");
+    w_cmd(&mut req, &mut rn, path);
+    w_cmd(&mut req, &mut rn, b" HTTP/1.1\r\nHost: ");
     if rn + host.len() >= 200 {
         out(me, fd, ser, b"fetch: host name too long\n");
         close_h(me, h);
@@ -339,13 +633,20 @@ fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
         return;
     }
 
-    // 4. Pull the stream: print the status line, then the first 512 bytes
-    //    of the body (terminal-friendly); count everything.
-    let mut hdr = [0u8; 384];
+    // 3. Pull the stream: print the status line, then the first 512 bytes
+    //    of the body (terminal-friendly); count everything. The staged
+    //    header block cap is 1 KiB: real 301 redirect blocks (Google's
+    //    is ~600 B) must fit whole, or the redirect chase becomes
+    //    impossible (the overflow flip is an honest no-chase).
+    let mut hdr = [0u8; 1024];
     let mut hl = 0usize;
     let mut body = false;
     let mut body_shown = 0usize;
     let mut total = 0usize;
+    let mut redir_ok = false;
+    let mut code = 0u16;
+    let mut loc = [0u8; 240];
+    let mut loc_len = 0usize;
     loop {
         let mut req = Message::new(netab::NET_RECV);
         req.arg0 = h;
@@ -389,6 +690,14 @@ fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
                     && hdr[hl - 1] == b'\n')
                     || hl >= hdr.len()
                 {
+                    // Header complete only if the separator really ended
+                    // it (an overflow flip means we never saw the blank
+                    // line: no chase is possible)
+                    redir_ok = hl >= 4
+                        && hdr[hl - 4] == b'\r'
+                        && hdr[hl - 3] == b'\n'
+                        && hdr[hl - 2] == b'\r'
+                        && hdr[hl - 1] == b'\n';
                     body = true;
                     // Status line = bytes up to the first '\n' ('\r'
                     // trimmed) → "fetch: HTTP/1.1 200 OK".
@@ -409,6 +718,14 @@ fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
                     w_cmd(&mut ob, &mut on, &hdr[..sco]);
                     w_cmd(&mut ob, &mut on, b"\n");
                     out(me, fd, ser, &ob[..on]);
+                    // Redirect material: status code + Location value,
+                    // both straight from the staged bytes.
+                    code = parse_code(&hdr[..sco]);
+                    if let Some((ls, le)) = find_location(&hdr[..hl.min(hdr.len())]) {
+                        // clamp: a 240-B Location is already absurd
+                        loc_len = (le - ls).min(loc.len());
+                        loc[..loc_len].copy_from_slice(&hdr[ls..ls + loc_len]);
+                    }
                 }
                 ci += 1;
             }
@@ -421,6 +738,56 @@ fn fetch(me: u32, fd: u64, ser: Option<u64>, host: &[u8]) {
     w_cmd(&mut b, &mut n, b" bytes total\n");
     out(me, fd, ser, &b[..n]);
     close_h(me, h);
+    let redir = if redir_ok && code >= 300 && code < 400 && loc_len > 0 {
+        Some(&loc[..loc_len])
+    } else {
+        None
+    };
+    maybe_chase(me, fd, ser, redir, host, port, false, hops);
+}
+
+/// Three digits after the first space of a status line; 0 on garbage.
+fn parse_code(line: &[u8]) -> u16 {
+    let Some(sp) = line.iter().position(|&b| b == b' ') else {
+        return 0;
+    };
+    let rest = &line[sp + 1..];
+    if rest.len() < 3 {
+        return 0;
+    }
+    let mut v = 0u16;
+    for &d in &rest[..3] {
+        if !(b'0'..=b'9').contains(&d) {
+            return 0;
+        }
+        v = v * 10 + (d - b'0') as u16;
+    }
+    v
+}
+
+/// Case-insensitive `Location:` scan over a staged header block; the
+/// value runs to that line's CR (the caller's out of the head block).
+fn find_location(head: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    while i + 9 <= head.len() {
+        if head[i + 1..i + 9].eq_ignore_ascii_case(b"ocation:") && head[i] | 0x20 == b'l' {
+            let mut j = i + 9;
+            while j < head.len() && head[j] == b' ' {
+                j += 1;
+            }
+            let end = head[j..]
+                .iter()
+                .position(|&c| c == b'\r' || c == b'\n')
+                .map(|d| j + d)
+                .unwrap_or(head.len());
+            return Some((j, end));
+        }
+        match head[i..].iter().position(|&c| c == b'\n') {
+            Some(off) => i += off + 1,
+            None => break,
+        }
+    }
+    None
 }
 
 /// Net CLOSE (best-effort: the broker frees the handle either way).
@@ -657,7 +1024,7 @@ fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
             me,
             fd,
             ser,
-            b"commands: help echo cat ps kill ls exit ping fetch rm mkdir; echo x > /disk/f\n",
+            b"commands: help echo cat ps kill ls exit ping fetch rm mkdir exec; echo x > /disk/f\n",
         );
     } else if line.starts_with(b"echo ") {
         let rest = &line[5..];
@@ -726,6 +1093,27 @@ fn run_line(me: u32, fd: u64, ser: Option<u64>, line: &[u8]) {
             w_cmd(&mut nb, &mut nn, b"\n");
             out(me, fd, ser, &nb[..nn]);
         }
+    } else if line.starts_with(b"exec ") {
+        // M17: run a .gle app from the disk. The admin gate lives in the
+        // vfs server; the kernel validates the container, spawns a fresh
+        // ring-3 task and replies its id (shown as the task's next proof
+        // line on serial — [sched]/[winsrv]/[hello]).
+        let t = trim(&line[5..]);
+        let mut nb = [0u8; 128];
+        let mut nn = 0usize;
+        if t.is_empty() {
+            out(me, fd, ser, b"exec: missing path\n");
+        } else if vfs_path_op(me, OP_EXEC, t) {
+            w_cmd(&mut nb, &mut nn, b"exec: started ");
+            w_cmd(&mut nb, &mut nn, t);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
+        } else {
+            w_cmd(&mut nb, &mut nn, b"exec: refused ");
+            w_cmd(&mut nb, &mut nn, t);
+            w_cmd(&mut nb, &mut nn, b"\n");
+            out(me, fd, ser, &nb[..nn]);
+        }
     } else if line.starts_with(b"ping ") {
         ping(me, fd, ser, trim(&line[5..]));
     } else if line.starts_with(b"fetch ") {
@@ -771,6 +1159,13 @@ fn parse_u32(b: &[u8]) -> Option<u32> {
 /// Kernel iretq's here in ring 3 with a fresh stack.
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    unsafe {
+        // Once, before any allocation. Static region spills into bss.
+        ALLOC.lock().init(
+            core::ptr::addr_of!(HEAP).cast_mut().cast::<u8>(),
+            HEAP_SIZE,
+        );
+    }
     let me = getpid();
     let fd = dev_open(me);
     // dev encodes the console in the handle's top bit (term0 = GUI).

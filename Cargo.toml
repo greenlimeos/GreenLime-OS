@@ -8,6 +8,10 @@ members = [
   "userland/demo",
   "userland/fuzz",
   "userland/wallpaper",
+  "libs/greenlime-client",
+  "libs/greenlime-tls",
+  "userland/notepad",
+  "userland/hello",
 ]
 resolver = "2"
 
@@ -25,7 +29,10 @@ opt-level = "z"
 
 [workspace.dependencies]
 greenlime-abi = { path = "libs/greenlime-abi" }
+greenlime-client = { path = "libs/greenlime-client" }
 greenlime-font = { path = "libs/greenlime-font" }
+# M20: the TLS 1.3 fetch lane (vendored rustls crypto provider + driver).
+greenlime-tls = { path = "libs/greenlime-tls" }
 limine = "0.5"
 spin = "0.10"
 uart_16550 = "0.8"

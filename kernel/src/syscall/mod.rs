@@ -8,7 +8,7 @@ use crate::{ipc, kprintln, sched};
 
 pub fn init() {
     arch_syscall::init();
-    debug_assert!(Syscall::COUNT == 8);
+    debug_assert!(Syscall::COUNT == 10);
     kprintln!(
         "[syscall] table: {} numbers (ABI v{})",
         Syscall::COUNT,
@@ -70,6 +70,13 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, _a2: u64) -> u64 
             }
         }
         Some(Syscall::GetPid) => sched::current_id().map(|id| id as u64).unwrap_or(u64::MAX),
+        // M20 entropy lane: fill the caller's buffer from the kernel DRBG
+        // (the rustls handshakes' fresh-key source). Refused, never faulted.
+        Some(Syscall::Rand) => sys_rand(a0, a1),
+        // M20 clock lane: CMOS boot stamp + drained seconds. No user args
+        // are consulted, so nothing to validate.
+        Some(Syscall::Now) =>
+            crate::drivers::rtc::unix_secs(crate::arch::x86_64::idt::ticks() / 100),
         None => u64::MAX,
     };
     // Safe-point preemption (Option B): a tick may have raised a request
@@ -124,5 +131,46 @@ fn sys_log(ptr: u64, len: u64) -> u64 {
     }
     let msg = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
     kprintln!("[user] {}", msg);
+    len
+}
+
+/// Fill a user buffer with kernel DRBG bytes (M20 — TLS handshakes draw
+/// their fresh ephemeral keys here). The mirror-symmetric sys_log: same
+/// bounds law, same page-table PROBE (with `want_write = true` — nothing
+/// arithmetic proves a PTE is writable), copy under STAC so SMAP allows
+/// this one supervisor WRITE of user memory. Reply = len on success.
+fn sys_rand(ptr: u64, len: u64) -> u64 {
+    const USER_END: u64 = 0x0000_8000_0000_0000;
+    const MAX_LEN: u64 = 4096;
+    if len == 0 || len > MAX_LEN {
+        return u64::MAX;
+    }
+    let end = match ptr.checked_add(len) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if ptr >= USER_END || end > USER_END {
+        return u64::MAX;
+    }
+    // Every overlapped page must be mapped user-WRITABLE (GLS-011's twin
+    // on the write side: a read-only mapping must be refused, not faulted
+    // in-kernel under STAC).
+    if !crate::mm::vmm::user_range_ok(ptr, len, true) {
+        return u64::MAX;
+    }
+    // Fill from the DRBG (kernel-side), then copy out under STAC.
+    let mut buf = [0u8; 4096];
+    if !crate::crypto::rand_fill(&mut buf[..len as usize]) {
+        return u64::MAX;
+    }
+    unsafe {
+        if crate::arch::x86_64::paging::smap_on() {
+            core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+        }
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr as *mut u8, len as usize);
+        if crate::arch::x86_64::paging::smap_on() {
+            core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+        }
+    }
     len
 }

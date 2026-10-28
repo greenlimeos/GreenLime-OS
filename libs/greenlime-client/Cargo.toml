@@ -1,0 +1,8 @@
+[package]
+name = "greenlime-client"
+version.workspace = true
+edition.workspace = true
+description = "Thin dev crate for GreenLime window apps (.gle porting base): open / print / keys over the raw ABI"
+
+[dependencies]
+greenlime-abi = { workspace = true }

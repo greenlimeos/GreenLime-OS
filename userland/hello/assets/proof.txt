@@ -1,0 +1,5 @@
+GreenLime OS GLE v2 asset proof.
+
+This plain-text file is the FIRST asset of the hello container: at exec
+the kernel maps it read-only into the app's asset window and the app
+printed its head to the serial log. No installer, nothing copied.

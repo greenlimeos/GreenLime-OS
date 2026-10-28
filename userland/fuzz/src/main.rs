@@ -137,6 +137,35 @@ pub extern "C" fn _start() -> ! {
     }
     let mut rng = Rng(t ^ (me as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
+    // M20 one-shot probe of the new lanes (Rand/Now), printed once at boot:
+    // two 32-byte DRBG fills must differ (the same 32 bytes twice = counter
+    // reuse — the one corruption TLS cannot survive) and the clock must be
+    // an epoch stamp. OUTCOME BITS ONLY: DRBG output is never logged.
+    let mut pa = [0u8; 32];
+    let mut pb = [0u8; 32];
+    unsafe { syscall3(Syscall::Rand as u64, pa.as_mut_ptr() as u64, 32, 0) };
+    unsafe { syscall3(Syscall::Rand as u64, pb.as_mut_ptr() as u64, 32, 0) };
+    let pairs =
+        pa.iter().zip(pb.iter()).filter(|(x, y)| x != y).count();
+    let now = unsafe { syscall3(Syscall::Now as u64, 0, 0, 0) };
+    {
+        let mut buf = [0u8; 80];
+        let mut n = 0usize;
+        for &c in b"[fuzz] rng probe: pairs=" {
+            buf[n] = c;
+            n += 1;
+        }
+        n = put_dec(&mut buf, n, pairs as u64);
+        for &c in b"/32 clock=" {
+            buf[n] = c;
+            n += 1;
+        }
+        n = put_dec(&mut buf, n, now);
+        buf[n] = b'\n';
+        n += 1;
+        unsafe { syscall3(Syscall::Log as u64, buf.as_ptr() as u64, n as u64, 0) };
+    }
+
     let mut iters: u64 = 0;
     // Self-mailbox flow control: only recv when something we sent is
     // queued, only send while under half the queue depth. IpcRecv BLOCKS

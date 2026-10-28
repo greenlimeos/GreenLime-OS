@@ -7,8 +7,11 @@
 /// copies safe on 32 KiB kernel stacks (worth ~2 KB per local copy).
 pub const MAX_PAYLOAD: usize = 2048;
 
-/// Mailbox ports: task N owns port N (N < MAX_TASKS).
-pub const MAX_TASKS: u32 = 9;
+/// Mailbox ports: task N owns port N (N < MAX_TASKS). v2.1 (M17): 9 -> 12
+/// — ids 0..8 are the boot tasks, 9..11 are the third-party .gle app slots
+/// (EXEC picks them from the same freelist path). Appending slots is
+/// deliberately ABI-safe: callers hardcode only ids <= 8 (net = 6).
+pub const MAX_TASKS: u32 = 12;
 /// Service ports.
 pub const PORT_VFS: u32 = 16;
 pub const PORT_DEV: u32 = 17;

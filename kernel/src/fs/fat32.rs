@@ -1,4 +1,4 @@
-//! FAT32 filesystem (512-byte sectors, no LFN).
+//! FAT32 filesystem (512-byte sectors).
 //! v0.x-v1.0: read-only (load files and list directories off a disk).
 //! M14 (v1.1): full write path — FAT chain alloc/free, 8.3 dir entry
 //! create/delete, mkdir, file write/extend/truncate. Write semantics:
@@ -10,6 +10,12 @@
 //!   no cache, so a write is durable when the syscall returns.
 //! Only Fat32 ever calls storage::write_* — always from the single vfs
 //! task behind DISK: Mutex, so &mut self methods are race-free.
+//! M16 (v1.2): real long filenames (LFN). The display name rides in a
+//! checksum-validated UTF-16 entry chain physically above the short
+//! entry; 8.3-impossible names collapse to unique `SSSSSS~N` aliases,
+//! delete frees the whole set, and path lookups resolve by either name.
+//! This FS keeps an ASCII namespace: LFN's job here is case preservation
+//! plus names the short form can't spell (Documents, Recycle Bin, …).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -22,8 +28,18 @@ const EOC: u32 = 0x0FFF_FFFF;
 const FILE_MAX: usize = 1024 * 1024;
 /// Hard cap for one directory chain, matching the v1.0 scan cap.
 const DIR_MAX: usize = 64 * 1024;
+/// READ law (M19): .gle v2 containers live on the disk up to 8 MiB.
+/// Reads (read_file) may drill this deep; create/write/setsize stay
+/// under the FILE_MAX law — nothing else is allowed to grow.
+const FILE_READ_MAX: usize = 8 * 1024 * 1024;
+/// Longest FAT chain any code may follow: the read cap at the smallest
+/// legal cluster (1 sector/cluster = worst case), with a lane to spare.
+/// Guards every chain walk against a corrupt, looping FAT.
+const CHAIN_MAX: usize = FILE_READ_MAX / SECTOR + 2;
 /// Path depth cap (create/mkdir/delete): cheap loop guard.
 const DEPTH_MAX: usize = 16;
+/// LFN chain cap: 20 sets x 13 units = 255 chars, mirroring the spec cap.
+const LFN_MAX_SETS: usize = 20;
 
 /// Fixed creation/mod stamp: 2000-01-01 00:00 = (2000-1980)<<9 | 1<<5 | 1.
 const STAMP_DATE: u16 = 0x2821;
@@ -44,17 +60,6 @@ pub struct Fat32 {
     root_cluster: u32,
     /// First-fit resume cursor: next cluster to check for free space.
     scan_hint: u32,
-}
-
-/// A usable 32-byte slot inside a dir chain, from find_slot().
-struct DirSlot {
-    /// Byte offset of the slot inside the dir chain.
-    off: u64,
-    /// The slot was an end-of-directory 0x00 marker before we used it.
-    was_term: bool,
-    /// That marker was the LAST slot of the chain (we pre-extended the
-    /// chain so a fresh 0x00 terminator now sits at off + 32).
-    consumed_last: bool,
 }
 
 impl Fat32 {
@@ -171,14 +176,16 @@ impl Fat32 {
         None
     }
 
-    /// Free a whole chain (writes 0 over every entry). Bounded so a
-    /// corrupt (looping) FAT can't hang the disk; best-effort per entry.
+    /// Free a whole chain (writes 0 over every entry). Bounded by
+    /// CHAIN_MAX so a corrupt (looping) FAT can't hang the disk, and so
+    /// an 8 MiB read-law file frees fully, not partially.
+    /// Best-effort per entry.
     fn free_chain(&mut self, first: u32) {
         if first < 2 {
             return;
         }
         let mut c = first;
-        for _ in 0..(FILE_MAX / SECTOR + 2) {
+        for _ in 0..CHAIN_MAX {
             let next = match self.fat_entry(c) {
                 Some(n) => n,
                 None => return,
@@ -193,13 +200,15 @@ impl Fat32 {
 
     /// Collect up to `limit` cluster numbers of a chain. first < 2 = an
     /// empty (cluster-less) file: Some(empty). None = unreadable chain.
+    /// The walk itself stops at CHAIN_MAX (looping-FAT guard), which is
+    /// >= every caller's limit.
     fn chain_of(&self, first: u32, limit: usize) -> Option<Vec<u32>> {
         let mut out = Vec::new();
         if first < 2 {
             return Some(out);
         }
         let mut c = first;
-        for _ in 0..(FILE_MAX / SECTOR + 2) {
+        for _ in 0..CHAIN_MAX {
             if out.len() < limit {
                 out.push(c);
             } else {
@@ -414,6 +423,247 @@ impl Fat32 {
         raw_name == &have_base && raw_ext == &have_ext
     }
 
+    // ---------------- LFN (M16, v1.2): real names ----------------
+
+    /// FAT LFN checksum over the 11 short-name bytes (spec sum with
+    /// rotate-right accumulation).
+    fn lfn_checksum(name11: &[u8; 11]) -> u8 {
+        let mut c: u8 = 0;
+        for &b in name11 {
+            c = c.rotate_right(1).wrapping_add(b);
+        }
+        c
+    }
+
+    /// Decode the LFN set attached to the short entry at `o`. FAT spec
+    /// layout: the LFN slots sit physically above (lower offsets than)
+    /// the short entry, ordinals ASCENDING toward the short entry — the
+    /// slot directly above the short entry carries the HIGHEST ordinal
+    /// (unflagged), and walking further out the ordinals descend to 1,
+    /// which carries the 0x40 "first part" flag. Every slot carries this
+    /// name's checksum. ASCII-only decode; None on any inconsistency —
+    /// callers fall back to the short name.
+    fn lfn_of_slot(raw: &[u8], o: usize, name11: &[u8; 11]) -> Option<String> {
+        if o < 32 || raw.len() < o {
+            return None;
+        }
+        let chk = Self::lfn_checksum(name11);
+        let mut units = [0xFFFFu16; 13 * LFN_MAX_SETS];
+        let mut sets = 0usize;
+        let mut prev_ord = 0usize;
+        let mut p = o; // slot cursor directly above the last-walked entry
+        loop {
+            if p < 32 {
+                return None; // dir start reached: no flagged entry anywhere
+            }
+            let top = p - 32;
+            if top + 32 > raw.len() {
+                return None;
+            }
+            let e = &raw[top..p];
+            if e[11] != 0x0F || e[13] != chk {
+                return None;
+            }
+            if e[26..28] != [0x00, 0x00] {
+                return None; // LFN "first cluster" fields must be zero
+            }
+            let ord = (e[0] & 0x3F) as usize;
+            if ord == 0 || ord > LFN_MAX_SETS {
+                return None;
+            }
+            if sets > 0 && ord + 1 != prev_ord {
+                return None; // ordinals must descend by one as we walk out
+            }
+            // 13 UTF-16 units per set slice: 5 + 6 + 2.
+            let mut tmp = [0u16; 13];
+            let mut ui = 0usize;
+            for (r0, r1) in [(1usize, 11usize), (14usize, 26usize), (28usize, 32usize)] {
+                let mut b = r0;
+                while b + 2 <= r1 {
+                    tmp[ui] = u16::from_le_bytes([e[b], e[b + 1]]);
+                    ui += 1;
+                    b += 2;
+                }
+            }
+            units[13 * (ord - 1)..13 * ord].copy_from_slice(&tmp);
+            prev_ord = ord;
+            sets += 1;
+            if e[0] & 0x40 != 0 {
+                break; // flagged first part reached: the set is complete
+            }
+            p = top;
+        }
+        let mut out = String::new();
+        for &u in units.iter().take(13 * sets) {
+            if u == 0x0000 {
+                break;
+            }
+            if u > 0x7F {
+                return None;
+            }
+            out.push(u as u8 as char);
+        }
+        Some(out)
+    }
+
+    /// Does the entry set containing the short slot at `o` in `raw`
+    /// match `want`? LFN compare is ASCII case-folded (the single-writer
+    /// FS still displays the exact case); the fallback keeps the M14
+    /// case-insensitive 8.3 compare.
+    fn entry_matches(raw: &[u8], o: usize, want: &str) -> bool {
+        if o + 32 > raw.len() {
+            return false;
+        }
+        let mut name11 = [0u8; 11];
+        name11.copy_from_slice(&raw[o..o + 11]);
+        if let Some(lfn) = Self::lfn_of_slot(raw, o, &name11) {
+            if lfn.eq_ignore_ascii_case(want) {
+                return true;
+            }
+        }
+        let mut name = [0u8; 8];
+        let mut ext = [0u8; 3];
+        name.copy_from_slice(&raw[o..o + 8]);
+        ext.copy_from_slice(&raw[o + 8..o + 11]);
+        Self::name_eq(&name, &ext, want)
+    }
+
+    /// Uppercase display of an 11-byte short name (base[.ext]).
+    fn disp83(n: &[u8; 11]) -> String {
+        let base = core::str::from_utf8(&n[0..8]).unwrap_or("").trim_end();
+        let ext = core::str::from_utf8(&n[8..11]).unwrap_or("").trim_end();
+        if ext.is_empty() {
+            alloc::format!("{}", base)
+        } else {
+            alloc::format!("{}.{}", base, ext)
+        }
+    }
+
+    /// Is a LIVE entry in `dir` carrying this exact short name? An
+    /// unreadable dir counts as "busy" — refuse to alias into the dark.
+    fn short_in_use(&self, dir: u32, want: &[u8; 11]) -> bool {
+        let Some(raw) = self.dir_raw(dir) else {
+            return true;
+        };
+        for o in (0..raw.len()).step_by(32) {
+            if o + 32 > raw.len() {
+                break;
+            }
+            let e = &raw[o..o + 32];
+            if e[0] == 0x00 {
+                break;
+            }
+            if e[0] == 0xE5 || e[11] == 0x0F || e[11] & 0x08 != 0 {
+                continue;
+            }
+            if &e[0..11] == want {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resolve `name` to (short entry, LFN needed). Exact 8.3 names
+    /// whose typed case equals the short display keep the M14
+    /// LFN-less shape; anything else rides an LFN set (case change,
+    /// spaces, >8.3 forms) and collapses to a unique `SSSSSS~N` alias
+    /// when a plain short slot name is already taken.
+    fn short_alias(&mut self, dir: u32, name: &str) -> Option<([u8; 11], bool)> {
+        if let Some(n) = Self::to_83(name) {
+            if name == Self::disp83(&n) && !self.short_in_use(dir, &n) {
+                return Some((n, false));
+            }
+            if !self.short_in_use(dir, &n) {
+                return Some((n, true));
+            }
+        }
+        // Alias generation on the folded name: uppercase, illegal chars
+        // -> '_', first dot splits base/ext, base trimmed to 6 to make
+        // room for "~N"; N grows until the alias is free in the dir.
+        const SPECIAL: &[u8] = b"!#$%&()@^_`{}~'-";
+        let up: String = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+        let (base, ext) = match up.find('.') {
+            Some(i) => (&up[..i], &up[i + 1..]),
+            None => (&up[..], ""),
+        };
+        let fold = |s: &str, cap: usize| -> String {
+            s.chars()
+                .map(|c| {
+                    let b = c as u8;
+                    if c.is_ascii() && (c.is_ascii_alphanumeric() || SPECIAL.contains(&b)) {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(cap)
+                .collect()
+        };
+        let mut b = fold(base, 6);
+        if b.is_empty() {
+            b.push('_');
+        }
+        let e = fold(ext, 3);
+        for n in 1..10u8 {
+            let mut nm = [b' '; 11];
+            let alias = alloc::format!("{}~{}", b, n);
+            nm[..alias.len()].copy_from_slice(alias.as_bytes());
+            nm[8..8 + e.len()].copy_from_slice(e.as_bytes());
+            if !self.short_in_use(dir, &nm) {
+                return Some((nm, true));
+            }
+        }
+        None
+    }
+
+    /// One 32-byte LFN entry: `units` = 13 UTF-16 code units starting at
+    /// char offset 13*(ord & 0x3F - 1), terminated by 0x0000, padded
+    /// with 0xFFFF (the 0xFF prefill covers the padding; callers spell
+    /// out the terminator in `units`), type byte 0, checksum, and
+    /// first-cluster fields zeroed.
+    fn lfn_entry(units: [u16; 13], ord: u8, chk: u8) -> [u8; 32] {
+        let mut e = [0xFFu8; 32];
+        e[0] = ord;
+        e[11] = 0x0F;
+        e[12] = 0x00;
+        e[13] = chk;
+        e[26] = 0x00;
+        e[27] = 0x00;
+        let mut u = 0usize;
+        for (r0, r1) in [(1usize, 11usize), (14usize, 26usize), (28usize, 32usize)] {
+            let mut b = r0;
+            while b + 2 <= r1 {
+                e[b] = units[u] as u8;
+                e[b + 1] = (units[u] >> 8) as u8;
+                u += 1;
+                b += 2;
+            }
+        }
+        e
+    }
+
+    /// `name` -> LFN units terminated by 0x0000 (padded with 0xFFFF all
+    /// the way up: the terminator's trailing padding is explicit).
+    /// Non-ASCII names are refused — callers fall back to the short
+    /// form; the LFN cap mirrors the spec's 128-slot sanity.
+    fn lfn_units(name: &str) -> Option<Vec<u16>> {
+        if name.chars().count() > 13 * LFN_MAX_SETS - 1 {
+            return None;
+        }
+        let n = name.chars().count();
+        let mut u = alloc::vec![0xFFFFu16; n + 1];
+        for (i, c) in name.chars().enumerate() {
+            if c as u32 > 0x7F {
+                return None;
+            }
+            u[i] = c as u16;
+        }
+        u[n] = 0x0000;
+        Some(u)
+    }
+
+    // ---------------- dir walks ----------------
+
     /// Walk to a path with full bookkeeping: returns the cluster of the
     /// dir CONTAINING the final component (root's cluster for "/"), the
     /// entry when the final component exists, and the byte offset of its
@@ -424,8 +674,8 @@ impl Fat32 {
         &self,
         path: &str,
     ) -> Option<(u32, Option<(bool, u32, u32)>, Option<u64>)> {
-        let mut dir = self.root_cluster;
         let parts = Self::split(path);
+        let mut dir = self.root_cluster; // root pseudo-cluster
         if parts.is_empty() {
             return Some((dir, None, None)); // root itself
         }
@@ -443,30 +693,28 @@ impl Fat32 {
             let mut o = 0usize;
             let mut found: Option<(bool, u32, u32, u64)> = None;
             while o + 32 <= raw.len() {
-                let e = &raw[o..o + 32];
+                let so = o;
                 o += 32;
+                let e = &raw[so..o];
                 if e[0] == 0x00 {
                     break; // end of directory
                 }
                 if e[0] == 0xE5 || e[11] == 0x0F || e[11] & 0x08 != 0 {
-                    continue; // deleted / LFN / volume label
+                    continue; // deleted / LFN part / volume label
                 }
-                let mut name = [0u8; 8];
-                let mut ext = [0u8; 3];
-                name.copy_from_slice(&e[0..8]);
-                ext.copy_from_slice(&e[8..11]);
-                if &name == b".       " || &name == b"..      " {
+                if &e[0..8] == b".       " || &e[0..8] == b"..      " {
                     continue;
                 }
-                if Self::name_eq(&name, &ext, part) {
+                // LFN-aware: the display name riding above the slot
+                // matches first, the 8.3 short form second.
+                if Self::entry_matches(&raw, so, part) {
                     let hi = le16(e, 20) as u32;
                     let lo = le16(e, 26) as u32;
                     let first = (hi << 16) | lo;
                     let size = le32(e, 28);
                     // TRUE first cluster (0 = empty file), no .max() —
                     // write paths need the real value.
-                    found =
-                        Some((e[11] & 0x10 != 0, first, size, (o - 32) as u64));
+                    found = Some((e[11] & 0x10 != 0, first, size, so as u64));
                     break;
                 }
             }
@@ -528,59 +776,6 @@ impl Fat32 {
         Some(raw)
     }
 
-    /// Find a usable 32-byte slot for a NEW entry in `dir`, maintaining
-    /// the FAT end-of-directory marker: remaining_free = internal/ext
-    /// slots first (E5 without ceremony), else the 0x00 terminator slot;
-    /// when everything is live or the terminator sat at the very end of
-    /// the chain, a fresh zeroed cluster is appended (its slot 0 becomes
-    /// the new marker). None = dir unreadable/full or disk error.
-    fn dir_slot(&mut self, dir: u32) -> Option<DirSlot> {
-        let raw = self.dir_raw(dir)?;
-        let n = raw.len();
-        let mut o = 0usize;
-        while o + 32 <= n {
-            let b0 = raw[o];
-            if b0 == 0x00 {
-                if o + 32 == n {
-                    // We want the terminator itself as our entry, but
-                    // there is no next slot to carry the new marker —
-                    // extend first, then use this slot.
-                    if self.dir_extend(dir).is_none() {
-                        return None;
-                    }
-                    return Some(DirSlot {
-                        off: o as u64,
-                        was_term: true,
-                        consumed_last: true,
-                    });
-                }
-                return Some(DirSlot {
-                    off: o as u64,
-                    was_term: true,
-                    consumed_last: false,
-                });
-            }
-            if b0 == 0xE5 {
-                return Some(DirSlot {
-                    off: o as u64,
-                    was_term: false,
-                    consumed_last: false,
-                });
-            }
-            o += 32;
-        }
-        // Every slot is live: append a cluster; its first slot (byte n)
-        // is zeroed (new terminator) and becomes the entry slot.
-        if self.dir_extend(dir).is_none() {
-            return None;
-        }
-        Some(DirSlot {
-            off: n as u64,
-            was_term: false,
-            consumed_last: false,
-        })
-    }
-
     /// Append one zeroed cluster to a dir chain, linking the previous
     /// last cluster to it. Returns the new chain length.
     fn dir_extend(&mut self, dir: u32) -> Option<u64> {
@@ -600,6 +795,214 @@ impl Fat32 {
             return None;
         }
         Some(raw_len + self.cluster_bytes() as u64)
+    }
+
+    // ---------------- slot reservation (dir runs) ----------------
+
+    /// Reserve `n` physically consecutive slots in `dir` (a short entry
+    /// plus, optionally, its LFN set above it). Free capacity: 0xE5
+    /// chains, and end-of-directory 0x00 zones whose whole run to the
+    /// chain end is free. When no single free run fits, fresh clusters
+    /// are appended (each supplies capacity/32 slots). Returns the byte
+    /// offsets to write, plus the marker that must be re-established
+    /// afterwards (Some(off) when a consumed run swallowed a 0x00).
+    fn dir_run(&mut self, dir: u32, n: usize) -> Option<(Vec<u64>, Option<u64>)> {
+        if n == 0 {
+            return None;
+        }
+        for _lap in 0..16 {
+            let raw = self.dir_raw(dir)?;
+            let slots = raw.len() / 32;
+            // Maximal free runs: (first slot, length, tail-touches-00).
+            let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+            let mut cur: Option<usize> = None;
+            for i in 0..slots {
+                let b0 = raw[i * 32];
+                let free = b0 == 0x00 || b0 == 0xE5;
+                match (cur, free) {
+                    (None, true) => cur = Some(i),
+                    (Some(_), false) => {
+                        let rs = cur.take().unwrap();
+                        runs.push((rs, i - rs, false));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(rs) = cur {
+                runs.push((rs, slots - rs, true));
+            }
+            for (rs, rl, _tail) in &runs {
+                if *rl < n {
+                    continue;
+                }
+                let offs: Vec<u64> = (*rs as u64..(*rs + n) as u64)
+                    .map(|s| s * 32)
+                    .collect();
+                // Marker work only if the run consumed a 0x00 slot.
+                let mut t: Option<usize> = None;
+                for j in *rs..*rs + *rl {
+                    if raw[j * 32] == 0x00 {
+                        t = Some(j);
+                        break;
+                    }
+                }
+                let marker = match t {
+                    Some(t) if t < *rs + n => Some(((*rs + n) as u64) * 32),
+                    _ => None,
+                };
+                return Some((offs, marker));
+            }
+            // No run fits: extend the dir chain by one cluster (fresh
+            // zero capacity at the end) and retry.
+            if self.dir_extend(dir).is_none() {
+                return None;
+            }
+        }
+        None // dir chain grew past the ops cap — full or broken
+    }
+
+    /// Re-establish the end-of-directory marker one slot past `off`,
+    /// extending the chain first when the raw ends at `off`.
+    fn dir_run_marker(&mut self, dir: u32, off: u64) -> bool {
+        let len = match self.dir_raw(dir) {
+            Some(r) => r.len() as u64,
+            None => return false,
+        };
+        if off + 32 > len && self.dir_extend(dir).is_none() {
+            return false;
+        }
+        self.write_term_at(dir, off)
+    }
+
+    /// Write a full entry set into a dir_run's offsets: LFN parts
+    /// (highest ordinal first, physically above the short entry at the
+    /// LAST offset) then the short entry. On failure, every touched slot
+    /// becomes 0xE5 (best-effort undo; re-format repairs the rest).
+    fn write_entry_set(
+        &mut self,
+        dir: u32,
+        offs: &[u64],
+        short: &[u8; 11],
+        lfn_name: Option<&str>,
+        attr: u8,
+        first: u32,
+    ) -> bool {
+        let mut written: Vec<u64> = Vec::new();
+        let mut lfn_parts: Vec<[u8; 32]> = Vec::new();
+        if let Some(lname) = lfn_name {
+            let Some(units) = Self::lfn_units(lname) else {
+                return false;
+            };
+            let k = lname.chars().count().div_ceil(13);
+            if k + 1 != offs.len() || k == 0 {
+                return false; // run sized wrong for this name
+            }
+            let chk = Self::lfn_checksum(short);
+            for set in 0..k {
+                // Spec ordinals: ord 1 = the FIRST characters, at the
+                // top of the run (lowest offset) with the 0x40
+                // "first part" flag; plain ord k sits right above the
+                // short entry. Set `s` holds chars [13s .. 13s+13).
+                let ord = (set + 1) as u8;
+                let flag: u8 = if set == 0 { 0x40 } else { 0x00 };
+                let mut chunk = [0xFFFFu16; 13];
+                for j in 0..13 {
+                    let src = set * 13 + j;
+                    if src < units.len() {
+                        chunk[j] = units[src];
+                    }
+                }
+                lfn_parts.push(Self::lfn_entry(chunk, flag | ord, chk));
+            }
+        } else if offs.len() != 1 {
+            return false;
+        }
+        for (i, ent) in lfn_parts.iter().enumerate() {
+            if !self.write_entry_at(dir, offs[i], ent) {
+                self.undo_set(dir, offs, written.len());
+                return false;
+            }
+            written.push(offs[i]);
+        }
+        let tail = Self::dir_entry(short, attr, first);
+        let last = offs.len() - 1;
+        if !self.write_entry_at(dir, offs[last], &tail) {
+            self.undo_set(dir, offs, written.len());
+            return false;
+        }
+        written.push(offs[last]);
+        true
+    }
+
+    /// Best-effort: mark the first `upto` offsets of a reserved run as
+    /// deleted (0xE5) after a failed write_entry_set.
+    fn undo_set(&mut self, dir: u32, offs: &[u64], upto: usize) {
+        for &o in offs.iter().take(upto) {
+            let _ = self.write_e5(dir, o);
+        }
+    }
+
+    /// The raw 32 bytes of the entry at chain offset `off` (the delete
+    /// path reads the short name back to locate its LFN set).
+    fn entry_at(&self, dir: u32, off: u64) -> Option<[u8; 32]> {
+        let chain = self.chain_of(dir, DIR_MAX / 32 + 2)?;
+        let lba = self.chain_pos_lba(&chain, off)?;
+        let o = (off % SECTOR as u64) as usize;
+        let mut s = [0u8; SECTOR];
+        if !self.read_sector(lba, &mut s) {
+            return None;
+        }
+        let mut e = [0u8; 32];
+        e.copy_from_slice(&s[o..o + 32]);
+        Some(e)
+    }
+
+    /// Mark the entry set (short + attached LFN chain) deleted: E5 in
+    /// each touched slot, scanning straight up from the slot while the
+    /// checksum matches so the allocator keeps seeing plain-free E5 runs
+    /// (stale LFN parts would otherwise wedge union scanning).
+    fn del_set(&mut self, dir: u32, off: u64) -> bool {
+        let e = match self.entry_at(dir, off) {
+            Some(e) => e,
+            None => return false,
+        };
+        if e[11] == 0x0F || e[11] & 0x08 != 0 || e[0] == 0xE5 || e[0] == 0x00 {
+            return false; // not a live short entry
+        }
+        let mut name11 = [0u8; 11];
+        name11.copy_from_slice(&e[0..11]);
+        let chk = Self::lfn_checksum(&name11);
+        let mut top: Option<u64> = None;
+        let mut p = off;
+        for _ in 0..LFN_MAX_SETS {
+            if p < 32 {
+                break;
+            }
+            let raw = match self.dir_raw(dir) {
+                Some(r) => r,
+                None => break,
+            };
+            let top_off = (p - 32) as usize;
+            if top_off + 32 > raw.len() {
+                break;
+            }
+            let up = &raw[top_off..top_off + 32];
+            // Any checksum-matched LFN slot belongs to this set (the
+            // set's ordinals descend walking out; the 0x40 flag on ord 1
+            // is not required per-slot).
+            if up[11] != 0x0F || up[13] != chk {
+                break;
+            }
+            top = Some(p - 32);
+            p -= 32;
+        }
+        if let Some(t) = top {
+            let sets = ((off - t) / 32) as usize;
+            for i in 0..sets {
+                let _ = self.write_e5(dir, t + (i as u64) * 32);
+            }
+        }
+        self.write_e5(dir, off)
     }
 
     /// After using a 0x00-terminator slot that had successors, restore
@@ -721,14 +1124,24 @@ impl Fat32 {
 
     // ---------------- read API (v0.x contract, unchanged) ----------------
 
+    /// Kind + byte size of the entry at `path`: (is_dir, size). None =
+    /// missing / unreachable.
+    pub fn entry_info(&self, path: &str) -> Option<(bool, u64)> {
+        let (_, ent, _) = self.locate(path)?;
+        let (is_dir, _first, size) = ent?;
+        Some((is_dir, size as u64))
+    }
+
     /// Read a whole file (cap 1 MiB).
+    /// Read a whole file. The cap is the READ law (M19): v2 .gle
+    /// containers reach 8 MiB on the disk while writes stay at FILE_MAX.
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         let (_, ent, _) = self.locate(path)?;
         let (is_dir, first, size) = ent?;
         if is_dir {
             return None;
         }
-        if size as usize > FILE_MAX {
+        if size as usize > FILE_READ_MAX {
             return None;
         }
         if size == 0 {
@@ -739,7 +1152,8 @@ impl Fat32 {
         Some(data)
     }
 
-    /// List a directory: names (dirs suffixed '/').
+    /// List a directory: display names (LFN when it decodes, else the
+    /// uppercased short form), dirs suffixed '/'.
     pub fn list_dir(&self, path: &str) -> Option<Vec<String>> {
         let (_, ent, _) = self.locate(path)?;
         let start = match ent {
@@ -754,8 +1168,9 @@ impl Fat32 {
         let mut out = Vec::new();
         let mut o = 0usize;
         while o + 32 <= raw.len() {
-            let e = &raw[o..o + 32];
+            let so = o;
             o += 32;
+            let e = &raw[so..o];
             if e[0] == 0x00 {
                 break;
             }
@@ -767,20 +1182,85 @@ impl Fat32 {
             if base == "." || base == ".." || base.is_empty() {
                 continue;
             }
-            let mut name = String::from(base);
-            if !ext.is_empty() {
-                name.push('.');
-                name.push_str(ext);
-            }
+            // Display name: the LFN set's truth when it decodes, else
+            // the uppercase short form.
+            let mut name_buf = [0u8; 11];
+            name_buf[..8].copy_from_slice(&e[0..8]);
+            name_buf[8..].copy_from_slice(&e[8..11]);
+            let name: String = match Self::lfn_of_slot(&raw, so, &name_buf) {
+                Some(l) => l,
+                None => {
+                    let mut n = String::from(base);
+                    if !ext.is_empty() {
+                        n.push('.');
+                        n.push_str(ext);
+                    }
+                    n
+                }
+            };
             if e[11] & 0x10 != 0 {
-                name.push('/');
+                out.push(alloc::format!("{}/", name));
+            } else {
+                out.push(name);
             }
-            out.push(name);
         }
         Some(out)
     }
 
-    // ---------------- write API (M14, v1.1) ----------------
+    /// List a directory with kinds + sizes: (display name, is_dir, size).
+    /// Sizes: files carry their byte count, dirs report 0. Names follow
+    /// the list_dir display rules WITHOUT the '/' suffix (the Files
+    /// window wants kind + size columns, not line sugar).
+    pub fn list_detail(&self, path: &str) -> Option<Vec<(String, bool, u64)>> {
+        let (_, ent, _) = self.locate(path)?;
+        let start = match ent {
+            Some((true, first, _)) => first,
+            Some((false, _, _)) => return None,
+            None => self.root_cluster,
+        };
+        if start < 2 {
+            return Some(Vec::new());
+        }
+        let raw = self.read_chain(start, DIR_MAX)?;
+        let mut out = Vec::new();
+        let mut o = 0usize;
+        while o + 32 <= raw.len() {
+            let so = o;
+            o += 32;
+            let e = &raw[so..o];
+            if e[0] == 0x00 {
+                break;
+            }
+            if e[0] == 0xE5 || e[11] == 0x0F || e[11] & 0x08 != 0 {
+                continue;
+            }
+            let base = core::str::from_utf8(&e[0..8]).unwrap_or("").trim_end();
+            let ext = core::str::from_utf8(&e[8..11]).unwrap_or("").trim_end();
+            if base == "." || base == ".." || base.is_empty() {
+                continue;
+            }
+            let mut name_buf = [0u8; 11];
+            name_buf[..8].copy_from_slice(&e[0..8]);
+            name_buf[8..].copy_from_slice(&e[8..11]);
+            let name: String = match Self::lfn_of_slot(&raw, so, &name_buf) {
+                Some(l) => l,
+                None => {
+                    let mut n = String::from(base);
+                    if !ext.is_empty() {
+                        n.push('.');
+                        n.push_str(ext);
+                    }
+                    n
+                }
+            };
+            let is_dir = e[11] & 0x10 != 0;
+            let size = if is_dir { 0 } else { le32(e, 28) as u64 };
+            out.push((name, is_dir, size));
+        }
+        Some(out)
+    }
+
+    // ---------------- write API (M14, v1.1; M16 LFN) ----------------
 
     /// Create an empty file. False if it exists / parent missing /
     /// name un-representable / disk full or erroring.
@@ -796,21 +1276,23 @@ impl Fat32 {
         if let Some((_, Some(_), _)) = self.locate(path) {
             return false; // already there
         }
-        let name11 = match Self::to_83(name) {
-            Some(n) => n,
+        let (short, need_lfn) = match self.short_alias(pdir, name) {
+            Some(x) => x,
             None => return false,
         };
-        let slot = match self.dir_slot(pdir) {
-            Some(s) => s,
-            None => return false,
+        let k = if need_lfn {
+            name.chars().count().div_ceil(13)
+        } else {
+            0
         };
-        let ent = Self::dir_entry(&name11, 0x20, 0); // archive, no cluster
-        if !self.write_entry_at(pdir, slot.off, &ent) {
+        let Some((offs, marker)) = self.dir_run(pdir, k + 1) else {
+            return false;
+        };
+        if !self.write_entry_set(pdir, &offs, &short, need_lfn.then_some(name), 0x20, 0) {
             return false;
         }
-        if slot.was_term && !slot.consumed_last {
-            // Restore the end-of-directory marker one slot later.
-            if !self.write_term_at(pdir, slot.off + 32) {
+        if let Some(m) = marker {
+            if !self.dir_run_marker(pdir, m) {
                 return false;
             }
         }
@@ -833,17 +1315,21 @@ impl Fat32 {
         if let Some((_, Some(_), _)) = self.locate(path) {
             return false;
         }
-        let name11 = match Self::to_83(name) {
-            Some(n) => n,
+        let (short, need_lfn) = match self.short_alias(pdir, name) {
+            Some(x) => x,
             None => return false,
         };
-        let slot = match self.dir_slot(pdir) {
-            Some(s) => s,
-            None => return false,
+        let k = if need_lfn {
+            name.chars().count().div_ceil(13)
+        } else {
+            0
         };
-        let nc = match self.alloc_one() {
-            Some(c) => c,
-            None => return false,
+        let Some((offs, marker)) = self.dir_run(pdir, k + 1) else {
+            return false;
+        };
+        let Some(nc) = self.alloc_one() else {
+            self.undo_set(pdir, &offs, offs.len());
+            return false;
         };
         // '.' -> self, '..' -> parent (0 = root parent). Literals are the
         // full 11 short-name bytes (8 base + 3 space-padded ext).
@@ -869,28 +1355,33 @@ impl Fat32 {
                 }
             }
         }
-        if !self.write_entry_at(
-            pdir,
-            slot.off,
-            &Self::dir_entry(&name11, 0x10, nc),
-        ) {
-            ok = false;
+        if ok {
+            ok = self.write_entry_set(
+                pdir,
+                &offs,
+                &short,
+                need_lfn.then_some(name),
+                0x10,
+                nc,
+            );
         }
-        if ok && slot.was_term && !slot.consumed_last {
-            ok = self.write_term_at(pdir, slot.off + 32);
+        if ok && marker.is_some() {
+            ok = self.dir_run_marker(pdir, marker.unwrap());
         }
         if !ok {
             // Try to undo: drop the new dir cluster and mark the entry
-            // deleted (best-effort; leakers are reparable by re-format).
+            // set deleted (best-effort; leakers are reparable by
+            // re-format).
             let _ = self.free_chain(nc);
-            let _ = self.patch_entry(pdir, slot.off, Some(0), Some(0));
-            let _ = self.write_e5(pdir, slot.off);
+            self.undo_set(pdir, &offs, offs.len());
             return false;
         }
         true
     }
 
     /// Delete a file, or a directory when it is empty. Root can't go.
+    /// Long names: frees the whole LFN set (the allocator expects plain
+    /// 0xE5 runs above the short slot).
     pub fn delete(&mut self, path: &str) -> bool {
         let (dir, ent, slot) = match self.locate(path) {
             Some(x) => x,
@@ -910,7 +1401,7 @@ impl Fat32 {
         if first >= 2 {
             self.free_chain(first);
         }
-        self.write_e5(dir, slot)
+        self.del_set(dir, slot)
     }
 
     /// Mark an entry deleted: E5 in the slot's first byte (the rest of

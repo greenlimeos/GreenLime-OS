@@ -47,9 +47,9 @@ pub const NET_CONNECT: u32 = 0x0106;
 /// streams by looping). The broker drains a full tx buffer via polls
 /// (bounded) rather than failing on backpressure. arg0 = bytes accepted.
 pub const NET_SEND: u32 = 0x0107;
-/// Stream recv: handle arg0. Replies NET_REPLY with payload = up to 240 B
-/// and arg0 = byte count (one code path with the drain loop). Held by the
-/// broker until data arrives; when the peer closed and the buffer drained,
+/// Stream recv: handle arg0. Replies NET_REPLY with payload = up to
+/// MAX_PAYLOAD (2048 B since v6) and arg0 = byte count (one code path with
+/// the drain loop). Held by the broker until data arrives; when the peer closed and the buffer drained,
 /// replies kind NET_EOF (arg0 = 0) — stream end, not an error. One pending
 /// recv per handle; a second before completion is rejected.
 pub const NET_RECV: u32 = 0x0108;

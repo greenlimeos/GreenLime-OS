@@ -1,0 +1,66 @@
+# greenlime-tls (M20) — the TLS 1.3 lane the shell's `fetch https://*`
+# runs on. Two halves live here:
+#
+#   1. the cryptography provider — vendored from RustCrypto's
+#      rustls-rustcrypto (github.com/RustCrypto/rustls-rustcrypto @
+#      master, Oct 2026; MIT OR Apache-2.0 — both licenses vendored
+#      alongside) and adapted for GreenLime: `getrandom` (Linux syscalls
+#      behind our syscall gate = instant wedge) is removed and every
+#      entropy draw goes to the kernel ChaCha8 DRBG through
+#      `Syscall::Rand`, and the wall clock for certificate validation
+#      comes from `Syscall::Now` (CMOS boot epoch + uptime).
+#   2. the fetch machinery (`fetch`) — URL parsing, the net-broker TCP
+#      wire, the rustls ClientConnection drive loop, and plain HTTP/1.1.
+#
+# Build law: no_std + alloc only (the wall clock is kernel-supplied, so
+# rustls' std clock never exists here). TLS 1.3 ONLY: the `tls12` feature
+# is never declared, so that code never compiles — smaller, and one whole
+# downgrade-attack surface just isn't there. Certificate validation is
+# REAL: webpki + the Mozilla root store (webpki-roots), no noop verifier.
+[package]
+name = "greenlime-tls"
+version = "0.1.0"
+edition = "2021"
+description = "GreenLime OS TLS 1.3 client: vendored RustCrypto provider + fetching"
+
+[dependencies]
+greenlime-abi = { workspace = true }
+webpki-roots = { version = "1", default-features = false }
+
+# ---- vendored provider dependencies (mirrors rustls-rustcrypto master,
+# with getrandom removed and rand_core declared directly) ----
+aead = { version = "0.6", default-features = false }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false }
+crypto-common = { version = "0.2", default-features = false }
+der = { version = "0.8", default-features = false }
+digest = { version = "0.11", default-features = false }
+ecdsa = { version = "0.17", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["pkcs8"] }
+hmac = { version = "0.13", default-features = false }
+p256 = { version = "0.14", default-features = false, features = ["pem", "ecdsa", "ecdh"] }
+p384 = { version = "0.14", default-features = false, features = ["pem", "ecdsa", "ecdh"] }
+paste = { version = "1", default-features = false }
+pkcs8 = { version = "0.11", default-features = false }
+pki-types = { package = "rustls-pki-types", version = "1", default-features = false }
+rand-core = { package = "rand_core", version = "0.10", default-features = false }
+rsa = { version = "0.10.0-rc.18", default-features = false, features = ["sha2", "encoding"] }
+rustls = { version = "0.23", default-features = false }
+sec1 = { version = "0.8", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+signature = { version = "3", default-features = false }
+x25519-dalek = { version = "3", default-features = false }
+
+[features]
+# alloc always on (rustls does not support alloc-less environments); std
+# is intentionally undeclared — its cfg-gated code stays out.
+# The flag doubles as our own `#[cfg(feature = "alloc")]` switch, since
+# it also switches the external crates' alloc features on.
+default = ["alloc", "zeroize"]
+alloc = ["pki-types/alloc", "aead/alloc", "ed25519-dalek/alloc"]
+zeroize = ["ed25519-dalek/zeroize", "x25519-dalek/zeroize"]
+# tls12 stays OFF by the build law (one whole downgrade-attack surface
+# does not compile in). Declared empty only so rustc's check-cfg stops
+# flagging the vendored cfg sites; if anyone enables it, the TLS 1.2
+# vendored blocks fail loudly against rustls without the tls12 feature.
+tls12 = []

@@ -55,7 +55,6 @@ use spin::Mutex;
 use crate::arch::x86_64::idt;
 use crate::arch::x86_64::simd;
 use crate::drivers::{fb, input, virtio_input};
-use crate::servers::vfs;
 use crate::{ipc, kprintln, sched};
 
 const FONT_PX: f32 = 16.0;
@@ -87,19 +86,12 @@ const SEARCH_BG: Rgb = Rgb(44, 46, 52); // search field fill
 const HOVER: Rgb = Rgb(58, 61, 68); // hover lift on dark surfaces
 const ACTIVE: Rgb = Rgb(48, 50, 58); // pressed / open state fill
 const HAIRLINE: Rgb = Rgb(56, 58, 66); // taskbar top line + separators
+const F_SIDEBAR: Rgb = Rgb(38, 38, 42); // Files places-card fill (M16)
 // Brand + app icon colors.
 const LIME: Rgb = Rgb(170, 232, 64); // brand accent: start logo + focus bar
 const UND_SOFT: Rgb = Rgb(146, 150, 158); // running (unfocused) underline
-const BLUE: Rgb = Rgb(76, 148, 244); // Files folder back panel
-const BLUE_HI: Rgb = Rgb(122, 180, 250); // folder front sheet
-const BALL_RED: Rgb = Rgb(225, 74, 58); // browser ball wedges
-const BALL_GRN: Rgb = Rgb(52, 168, 83);
-const BALL_YEL: Rgb = Rgb(244, 180, 6);
-const BALL_BLU: Rgb = Rgb(66, 133, 244);
-const BALL_WHITE: Rgb = Rgb(238, 240, 246);
-const GEAR: Rgb = Rgb(158, 163, 172); // settings gear
-const TERM_SQ: Rgb = Rgb(56, 58, 64); // terminal tile square
-const FOOT_FG: Rgb = Rgb(176, 180, 188); // search / power strokes
+const BLUE_HI: Rgb = Rgb(122, 180, 250); // client chip azure strip
+const FOOT_FG: Rgb = Rgb(176, 180, 188); // search glass stroke
 const AVATAR_INK: Rgb = Rgb(30, 36, 18); // avatar initial on lime
 
 /// Glass strengths (Q8 alpha).
@@ -140,6 +132,33 @@ const MENU_H: u32 = 300;
 const MENU_GAP: u32 = 12; // air between the card and the bar
 const TILE_W: u32 = 126;
 const TILE_H: u32 = 100;
+
+// Files window v2 geometry (M16): sidebar + breadcrumb + icon grid.
+const FILES_W: u32 = 720; // default Files window width
+const FILES_H: u32 = 540; // default Files window height
+const F_SIDE_W: u32 = 152; // places sidebar width
+const F_BREAD_H: u32 = 40; // breadcrumb strip height
+const F_FOOT_H: u32 = 30; // status strip height
+const F_CELL_W: u32 = 86; // grid cell (margins included)
+const F_CELL_H: u32 = 84;
+const F_ROW_H: u32 = 36; // sidebar place row pitch
+/// VFS paths mirrored by the places sidebar; index matches PLACES order
+/// in vfs.rs (Desktop, Documents, Downloads, Recycle Bin).
+const F_PLACE_PATHS: [&str; 4] = [
+    "/disk/Desktop",
+    "/disk/Documents",
+    "/disk/Downloads",
+    "/disk/Recycle Bin",
+];
+/// Files' selection wash: brand lime at Q8 alpha (selection must read
+/// as "lime at rest" — exact-color counts in qmp_files_test).
+const F_SELECT_A: u32 = 56;
+
+/// Right-click context menu (M18): two items, one row each.
+const CTX_W: u32 = 168;
+const CTX_ITEM_H: u32 = 30;
+const CTX_ITEMS: usize = 2;
+const CTX_H: u32 = CTX_ITEM_H * CTX_ITEMS as u32 + 6;
 
 const SCROLLBACK: usize = 200;
 const CUR_W: u32 = 12;
@@ -249,6 +268,33 @@ fn point_in(x: u32, y: u32, r: Rect) -> bool {
     x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
 }
 
+/// ACPI S5 poweroff, QEMU-flavored: PM1a control lives at I/O 0x604 on
+/// q35 (0xB004 on the i440fx machine); QEMU's fixed S5 mapping fires on
+/// a plain SLP_EN write. The first accepted write ends the QEMU
+/// process; if neither lands, we coast to hlt and the OS stays alive —
+/// never a wedge, always logged.
+fn acpi_poweroff() -> ! {
+    unsafe {
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") 0x604_u16,
+            in("ax") 0x2000_u16,
+            options(nostack, nomem)
+        );
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") 0xB004_u16,
+            in("ax") 0x2000_u16,
+            options(nostack, nomem)
+        );
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags))
+        };
+    }
+}
+
 /// Start menu pinned apps (tile grid + search filter over the same list).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum App {
@@ -287,6 +333,33 @@ fn name_matches(name: &str, q: &[u8]) -> bool {
     }
     b.windows(q.len())
         .any(|w| w.iter().map(|c| c.to_ascii_lowercase()).eq(q.iter().copied()))
+}
+
+/// Right-click popup zones (M18): over the Files window body, or the
+/// bare desktop. A live non-Files window eats the right-click silently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtxKind {
+    Desktop,
+    Files,
+}
+
+impl CtxKind {
+    /// Item labels — the popup hit-test lives in the SAME geometry
+    /// draw_ctx paints (row i at y = m.y + i * CTX_ITEM_H).
+    fn items(self) -> [&'static str; CTX_ITEMS] {
+        match self {
+            CtxKind::Desktop => ["New text file", "Refresh"],
+            CtxKind::Files => ["New text file", "Refresh"],
+        }
+    }
+}
+
+/// One popup instance: anchor top-left (already clamped on-screen).
+#[derive(Clone, Copy)]
+struct CtxMenu {
+    kind: CtxKind,
+    x: u32,
+    y: u32,
 }
 
 /// One window's geometry + state. Z-order = position in WinSrv::windows.
@@ -426,6 +499,18 @@ struct WinSrv {
     next_id: u32,
     /// Double-click detector: last titlebar click (window id, tick).
     last_click: Option<(u32, u64)>,
+    // Files explorer state (M16, system window FILES_ID).
+    /// Browsed path (absolute, no trailing slash; "/" = ramfs root).
+    fpath: String,
+    /// Listing cache for the current path (name, is_dir, size) —
+    /// computed on every browse, so painting stays VFS-free per lap.
+    fview: Vec<(String, bool, u64)>,
+    /// Selected display name in the grid.
+    fsel: Option<String>,
+    /// Double-click detector: last clicked grid cell (cell idx, tick).
+    fclick: Option<(usize, u64)>,
+    /// Open right-click popup (M18). Left-click routes into it FIRST.
+    ctx: Option<CtxMenu>,
     /// M15 canvas budget: total canvas pixels live across all windows
     /// (each pixel = one xrgb u32 from the 16 MiB kernel heap — 4 MiB of
     /// back buffer + 4 MiB cached wallpaper already live there).
@@ -489,6 +574,11 @@ impl WinSrv {
             e0: false,
             next_id: 2, // 0/1 are system windows (terminal, Files); first client = id 2 (contract)
             last_click: None,
+            fpath: String::from("/"),
+            fview: alloc::vec![],
+            fsel: None,
+            fclick: None,
+            ctx: None,
             canvas_used: 0,
         };
         srv.line_h = srv.font.line_height(FONT_PX);
@@ -559,6 +649,9 @@ impl WinSrv {
             mx,
             my,
             next_id,
+            fpath,
+            fsel,
+            fview,
             ..
         } = self;
         let wall: &[u32] = wallpaper;
@@ -584,7 +677,19 @@ impl WinSrv {
             }
             let p = anim_p(now, w.born);
             window_shadow(back, wall, r, w.rect(), p);
-            draw_window(back, font, wall, w, *focus, r, *line_h, *mx, *my, now);
+            draw_window(
+                back,
+                font,
+                wall,
+                w,
+                *focus,
+                r,
+                *line_h,
+                *mx,
+                *my,
+                now,
+                (&*fpath, (*fsel).as_deref(), &**fview),
+            );
         }
         // 3. Taskbar: full-width acrylic bar — centered cluster + tray.
         let strip = strip_rect(sw, sh);
@@ -623,6 +728,19 @@ impl WinSrv {
                     *my,
                 );
             }
+        }
+        // 5. Right-click popup (M18): above card + windows, under cursor.
+        if let Some(m) = self.ctx {
+            draw_ctx(
+                back,
+                font,
+                wall,
+                r,
+                (m.x, m.y, CTX_W, CTX_H),
+                m.kind,
+                *mx,
+                *my,
+            );
         }
     }
 
@@ -896,7 +1014,12 @@ impl WinSrv {
         }
         let pressed = btn & 1 != 0;
         let was = self.prev_btn & 1 != 0;
-        self.prev_btn = btn & 1;
+        // Right button: the tablet driver already sets bit 1 on
+        // BTN_RIGHT. Only the DOWN edge fires (a held right button must
+        // not re-open a menu on every move report).
+        let rnow = btn & 2 != 0;
+        let rwas = self.prev_btn & 2 != 0;
+        self.prev_btn = btn;
         if pressed && !was {
             self.click(x, y);
         } else if pressed && moved {
@@ -904,6 +1027,9 @@ impl WinSrv {
         }
         if !pressed && was {
             self.drag_end();
+        }
+        if rnow && !rwas {
+            self.rclick(x, y);
         }
     }
 
@@ -984,6 +1110,19 @@ impl WinSrv {
     /// Left-click edge handling. Coordinates in screen pixels.
     fn click(&mut self, x: u32, y: u32) {
         let (sw, sh) = (self.fb.width, self.fb.height);
+        // Right-click popup routes FIRST: an item click runs it; a click
+        // anywhere else just dismisses it (consumed — the OS convention:
+        // outside-click closes, never clicks through).
+        if let Some(m) = self.ctx {
+            let mr = (m.x, m.y, CTX_W, CTX_H);
+            let CtxMenu { kind, y: my0, .. } = m;
+            self.ctx = None;
+            self.invalidate(pad(mr));
+            if point_in(x, y, mr) {
+                self.ctx_act(kind, ((y - my0) / CTX_ITEM_H) as usize);
+            }
+            return;
+        }
         // Taskbar usable with the start card open too. Clicks on the bar
         // but off a button are dead space: close the card.
         if y >= sh - TASKBAR_H {
@@ -1020,8 +1159,12 @@ impl WinSrv {
             }
             // Footer: power button (right), user chip is inert.
             if point_in(x, y, power_rect(sw, sh)) {
-                kprintln!("[winsrv] power");
-                return;
+                // (M18.1 user ask) This was a bare print — the button
+                // never did anything. Now it really powers off: the
+                // proof line runs, then the PM1a write ends QEMU.
+                self.start_open = false;
+                kprintln!("[winsrv] shutdown");
+                acpi_poweroff();
             }
             if point_in(x, y, (mx0, my0, mw, mh)) {
                 return; // inside card: keep it open
@@ -1093,12 +1236,90 @@ impl WinSrv {
                     resize: false,
                 });
             } else if id == FILES_ID {
-                // Files body: click a directory line to navigate into it.
-                self.files_click(id, y);
+                // Files body: geometry hit test (M16 explorer).
+                self.files_click(id, x, y);
             }
             return;
         }
         // Desktop click: nothing.
+    }
+
+    /// Right-click popup (M18). Zone law: the Files window BODY wins;
+    /// a live non-Files window eats the click silently (no menus over
+    /// app windows yet); bare desktop gets the desktop menu.
+    fn rclick(&mut self, x: u32, y: u32) {
+        let (sw, sh) = (self.fb.width, self.fb.height);
+        if y >= sh - TASKBAR_H {
+            return; // the bar is reserved space: no menus down there
+        }
+        if self.start_open {
+            self.close_start(); // the card yields to a popup
+        }
+        let mut kind = CtxKind::Desktop;
+        for w in self.windows.iter().rev() {
+            if x >= w.x && x < w.x + w.w && y >= w.y && y < w.y + w.h {
+                if w.id != FILES_ID {
+                    return;
+                }
+                kind = CtxKind::Files;
+                break;
+            }
+        }
+        // Anchor clamp: fully on-screen, never under the taskbar.
+        let ax = x.min(sw.saturating_sub(CTX_W + 2));
+        let ay = y.min(sh.saturating_sub(TASKBAR_H + CTX_H + 2));
+        let old = self.ctx.map(|m| (m.x, m.y, CTX_W, CTX_H));
+        self.ctx = Some(CtxMenu {
+            kind,
+            x: ax,
+            y: ay,
+        });
+        if let Some(o) = old {
+            self.invalidate(pad(o));
+        }
+        self.invalidate(pad((ax, ay, CTX_W, CTX_H)));
+        match kind {
+            CtxKind::Desktop => kprintln!("[desktop] menu open at {},{}", x, y),
+            CtxKind::Files => kprintln!("[files] menu open at {},{}", x, y),
+        }
+    }
+
+    /// Popup actions (M18). Item 0 = New text file (creates in the Files
+    /// browse dir or /disk/Desktop, then opens it in Notepad); item 1 =
+    /// Refresh (Files re-lists; desktop recomposites everything).
+    fn ctx_act(&mut self, kind: CtxKind, item: usize) {
+        match (kind, item) {
+            (CtxKind::Desktop, 0) | (CtxKind::Files, 0) => {
+                let dir = match kind {
+                    CtxKind::Desktop => String::from("/disk/Desktop"),
+                    CtxKind::Files => self.fpath.clone(),
+                };
+                if !dir.starts_with("/disk") {
+                    kprintln!("[files] new file refused (not a disk folder)");
+                    if kind == CtxKind::Files {
+                        // ramfs root has no disk semantics: browse /disk
+                        self.files_open("/disk");
+                    }
+                    return;
+                }
+                if let Some(path) = crate::servers::vfs::new_txt_in(&dir) {
+                    let _ = crate::servers::vfs::open_txt(&path);
+                    if kind == CtxKind::Files || self.fpath == "/disk/Desktop" {
+                        // the fresh file must be visible immediately
+                        self.files_open(&dir);
+                    }
+                }
+            }
+            (CtxKind::Files, 1) => {
+                self.files_open(&self.fpath.clone());
+            }
+            (CtxKind::Desktop, 1) => {
+                let (sw, sh) = (self.fb.width, self.fb.height);
+                self.invalidate((0, 0, sw, sh));
+                kprintln!("[desktop] refresh");
+            }
+            _ => {}
+        }
     }
 
     /// Running client windows (not the Files/Terminal/Settings system
@@ -1322,119 +1543,253 @@ impl WinSrv {
         kprintln!("[winsrv] win {} toggled", id);
     }
 
-    /// (Re)generate / focus the Files window at `path`.
+    /// (Re)generate / focus the Files window at `path`. Name cache:
+    /// the listing is rebuilt per browse and cached for painting.
     fn files_open(&mut self, path: &str) {
+        // Central truth for the whole Files state machine: the sidebar
+        // active row, the bin view (Restore/Empty chips), the Back chip
+        // and trash/restore all read fpath. Without this write every
+        // one of those read "/", while the list still followed clicks.
+        self.fpath = String::from(path);
         let title = alloc::format!("Files - {}", path);
-        let lines: Vec<String> = match crate::servers::vfs::list_names(path) {
-            Some(names) => {
-                let mut out: Vec<String> = Vec::new();
-                if path != "/" {
-                    out.push(String::from("../"));
-                }
-                if names.is_empty() {
-                    out.push(String::from("(empty)"));
-                } else {
-                    for n in names {
-                        out.push(n);
-                    }
-                }
-                out
-            }
-            None => alloc::vec![String::from("(unreadable)")],
-        };
-        let lines: alloc::collections::VecDeque<String> = lines.into();
+        // M16 listing: kind + size from the VFS; dirs sort first, both
+        // names ASCII case-insensitive (the FS namespace is ASCII).
+        let mut view: Vec<(String, bool, u64)> =
+            crate::servers::vfs::list_details(path).unwrap_or_default();
+        if path.trim_end_matches('/') == "/disk/Recycle Bin" {
+            // Bin view: sidecars (.orig = source-dir records) stay out.
+            view.retain(|(n, _, _)| !n.ends_with(".orig"));
+        }
+        view.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()))
+        });
+        let n = view.len();
         if let Some(i) = self.idx_of(FILES_ID) {
             let w = &mut self.windows[i];
             w.title = title;
-            w.lines = lines;
+            w.lines.clear(); // painter is custom; the console lines stay empty
+            self.fview = view;
+            self.fsel = None;
+            self.fclick = None;
             let rect = w.rect();
             self.invalidate(rect);
         } else {
+            self.fview = view;
+            self.fsel = None;
+            self.fclick = None;
             self.windows.push(Window {
                 id: FILES_ID,
                 owner: u32::MAX,
-                x: 230,
-                y: 140,
-                w: 540,
-                h: 420,
+                x: 280,
+                y: 110,
+                w: FILES_W,
+                h: FILES_H,
                 born: idt::ticks(),
                 maxim: None,
                 title,
-                lines,
+                lines: alloc::collections::VecDeque::new(),
                 canvas: None,
                 ring: [0; 128],
                 head: 0,
                 len: 0,
                 pending: None,
             });
+            self.invalidate(pad((280, 110,
+                FILES_W,
+                FILES_H)));
             let (sw, sh) = (self.fb.width, self.fb.height);
-            self.invalidate(pad((230, 140, 540, 420)));
             self.invalidate(strip_rect(sw, sh));
         }
+        kprintln!("[files] show {} items={}", path, n);
     }
 
-    /// Files body click: resolve the row under `y` to a logical line and
-    /// navigate if it is a directory ("../" or one ending with '/').
-    fn files_click(&mut self, id: u32, y: u32) {
-        // Font metrics first (borrow split before touching windows).
-        let cw = self.font.char_advance('M', FONT_PX).max(1);
-        let line_h = self.line_h;
+    /// Files body click (M16): geometry hit-testing against files_geo —
+    /// sidebar places, the < Back chip, grid cells (single-click =
+    /// select, double-click = enter a directory), and footer chips
+    /// (Delete / Restore / Empty). VFS never painted per-lap: mutations
+    /// refresh the cache through files_open(fpath).
+    fn files_click(&mut self, id: u32, x: u32, y: u32) {
         let Some(i) = self.idx_of(id) else {
             return;
         };
-        let cr = self.windows[i].content_rect();
-        if y < cr.1 {
+        let geo = files_geo(self.windows[i].x, self.windows[i].y, self.windows[i].w, self.windows[i].h);
+        // Sidebar place rows.
+        for (ri, row) in geo.places.iter().enumerate() {
+            if !point_in(x, y, *row) {
+                continue;
+            }
+            if !crate::servers::vfs::disk_ok() {
+                kprintln!("[files] place unavailable (no disk)");
+                return;
+            }
+            self.files_open(F_PLACE_PATHS[ri]);
             return;
         }
-        let row = ((y - cr.1) / line_h.max(1)) as usize;
-        let cols = (cr.2 / cw).max(1) as usize;
-        let rows_of = |len: usize| len.div_ceil(cols).max(1);
-        // draw_lines shows the tail that fits; replicate its skip + wrap
-        // math so the clicked screen row maps to the logical line.
-        let total: usize = self.windows[i].lines.iter().map(|l| rows_of(l.chars().count())).sum();
-        let rows_max = (cr.3 / line_h).max(1) as usize;
-        let skip = total.saturating_sub(rows_max);
-        let probe = row + skip;
-        let mut run = 0usize;
-        let mut hit: Option<usize> = None;
-        for (idx, l) in self.windows[i].lines.iter().enumerate() {
-            let lr = rows_of(l.chars().count());
-            if run + lr > probe {
-                hit = Some(idx);
-                break;
+        // Breadcrumb < Back chip.
+        if point_in(x, y, geo.back) {
+            if self.fpath == "/" {
+                return; // the ramfs root has no parent
             }
-            run += lr;
-        }
-        let Some(idx) = hit else {
+            let parent = files_parent(&self.fpath);
+            self.files_open(&parent);
             return;
-        };
-        let entry = self.windows[i].lines[idx].clone();
-        if entry == "(empty)" || entry == "(unreadable)" || !entry.ends_with('/') {
-            return; // plain file: nothing to open yet
         }
-        // Current path lives in the title ("Files - <path>").
-        let title = self.windows[i].title.clone();
-        let cur = title.strip_prefix("Files - ").unwrap_or("/");
-        let next = if entry == "../" {
-            // Parent: "/a/b" -> "/a", "/a" -> "/", "/" stays "/". The path
-            // is stored without a trailing slash (root excepted).
-            let t = cur.trim_end_matches('/');
-            match t.rfind('/') {
-                None | Some(0) => String::from("/"),
-                Some(p) => String::from(&t[..p]),
+        // Footer chips.
+        if point_in(x, y, geo.chip_del) {
+            self.files_delete_sel();
+            return;
+        }
+        if point_in(x, y, geo.chip_restore) {
+            self.files_restore_sel();
+            return;
+        }
+        if point_in(x, y, geo.chip_empty) {
+            self.files_empty();
+            return;
+        }
+        // Grid: one cell per hit.
+        if x >= geo.grid_x && y >= geo.grid_y {
+            let col = (x - geo.grid_x) / F_CELL_W;
+            let row = (y - geo.grid_y) / F_CELL_H;
+            let cols = ((geo.grid_w / F_CELL_W).max(1)) as usize;
+            let n = self.fview.len();
+            let idx = row as usize * cols + col as usize;
+            let now = idt::ticks();
+            if idx >= n {
+                self.fsel = None;
+                self.fclick = None;
+                if let Some(wi) = self.idx_of(id) {
+                    self.invalidate(self.windows[wi].rect());
+                }
+                return;
             }
-        } else {
-            let name = entry.trim_end_matches('/');
-            if cur == "/" {
-                alloc::format!("/{}", name)
+            let name = self.fview[idx].0.clone();
+            let is_dir = self.fview[idx].1;
+            // Double-click: same cell within 45 ticks (~450ms of the 100 Hz
+            // timer) — 25 was tighter than the 500ms OS-standard double-click
+            // time and real hands missed it.
+            let dbl = self
+                .fclick
+                .map(|(li, lt)| li == idx && now <= lt + 45)
+                .unwrap_or(false);
+            self.fclick = Some((idx, now));
+            if dbl && is_dir {
+                let cur = self.fpath.clone();
+                let next = if cur == "/" {
+                    alloc::format!("/{}", name)
+                } else {
+                    alloc::format!("{}/{}", cur.trim_end_matches('/'), name)
+                };
+                self.files_open(&next);
+            } else if dbl
+                && !is_dir
+                && self.fpath != "/"
+                && self.fpath.trim_end_matches('/') != "/disk/Recycle Bin"
+                // Case-folded: mcopy of an 8.3 name stores HELLO.GLE
+                // (short-entry uppercase); only LFN keeps real case.
+                && name.to_ascii_lowercase().ends_with(".gle")
+            {
+                // M17: double-clicking an app (.gle) runs it — the winsrv
+                // kernel task calls vfs::exec_gle directly (kernel tasks
+                // share the kernel; no IPC hop). Bin view refuses: the bin
+                // is for moving files, not running them.
+                self.fsel = Some(name.clone());
+                if let Some(wi) = self.idx_of(id) {
+                    self.invalidate(self.windows[wi].rect());
+                }
+                let full = alloc::format!(
+                    "{}/{}",
+                    self.fpath.trim_end_matches('/'),
+                    name
+                );
+                kprintln!("[files] run {}", name);
+                if let Err(reason) = crate::servers::vfs::exec_gle(&full) {
+                    kprintln!("[files] run refused: {}", reason);
+                }
+            } else if dbl
+                && !is_dir
+                && self.fpath != "/"
+                && name.to_ascii_lowercase().ends_with(".txt")
+            {
+                // M18: a .txt opens in Notepad. vfs validates + registers
+                // the path and spawns the editor (CAP_DISK). Bin views
+                // allowed — reading (and editing) a trashed text is
+                // harmless; ramfs root refuses inside open_txt.
+                self.fsel = Some(name.clone());
+                if let Some(wi) = self.idx_of(id) {
+                    self.invalidate(self.windows[wi].rect());
+                }
+                let full = alloc::format!(
+                    "{}/{}",
+                    self.fpath.trim_end_matches('/'),
+                    name
+                );
+                kprintln!("[files] open txt {}", name);
+                if let Err(reason) = crate::servers::vfs::open_txt(&full) {
+                    kprintln!("[files] open refused: {}", reason);
+                }
             } else {
-                alloc::format!("{}/{}", cur.trim_end_matches('/'), name)
+                self.fsel = Some(name);
+                if let Some(wi) = self.idx_of(id) {
+                    self.invalidate(self.windows[wi].rect());
+                }
             }
-        };
-        // Only navigate if the target is really a directory.
-        if vfs::list_names(&next).is_some() {
-            self.files_open(&next);
         }
+    }
+
+    /// Footer Delete chip / Del key: move the selected file to the Recycle
+    /// Bin (vfs::trash). Only disk files trash (ramfs/?/ps + dirs refuse
+    /// with a print; "no bloat" also means no phantom error cards).
+    fn files_delete_sel(&mut self) {
+        let Some(sel) = self.fsel.clone() else {
+            return;
+        };
+        let bin_here = self.fpath.trim_end_matches('/') == "/disk/Recycle Bin";
+        if bin_here {
+            return; // bin view has Restore/Empty, not Delete
+        }
+        if self.fpath == "/" {
+            kprintln!("[files] delete refused (ramfs: root only reads)");
+            return;
+        }
+        let full = alloc::format!("{}/{}", self.fpath.trim_end_matches('/'), sel);
+        let cur = self.fpath.clone();
+        match crate::servers::vfs::trash(&full) {
+            Some(_moved) => {
+                kprintln!("[files] trash {} ok", sel);
+                self.files_open(&cur);
+            }
+            None => kprintln!("[files] trash {} refused", sel),
+        }
+    }
+
+    /// Footer Restore chip (bin view): untrash the selection back to its
+    /// source dir, then refresh the bin listing.
+    fn files_restore_sel(&mut self) {
+        if self.fpath.trim_end_matches('/') != "/disk/Recycle Bin" {
+            return;
+        }
+        let Some(sel) = self.fsel.clone() else {
+            return;
+        };
+        match crate::servers::vfs::untrash(&sel) {
+            Some(_to) => {
+                kprintln!("[files] restore {} ok", sel);
+                self.files_open("/disk/Recycle Bin");
+            }
+            None => kprintln!("[files] restore {} refused", sel),
+        }
+    }
+
+    /// Footer Empty chip (bin view): drop every bin item + sidecar.
+    fn files_empty(&mut self) {
+        if self.fpath.trim_end_matches('/') != "/disk/Recycle Bin" {
+            return;
+        }
+        let n = crate::servers::vfs::empty_bin();
+        self.files_open("/disk/Recycle Bin");
+        kprintln!("[files] bin empty n={}", n);
     }
 
     /// Enter inside the start card: launch the first filtered app.
@@ -1478,7 +1833,10 @@ impl WinSrv {
                     let nx = (self.mx as i32 + dx).clamp(0, self.fb.width as i32 - 1) as u32;
                     let ny = (self.my as i32 - dy).clamp(0, self.fb.height as i32 - 1) as u32;
                     // Pointer handles motion, click edges, and drag.
-                    self.pointer(nx, ny, self.pkt[0] & 1);
+                    // PS/2 flags byte: bits 0-2 = left/right/middle —
+                    // the full mask must reach pointer() (M18 right-
+                    // click law); masking to bit 0 erased right clicks.
+                    self.pointer(nx, ny, self.pkt[0] & 7);
                 }
                 changed = true;
             }
@@ -1499,7 +1857,9 @@ impl WinSrv {
         for (x, y, btn) in reports {
             let nx = (x as u64 * w.saturating_sub(1) / 32767) as u32;
             let ny = (y as u64 * h.saturating_sub(1) / 32767) as u32;
-            self.pointer(nx, ny, btn & 1);
+            // Full button mask (left + right + middle): the driver
+            // already sets bit 1 on BTN_RIGHT
+            self.pointer(nx, ny, btn);
         }
         true
     }
@@ -1516,6 +1876,13 @@ impl WinSrv {
             if sc == 0x5B {
                 // Left Windows key: toggles the start card (Windows 11).
                 self.toggle_start();
+            } else if sc == 0x53 {
+                // E0 53 = Delete (extended make): trash the selection in
+                // the focused Files window (the same move-to-bin footer
+                // chip does). Plain 0x53 is the KEYPAD "." — not this.
+                if self.focus == FILES_ID {
+                    self.files_delete_sel();
+                }
             }
             return;
         }
@@ -2228,6 +2595,42 @@ fn isqrt(n: u32) -> u32 {
 /// fixed-point REFERENCE for the SSE2 blend kernel (simd.rs); the compositor
 /// calls the vector path, tests keep this around for bit-exact comparison.
 #[inline(always)]
+/// Right-click popup (M18): a small acrylic panel, two rows. The hover
+/// row washes when the cursor sits on it; the CLICK hit-test lives in
+/// the exact same geometry click() routes ((y - m.y) / ITEM_H) — one law.
+fn draw_ctx(
+    back: &mut Framebuffer,
+    font: &mut FontSystem,
+    wall: &[u32],
+    r: Rect,
+    m: Rect,
+    kind: CtxKind,
+    mx: u32,
+    my: u32,
+) {
+    if !r_inter(r, pad(m)) {
+        return;
+    }
+    window_shadow(back, wall, r, m, 256);
+    fill_round_clip(back, r, m, RAD_CELL, PANEL_BORDER);
+    acrylic_round_clip(
+        back,
+        wall,
+        r,
+        (m.0 + 1, m.1 + 1, m.2 - 2, m.3 - 2),
+        RAD_CELL - 1,
+        PANEL_TINT,
+        242,
+    );
+    for (i, label) in kind.items().into_iter().enumerate() {
+        let row: Rect = (m.0, m.1 + CTX_ITEM_H * i as u32, m.2, CTX_ITEM_H);
+        if point_in(mx, my, row) {
+            fill_clip(back, r, row, HOVER);
+        }
+        draw_text_blended(back, font, row.0 + 14, row.1 + 9, label, 10.0, LABEL_FG);
+    }
+}
+
 fn blend_px(w: u32, tint: Rgb, a: u32) -> u32 {
     let wr = ((w >> 16) & 0xFF) as u32;
     let wg = ((w >> 8) & 0xFF) as u32;
@@ -2388,83 +2791,7 @@ fn fill_circle(back: &mut Framebuffer, cx: u32, cy: u32, r: u32, c: Rgb) {
     }
 }
 
-/// Top-half annulus (wifi arcs): rows above (cx, cy), radii r_in..r_out.
-/// Paints ONLY arc pixels — safe over acrylic (no bg punching).
-fn fill_arc_top(back: &mut Framebuffer, cx: u32, cy: u32, r_out: u32, r_in: u32, c: Rgb) {
-    if r_out <= r_in || cy < r_out {
-        return;
-    }
-    let cxi = cx as i32;
-    for dy in 1..=r_out as i32 {
-        let rest = (r_out * r_out) as i32 - dy * dy;
-        if rest < 0 {
-            continue;
-        }
-        let hw_out = isqrt(rest as u32) as i32;
-        let hw_in = if dy as i32 >= r_in as i32 {
-            0
-        } else {
-            isqrt(((r_in * r_in) as i32 - dy * dy).max(0) as u32) as i32
-        };
-        let y = cy as i32 - dy;
-        if y < 0 {
-            continue;
-        }
-        for (a, b) in [(cxi - hw_out, cxi - hw_in), (cxi + hw_in, cxi + hw_out)] {
-            let a = a.max(0) as u32;
-            let b = b.max(0) as u32;
-            if b > a {
-                back.fill_rect(a, y as u32, b - a, 1, c);
-            }
-        }
-    }
-}
-
-/// Bottom quarter-annulus rows below (cx, cy) on one side — used by the
-/// browser ball icon's colored wedges.
-fn fill_quarter_bottom(
-    back: &mut Framebuffer,
-    cx: u32,
-    cy: u32,
-    r_out: u32,
-    r_in: u32,
-    right: bool,
-    c: Rgb,
-) {
-    if r_out <= r_in || cy >= back.height {
-        return;
-    }
-    let cxi = cx as i32;
-    for dy in 1..=r_out as i32 {
-        let rest = (r_out * r_out) as i32 - dy * dy;
-        if rest < 0 {
-            continue;
-        }
-        let hw_out = isqrt(rest as u32) as i32;
-        let hw_in = if dy >= r_in as i32 {
-            0
-        } else {
-            isqrt(((r_in * r_in) as i32 - dy * dy).max(0) as u32) as i32
-        };
-        let y = cy as i32 + dy;
-        if y < 0 {
-            continue;
-        }
-        let (a, b) = if right {
-            (cxi + hw_in, cxi + hw_out)
-        } else {
-            (cxi - hw_out + 1, cxi - hw_in)
-        };
-        let a = a.max(0) as u32;
-        let b = b.max(0) as u32;
-        if b > a {
-            back.fill_rect(a, y as u32, b - a, 1, c);
-        }
-    }
-}
-
-/// Annulus ring around (cx, cy): full-circle outline-style mark, used for
-/// the magnifier, gear, and power glyphs.
+/// Annulus ring around (cx, cy): full-circle outline-style mark.
 fn fill_ring(back: &mut Framebuffer, cx: u32, cy: u32, r_out: u32, r_in: u32, c: Rgb) {
     if r_out <= r_in {
         return;
@@ -2657,6 +2984,103 @@ fn draw_text_clip(
     }
 }
 
+// ---- Files window v2 geometry (M16) --------------------------------------
+// ONE function drives the painter, the click map, and the docs so pixel
+// coordinates never disagree. All rects are absolute (screen space): the
+// painter feeds it the drawn position (rise included) and click mapping
+// feeds it the plain window coords — the two only differ during the brief
+// open animation.
+
+/// Files explorer layout: sidebar places, breadcrumb "< Back" chip, icon
+/// grid origin/width, and the footer chips.
+struct FilesGeo {
+    back: Rect,
+    /// Place rows; index = F_PLACE_PATHS index.
+    places: [Rect; 4],
+    /// Cells tile at (F_CELL_W, F_CELL_H) pitch from this origin.
+    grid_x: u32,
+    grid_y: u32,
+    grid_w: u32,
+    /// Footer chips: Delete (non-bin) / Restore + Empty (bin view).
+    chip_del: Rect,
+    chip_restore: Rect,
+    chip_empty: Rect,
+}
+
+/// `x/y/w/h` = the window's OUTER rect (titlebar included).
+fn files_geo(x: u32, y: u32, w: u32, h: u32) -> FilesGeo {
+    let bx = x + 1;
+    let by = y + 1 + TITLE_H; // body top (below the titlebar hairline row)
+    let bw = w.saturating_sub(2);
+    let cw0 = bw.saturating_sub(F_SIDE_W); // content column right of sidebar
+    // The sidebar paints as an inset rounded card (x+5, by+6); rows live
+    // inside with a 4px pad and a first-row air pocket.
+    let mut places = [(0, 0, 0, 0); 4];
+    for i in 0..4 {
+        places[i] = (
+            bx + 9,
+            by + 6 + 8 + i as u32 * F_ROW_H,
+            F_SIDE_W.saturating_sub(18),
+            F_ROW_H - 8,
+        );
+    }
+    let back = (bx + F_SIDE_W + 6, by + (F_BREAD_H - 22) / 2, 62, 22);
+    let fy = y + h - 1 - F_FOOT_H; // footer hairline row
+    let ccy = fy + (F_FOOT_H - 20) / 2; // 20-tall chips, vertically centered
+    let chip_empty = (bx + bw.saturating_sub(6 + 56), ccy, 56, 20);
+    let chip_restore = (chip_empty.0.saturating_sub(6 + 64), ccy, 64, 20);
+    let chip_del = (chip_restore.0.saturating_sub(6 + 56), ccy, 56, 20);
+    let grid_x = bx + F_SIDE_W + 10;
+    let grid_y = by + F_BREAD_H + 13; // below the breadcrumb hairline row
+    let grid_w = cw0.saturating_sub(20);
+    FilesGeo {
+        back,
+        places,
+        grid_x,
+        grid_y,
+        grid_w,
+        chip_del,
+        chip_restore,
+        chip_empty,
+    }
+}
+
+/// Parent path of an absolute path without a trailing slash: "/a/b" ->
+/// "/a", "/a" -> "/", "/" -> "/" (the root has no parent).
+fn files_parent(path: &str) -> String {
+    let t = path.trim_end_matches('/');
+    match t.rfind('/') {
+        None | Some(0) => String::from("/"),
+        Some(p) => String::from(&t[..p]),
+    }
+}
+
+/// Compact byte size for the grid + footer: integer math only (no float
+/// formatting in no_std). Below 1 KiB shows bytes; above, one decimal
+/// only while a tenth actually means something (unit < 10).
+fn fmt_size(b: u64) -> String {
+    if b < 1024 {
+        return alloc::format!("{} B", b);
+    }
+    let kb = b / 1024;
+    if kb < 1024 {
+        if kb < 10 {
+            let frac = (b % 1024) * 10 / 1024;
+            return alloc::format!("{}.{} KB", kb, frac);
+        }
+        return alloc::format!("{} KB", kb);
+    }
+    alloc::format!("{} MB", kb / 1024)
+}
+
+/// Display width of a glyph run (advance sum) — right-aligns the
+/// footer's selection line against the chip column.
+fn text_w(font: &mut FontSystem, s: &str, px: f32) -> u32 {
+    s.chars()
+        .map(|c| font.char_advance(c, px))
+        .fold(0u32, |a, b| a.saturating_add(b))
+}
+
 /// Compose one window: 1px border + rounded silhouette (focused = lighter
 /// border + lighter titlebar; maximized windows square their corners),
 /// flat maximize/close buttons (close hovers red), left title text,
@@ -2675,6 +3099,7 @@ fn draw_window(
     mx: u32,
     my: u32,
     now: u64,
+    fdata: (&str, Option<&str>, &[(String, bool, u64)]),
 ) {
     let p = anim_p(now, win.born);
     let rise: u32 = (((256 - p) * ANIM_RISE as u32) >> 8) as u32;
@@ -2727,10 +3152,15 @@ fn draw_window(
     // Content area: graphics mode blits the per-client canvas (M15),
     // text mode renders console lines. content_rect keeps its geometry
     // for hit-testing; the rise shifts only the drawing during the open
-    // animation.
+    // animation. The Files window (M16) paints a custom explorer body
+    // (sidebar + breadcrumb + grid + footer) instead of console lines.
     let cr = win.content_rect();
     let crd = (cr.0, cr.1 + rise, cr.2, cr.3);
-    if r_inter(r, crd) {
+    if win.id == FILES_ID {
+        if r_inter(r, crd) {
+            draw_files(back, font, r, x, y, w, h, mx, my, fdata);
+        }
+    } else if r_inter(r, crd) {
         match win.canvas.as_ref() {
             Some((pix, cw, ch)) => {
                 blit_canvas(back, pix, *cw, *ch, crd, r);
@@ -2741,6 +3171,313 @@ fn draw_window(
     // Open fade: the whole rect dissolves out of the wallpaper as p -> 1.
     if p < 256 {
         scrim_rect_clip(back, wall, r, (x, y, w, h), 256 - p);
+    }
+}
+
+/// M16 Files body painter (system window FILES_ID): Windows-11-style
+/// explorer — an inset places card on the left (Desktop / Documents /
+/// Downloads / Recycle Bin with lime active bands), a breadcrumb strip
+/// with a "< Back" chip, a hover/selection icon grid (folders azure,
+/// files paper + lime dog-ear, sizes right under the name), and a
+/// status footer with Delete / Restore / Empty chips. Geometry comes
+/// from files_geo (identical constants drive the click map); painting
+/// is VFS-free per lap — the listing rides in through fdata.
+#[allow(clippy::too_many_arguments)]
+fn draw_files(
+    back: &mut Framebuffer,
+    font: &mut FontSystem,
+    r: Rect,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    mx: u32,
+    my: u32,
+    fdata: (&str, Option<&str>, &[(String, bool, u64)]),
+) {
+    let (fpath, fsel, fview) = fdata;
+    let geo = files_geo(x, y, w, h);
+    let bx = x + 1;
+    let by = y + 1 + TITLE_H;
+    let bw = w.saturating_sub(2);
+    let bh = h.saturating_sub(TITLE_H + 2);
+    let bin_view = fpath.trim_end_matches('/') == "/disk/Recycle Bin";
+    let has_disk = crate::servers::vfs::disk_ok();
+    let lh12 = font.line_height(12.0);
+
+    // ---- places card (inset rounded, like Win11's nav pane) ----
+    let card = (
+        x + 5,
+        by + 6,
+        F_SIDE_W.saturating_sub(10),
+        bh.saturating_sub(7),
+    );
+    fill_round_clip(back, r, card, 8, F_SIDEBAR);
+    for i in 0..4 {
+        let row = geo.places[i];
+        if !r_inter(r, row) {
+            continue;
+        }
+        let active = fpath == F_PLACE_PATHS[i];
+        let hover = point_in(mx, my, row);
+        if active {
+            chip_round_clip(back, r, row, 6, LIME, F_SELECT_A);
+            fill_clip(back, r, (row.0, row.1, 3, row.3), LIME);
+        } else if hover {
+            chip_round_clip(back, r, row, 6, HOVER, 170);
+        }
+        let gcx = row.0 + 22;
+        let gcy = row.1 + row.3 / 2;
+        match i {
+            0 => draw_icon_rgba(back, r, gcx, gcy, ICON_MONITOR_20, 20),
+            1 => draw_icon_rgba(back, r, gcx, gcy, ICON_DOCSFOLD_20, 20),
+            2 => draw_icon_rgba(back, r, gcx, gcy, ICON_DLOAD_20, 20),
+            _ => draw_icon_rgba(back, r, gcx, gcy, ICON_BIN_20, 20),
+        }
+        let name = F_PLACE_PATHS[i].rsplit('/').next().unwrap_or("");
+        draw_text_clip(
+            back,
+            font,
+            row.0 + 40,
+            row.1 + (row.3 - lh12) / 2 + 1,
+            name,
+            12.0,
+            if has_disk { LABEL_FG } else { SUB_FG },
+            row.0 + row.2.saturating_sub(4),
+        );
+    }
+
+    // ---- breadcrumb strip: "< Back" chip + path, hairline below ----
+    let at_root = fpath == "/";
+    let back_hover = !at_root && point_in(mx, my, geo.back);
+    chip_round_clip(
+        back,
+        r,
+        geo.back,
+        5,
+        if back_hover { HOVER } else { SEARCH_BG },
+        if at_root { 128 } else { 256 },
+    );
+    draw_text_clip(
+        back,
+        font,
+        geo.back.0 + 12,
+        geo.back.1 + (geo.back.3 - lh12) / 2 + 1,
+        "< Back",
+        12.0,
+        if at_root { SUB_FG } else { LABEL_FG },
+        geo.back.0 + geo.back.2.saturating_sub(6),
+    );
+    draw_text_clip(
+        back,
+        font,
+        geo.back.0 + geo.back.2 + 12,
+        by + (F_BREAD_H - lh12) / 2 + 1,
+        fpath,
+        12.0,
+        SUB_FG,
+        bx + bw.saturating_sub(8),
+    );
+    fill_clip(
+        back,
+        r,
+        (
+            bx + F_SIDE_W,
+            by + F_BREAD_H,
+            bw.saturating_sub(F_SIDE_W),
+            1,
+        ),
+        HAIRLINE,
+    );
+
+    // ---- footer: item count, selection line (right-aligned), chips ----
+    let fy = y + h - 1 - F_FOOT_H;
+    fill_clip(
+        back,
+        r,
+        (
+            bx + F_SIDE_W,
+            fy,
+            bw.saturating_sub(F_SIDE_W),
+            1,
+        ),
+        HAIRLINE,
+    );
+    let count = alloc::format!("{} items", fview.len());
+    draw_text_clip(
+        back,
+        font,
+        bx + F_SIDE_W + 12,
+        fy + (F_FOOT_H - lh12) / 2 + 1,
+        &count,
+        12.0,
+        SUB_FG,
+        geo.chip_del.0.saturating_sub(8),
+    );
+    if let Some(sel) = fsel {
+        let sz = fview
+            .iter()
+            .find(|it| &it.0[..] == sel)
+            .map(|it| it.2)
+            .unwrap_or(0);
+        let sel_txt = alloc::format!("{} ({})", sel, fmt_size(sz));
+        let align_to = if bin_view {
+            geo.chip_restore.0
+        } else {
+            geo.chip_del.0
+        };
+        let tw = text_w(font, &sel_txt, 12.0);
+        let sx = align_to.saturating_sub(10 + tw);
+        draw_text_clip(
+            back,
+            font,
+            sx,
+            fy + (F_FOOT_H - lh12) / 2 + 1,
+            &sel_txt,
+            12.0,
+            LABEL_FG,
+            align_to.saturating_sub(4),
+        );
+    }
+    // Chips (6px gaps, 20 tall): bin view = Restore + Empty; elsewhere =
+    // Delete, and only with a selection. A chip missing its precondition
+    // simply never paints.
+    if bin_view {
+        let on = fsel.is_some();
+        let hov = on && point_in(mx, my, geo.chip_restore);
+        chip_round_clip(
+            back,
+            r,
+            geo.chip_restore,
+            5,
+            if hov { HOVER } else { SEARCH_BG },
+            256,
+        );
+        draw_text_clip(
+            back,
+            font,
+            geo.chip_restore.0 + 12,
+            geo.chip_restore.1 + (20 - lh12) / 2 + 1,
+            "Restore",
+            12.0,
+            if on { LABEL_FG } else { SUB_FG },
+            geo.chip_restore.0 + geo.chip_restore.2.saturating_sub(4),
+        );
+        let hov = point_in(mx, my, geo.chip_empty);
+        chip_round_clip(
+            back,
+            r,
+            geo.chip_empty,
+            5,
+            if hov { HOVER } else { SEARCH_BG },
+            256,
+        );
+        draw_text_clip(
+            back,
+            font,
+            geo.chip_empty.0 + 14,
+            geo.chip_empty.1 + (20 - lh12) / 2 + 1,
+            "Empty",
+            12.0,
+            LABEL_FG,
+            geo.chip_empty.0 + geo.chip_empty.2.saturating_sub(4),
+        );
+    } else if fsel.is_some() {
+        let hov = point_in(mx, my, geo.chip_del);
+        chip_round_clip(
+            back,
+            r,
+            geo.chip_del,
+            5,
+            if hov { HOVER } else { SEARCH_BG },
+            256,
+        );
+        draw_text_clip(
+            back,
+            font,
+            geo.chip_del.0 + 14,
+            geo.chip_del.1 + (20 - lh12) / 2 + 1,
+            "Delete",
+            12.0,
+            LABEL_FG,
+            geo.chip_del.0 + geo.chip_del.2.saturating_sub(4),
+        );
+    }
+
+    // ---- icon grid ----
+    if fview.is_empty() {
+        let msg = if bin_view { "(bin is empty)" } else { "(empty)" };
+        draw_text_clip(
+            back,
+            font,
+            geo.grid_x,
+            geo.grid_y + 2,
+            msg,
+            12.0,
+            SUB_FG,
+            geo.grid_x + geo.grid_w,
+        );
+        return;
+    }
+    let cols = (geo.grid_w / F_CELL_W).max(1);
+    let foot_top = y + h - 1 - F_FOOT_H;
+    let rows_fit = foot_top.saturating_sub(geo.grid_y) / F_CELL_H;
+    for (idx, it) in fview.iter().enumerate() {
+        let rowi = idx as u32 / cols;
+        let col = idx as u32 % cols;
+        if rowi >= rows_fit {
+            break;
+        }
+        let cell = (
+            geo.grid_x + col * F_CELL_W,
+            geo.grid_y + rowi * F_CELL_H,
+            F_CELL_W - 8, // trailing air = the gap between cells
+            F_CELL_H - 10,
+        );
+        if !r_inter(r, cell) {
+            continue;
+        }
+        let name = &it.0[..];
+        let sel = fsel == Some(name);
+        let hov = !sel && point_in(mx, my, cell);
+        if sel {
+            chip_round_clip(back, r, cell, 6, LIME, F_SELECT_A);
+        } else if hov {
+            chip_round_clip(back, r, cell, 6, HOVER, 170);
+        }
+        let gcx = cell.0 + cell.2 / 2;
+        let gcy = cell.1 + 24;
+        if it.1 {
+            draw_icon_rgba(back, r, gcx, gcy, ICON_FOLDER_30, 30);
+        } else {
+            draw_icon_rgba(back, r, gcx, gcy, ICON_PAGE_28, 28);
+        }
+        if sel {
+            underline(back, r, gcx, cell.1 + cell.3 - 1, LIME);
+        }
+        draw_text_clip(
+            back,
+            font,
+            cell.0 + 4,
+            cell.1 + 42,
+            name,
+            12.0,
+            LABEL_FG,
+            cell.0 + cell.2.saturating_sub(2),
+        );
+        if !it.1 {
+            let st = fmt_size(it.2);
+            draw_text_clip(
+                back,
+                font,
+                cell.0 + 4,
+                cell.1 + 57,
+                &st,
+                12.0,
+                SUB_FG,
+                cell.0 + cell.2.saturating_sub(2),
+            );
+        }
     }
 }
 
@@ -2865,111 +3602,83 @@ fn draw_glass(back: &mut Framebuffer, cx: u32, cy: u32, c: Rgb) {
     }
 }
 
-/// Files folder glyph in an `s` box centered at (cx, cy): darker back
-/// panel, lighter front sheet.
-fn draw_folder(back: &mut Framebuffer, r: Rect, cx: u32, cy: u32, s: u32) {
-    let half = s / 2;
-    let rad = (s / 6).max(2);
-    fill_round_clip(back, r, (cx - half, cy - half + 1, s, s * 2 / 3), rad, BLUE);
-    fill_round_clip(
-        back,
-        r,
-        (
-            cx.saturating_sub(half + 1),
-            cy - half + s * 3 / 10,
-            s + 2,
-            s * 6 / 11,
-        ),
-        rad,
-        BLUE_HI,
-    );
-}
+// ---- M16.x icons (icons8 "fluency", baked once by scripts/bake-icons.py) --
+// Raw straight-alpha RGBA (row-major, 4 B/px), channels pre-clamped <=238
+// (cursor-uniqueness). Blitted at exactly the baked size — never scaled.
 
-/// Terminal glyph in an `s` box: rounded dark square + ">_" prompt.
-fn draw_term_icon(
+const ICON_FOLDER_24: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/folder_24.rgba"));
+const ICON_FOLDER_28: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/folder_28.rgba"));
+const ICON_FOLDER_30: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/folder_30.rgba"));
+const ICON_CONSOLE_24: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/console_24.rgba"));
+const ICON_CONSOLE_28: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/console_28.rgba"));
+const ICON_SETTINGS_24: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/settings_24.rgba"));
+const ICON_SETTINGS_28: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/settings_28.rgba"));
+const ICON_MONITOR_20: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/monitor_20.rgba"));
+const ICON_DOCSFOLD_20: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/docsfold_20.rgba"));
+const ICON_DLOAD_20: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/dload_20.rgba"));
+const ICON_BIN_20: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/bin_20.rgba"));
+const ICON_PAGE_28: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/page_28.rgba"));
+const ICON_ROCKET_28: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/rocket_28.rgba"));
+const ICON_POWER_24: &[u8] =
+    include_bytes!(concat!(env!("GREENLIME_ICONS_DIR"), "/power_24.rgba"));
+
+/// Blit a baked RGBA icon centered on (cx, cy), clipped to r, with the
+/// integer `blend_px` one-pixel-at-a-time over the composed back buffer
+/// (straight alpha: a==0 skips, a==255 fully covers).
+fn draw_icon_rgba(
     back: &mut Framebuffer,
     r: Rect,
-    font: &mut FontSystem,
     cx: u32,
     cy: u32,
+    data: &[u8],
     s: u32,
 ) {
-    let half = s / 2;
-    fill_round_clip(back, r, (cx - half, cy - half, s, s), 3, TERM_SQ);
-    let px = (s as f32) * 0.55;
-    let total = font.char_advance('>', px) + font.char_advance('_', px);
-    let lh = font.line_height(px);
-    draw_text_blended(
-        back,
-        font,
-        cx.saturating_sub(total / 2),
-        cy.saturating_sub(lh / 2),
-        ">_",
-        px,
-        WHITE,
-    );
-}
-
-/// Settings gear in an `s` box: ring + 4 teeth + hub.
-fn draw_gear(back: &mut Framebuffer, cx: u32, cy: u32, s: u32) {
-    let r_out = s * 5 / 12; // ~10 for s=24
-    let r_in = (s / 4).max(3); // ~6
-    fill_ring(back, cx, cy, r_out, r_in, GEAR);
-    let t = (s / 10).max(2); // tooth thickness
-    let tooth = 4;
-    back.fill_rect(
-        cx.saturating_sub(t / 2),
-        cy.saturating_sub(r_out + tooth),
-        t,
-        tooth + 2,
-        GEAR,
-    );
-    back.fill_rect(cx.saturating_sub(t / 2), cy + r_in, t, tooth + 1, GEAR);
-    back.fill_rect(
-        cx.saturating_sub(r_out + tooth),
-        cy.saturating_sub(t / 2),
-        tooth + 2,
-        t,
-        GEAR,
-    );
-    back.fill_rect(cx + r_in, cy.saturating_sub(t / 2), tooth + 1, t, GEAR);
-    fill_circle(back, cx, cy, r_in / 3 + 1, GEAR);
-}
-
-/// Demo-app ball glyph in an `s` box (the Demo pin): blue ball, red top
-/// arc, green/yellow bottom wedges, white hub.
-fn draw_ball(back: &mut Framebuffer, cx: u32, cy: u32, s: u32) {
-    let rad = s * 5 / 12; // ~10 for s=24
-    fill_circle(back, cx, cy, rad, BALL_BLU);
-    fill_arc_top(back, cx, cy, rad, rad / 2, BALL_RED);
-    fill_quarter_bottom(back, cx, cy, rad, rad / 2, true, BALL_GRN);
-    fill_quarter_bottom(back, cx, cy, rad, rad / 2, false, BALL_YEL);
-    fill_circle(back, cx, cy, rad * 3 / 10, BALL_WHITE);
-    fill_circle(back, cx, cy, rad * 3 / 20, BALL_BLU);
-}
-
-/// Tile icon dispatch (28px box in start tiles).
-fn draw_tile_icon(
-    back: &mut Framebuffer,
-    r: Rect,
-    font: &mut FontSystem,
-    app: App,
-    cx: u32,
-    cy: u32,
-    s: u32,
-) {
-    match app {
-        App::Settings => draw_gear(back, cx, cy, s),
-        App::Demo => draw_ball(back, cx, cy, s),
-        App::Files => draw_folder(back, r, cx, cy, s),
-        App::Terminal => draw_term_icon(back, r, font, cx, cy, s),
+    let x0 = cx.saturating_sub(s / 2);
+    let y0 = cy.saturating_sub(s / 2);
+    for row in 0..s {
+        let py = y0 + row;
+        if py < r.1 || py >= r.1 + r.3 {
+            continue;
+        }
+        for col in 0..s {
+            let px = x0 + col;
+            if px < r.0 || px >= r.0 + r.2 {
+                continue;
+            }
+            let o = ((row * s + col) * 4) as usize;
+            let a = data[o + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let c = Rgb(data[o], data[o + 1], data[o + 2]);
+            let base = read_pixel(back, px, py);
+            back.put_pixel(px, py, unpack(blend_px(base, c, a)));
+        }
     }
 }
 
-/// Power glyph: ring + vertical stroke poking out the top.
-fn draw_power_glyph(back: &mut Framebuffer, cx: u32, cy: u32, c: Rgb) {
-    fill_ring(back, cx, cy, 5, 3, c);
-    back.fill_rect(cx.saturating_sub(1), cy.saturating_sub(9), 2, 7, c);
+/// Tile icon dispatch (28px icons8 blobs in start tiles, drawn at their
+/// exact baked size — never scaled).
+fn draw_tile_icon(back: &mut Framebuffer, r: Rect, app: App, cx: u32, cy: u32) {
+    match app {
+        App::Settings => draw_icon_rgba(back, r, cx, cy, ICON_SETTINGS_28, 28),
+        App::Demo => draw_icon_rgba(back, r, cx, cy, ICON_ROCKET_28, 28),
+        App::Files => draw_icon_rgba(back, r, cx, cy, ICON_FOLDER_28, 28),
+        App::Terminal => draw_icon_rgba(back, r, cx, cy, ICON_CONSOLE_28, 28),
+    }
 }
 
 /// The Windows 11 taskbar: full-width acrylic bar (square corners, flush
@@ -3035,8 +3744,8 @@ fn draw_taskbar(
                 }
             }
             1 => {
-                // Files pin: blue folder glyph.
-                draw_folder(back, r, cx, cy, 24);
+                // Files pin: icons8 blue folder icon.
+                draw_icon_rgba(back, r, cx, cy, ICON_FOLDER_24, 24);
                 if files_open {
                     underline(
                         back,
@@ -3048,8 +3757,8 @@ fn draw_taskbar(
                 }
             }
             2 => {
-                // Terminal pin: dark square with the prompt glyph.
-                draw_term_icon(back, r, font, cx, cy, 24);
+                // Terminal pin: icons8 console icon.
+                draw_icon_rgba(back, r, cx, cy, ICON_CONSOLE_24, 24);
                 if term_open {
                     underline(
                         back,
@@ -3061,8 +3770,8 @@ fn draw_taskbar(
                 }
             }
             3 => {
-                // Settings pin: gear glyph.
-                draw_gear(back, cx, cy, 24);
+                // Settings pin: icons8 gear icon.
+                draw_icon_rgba(back, r, cx, cy, ICON_SETTINGS_24, 24);
                 if set_open {
                     underline(
                         back,
@@ -3232,7 +3941,7 @@ fn draw_start(
         }
         if ta >= 256 {
             let (tcx, tcy) = (t.0 + TILE_W / 2, t.1 + 40);
-            draw_tile_icon(back, r, font, *app, tcx, tcy, 28);
+            draw_tile_icon(back, r, *app, tcx, tcy);
             let wpx: u32 = name.chars().map(|c| font.char_advance(c, 10.0)).sum();
             draw_text_blended(back, font, tcx - wpx / 2, t.1 + 66, name, 10.0, LABEL_FG);
         }
@@ -3254,13 +3963,13 @@ fn draw_start(
             AVATAR_INK,
         );
         draw_text_blended(back, font, px0 + 62, fcy.saturating_sub(6), "GreenLime", 11.0, LABEL_FG);
-        // Power button (hover tile + glyph).
+        // Power button (hover tile + icons8 shutdown icon).
         let pb0 = power_rect(sw, sh);
         let pb = (pb0.0, pb0.1 + rise, pb0.2, pb0.3);
         if point_in(mx, my, pb) {
             chip_round_clip(back, r, pb, RAD_TILE, HOVER, 256);
         }
-        draw_power_glyph(back, pb.0 + 22, fcy, FOOT_FG);
+        draw_icon_rgba(back, r, pb.0 + 22, fcy, ICON_POWER_24, 24);
     }
 }
 

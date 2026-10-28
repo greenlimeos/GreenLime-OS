@@ -113,7 +113,7 @@ pub fn print_table(devs: &[PciDev]) {
             d.bar0
         );
         if d.class == 0x01 && d.subclass == 0x06 {
-            kprintln!("[drivers] ahci: SATA controller present (full driver: later)");
+            kprintln!("[drivers] ahci: SATA controller present (claimed below)");
         }
     }
 }

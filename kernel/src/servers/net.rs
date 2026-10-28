@@ -1,4 +1,5 @@
-//! Net server (kernel task 6): owns the smoltcp interface (Phase B).
+//! Net server (kernel task 5 since M18; was 6 while demo booted): owns
+//! the smoltcp interface (Phase B).
 //!
 //! Bring-up: DHCP discover on the virtio-net NIC (QEMU user NAT answers),
 //! then one ICMP echo to the gateway as proof of a working stack, then a
@@ -380,7 +381,7 @@ pub unsafe extern "C" fn server_main() -> ! {
                 }
                 SockKind::Tcp => {
                     let Some(waiter) = recv_pending[slot] else { continue };
-                    let mut buf = [0u8; 240];
+                    let mut buf = [0u8; 2048]; // M20: one full IPC payload round trip
                     let sock = sockets.get_mut::<tcp::Socket>(e.h);
                     let n = sock.recv_slice(&mut buf).unwrap_or(0);
                     if n > 0 {

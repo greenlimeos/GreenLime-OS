@@ -1,6 +1,7 @@
 //! Drivers: hardware only. Trait + one file per device.
 //! Serial/fb come up first (console); storage comes later (needs PMM+heap).
 
+pub mod ahci;
 pub mod fb;
 pub mod input;
 pub mod pci;

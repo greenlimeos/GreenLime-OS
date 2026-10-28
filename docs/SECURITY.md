@@ -139,6 +139,35 @@ no sandboxing or user model yet — don't put secrets in it.
   fuzz the parsers headlessly, then convert hot paths to `Result` so bad
   input drops instead of halting.
 
+## v1.2.x · M20 — TLS 1.3 lane honesty
+
+`fetch https://…` runs TLS 1.3 (rustls 0.23, RustCrypto provider vendored
+as `libs/greenlime-tls`) with webpki chain validation over the vendored
+Mozilla root store — proven live by refusal of a self-signed chain
+(`self-signed.badssl.com`), tracked in `scripts/qmp_m20_tls_test.py`.
+What the lane is NOT (all stated, none hidden):
+
+- **DRBG scope:** kernel ChaCha8, seeded once per boot from the entropy
+  pool; monotonic counter only after that. Fine for TLS nonces/tickets
+  in one uptime, not a substitute for a per-call reseed.
+- **Clock:** certificate validity reads `Syscall::Now` = RTC boot epoch +
+  PIT uptime. In QEMU the RTC is UTC; on a real BIOS it is LOCAL time,
+  so a machine with a wrong/localized wall clock can mis-age every
+  certificate until paced. No continuous-sync source is wired.
+- **No revocation:** no OCSP/CRL is fetched; an un-revoked-but-compromised
+  CA is not detectable by this lane (same as any default webpki stack).
+- **DNS/IP blind spot:** validation is over the DNS name only — the
+  https lane refuses IP literals; the plain lane still runs unverified
+  http and never autoswitches.
+- **No chunked-TE decoder:** responses using `Transfer-Encoding: chunked`
+  (most big real-world bodies) stream their raw framing — the hex chunk
+  sizes ride in the visible body and the byte totals include them. The
+  status code, header parse, and the bytes themselves are all correct;
+  the de-chunker is a known next-step, not a hidden gap.
+- **Redirects are scheme-gated in the SHELL:** http → https chases, the
+  way down is refused; the TLS lane itself does one GET per call and
+  never follows anything.
+
 ## Audited and cleared
 
 Separate per-task `cr3`, supervisor-only kernel half, SMEP+SMAP, NX on

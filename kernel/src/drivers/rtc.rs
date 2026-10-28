@@ -3,7 +3,7 @@
 //! timer so no IRQ/periodic update ever fires (the PIC's RTC line stays
 //! masked). No DST lore: QEMU's RTC is what the guest calls "local time".
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 use crate::kprintln;
@@ -17,6 +17,10 @@ static BOOT_MINUTE: AtomicU32 = AtomicU32::new(0);
 /// Boot DATE, packed year<<16 | month<<8 | day (year = full 4 digits).
 /// 0 means "not read yet".
 static BOOT_DATE: AtomicU32 = AtomicU32::new(0);
+/// Epoch seconds (Unix time) of the boot moment, computed from the same
+/// CMOS read-out (M20): TLS certificate validity needs a real UTC stamp,
+/// not minutes-of-day. The M20 clock lane = BOOT_UNIX + uptime seconds.
+static BOOT_UNIX: AtomicU64 = AtomicU64::new(0);
 
 fn read(reg: u8) -> u8 {
     unsafe {
@@ -92,7 +96,7 @@ fn snapshot() -> Option<(u8, u8, u8, u16, u8, u8)> {
 /// failing boot.
 pub fn init() -> bool {
     match snapshot() {
-        Some((h, m, _s, y, mo, d)) => {
+        Some((h, m, s, y, mo, d)) => {
             BOOT_MINUTE.store(
                 (h as u32) * 60 + (m as u32),
                 Ordering::SeqCst,
@@ -101,6 +105,7 @@ pub fn init() -> bool {
                 ((y as u32) << 16) | ((mo as u32) << 8) | (d as u32),
                 Ordering::SeqCst,
             );
+            BOOT_UNIX.store(ephemeral_to_unix(h, m, s, y, mo, d), Ordering::SeqCst);
             kprintln!(
                 "[rtc] boot time {:02}:{:02}, date {}-{:02}-{:02}",
                 h,
@@ -172,4 +177,36 @@ pub fn now_date(uptime_secs: u64) -> (u32, u32, u32) {
             (y, m, d)
         }
     }
+}
+
+/// Calendar date -> days since 1970-01-01 (the standard civil algorithm;
+/// y >= 2000 always arrives from CMOS, so signed math stays trivial).
+fn days_from_civil(y: u16, m: u32, d: u32) -> u64 {
+    let y = y as i64 - (m <= 2) as i64;
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12; // March=0 (Hinnant's mapping)
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) as u64
+}
+
+/// The CMOS read-out -> Unix seconds (UTC). QEMU's RTC runs UTC by default;
+/// a real PC's BIOS clock is LOCAL time, so on real hardware the stamp may
+/// sit a zone-offset away from true UTC — stated plainly in M20's docs,
+/// not hidden: cert validity windows are hours wide, minute skew kills
+/// nothing but honesty demands the line.
+fn ephemeral_to_unix(h: u8, m: u8, s: u8, y: u16, mo: u8, d: u8) -> u64 {
+    days_from_civil(y, mo as u32, d as u32) * 86_400
+        + h as u64 * 3_600
+        + m as u64 * 60
+        + s as u64
+}
+
+/// The M20 clock lane: UTC epoch seconds right now (boot stamp + the
+/// timer's drained seconds; 0 = RTC was unreadable, and TLS will then
+/// refuse everything with an expired-cert error — the visible shape of
+/// a dead battery, which is the honest lie: noise, not silence.
+pub fn unix_secs(uptime_secs: u64) -> u64 {
+    BOOT_UNIX.load(Ordering::SeqCst) + uptime_secs
 }

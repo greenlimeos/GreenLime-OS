@@ -1,0 +1,12 @@
+[package]
+name = "greenlime-notepad"
+version.workspace = true
+edition.workspace = true
+description = "The built-in .txt editor (M18): spawned by winsrv's New text file / .txt double-click"
+
+[[bin]]
+name = "greenlime-notepad"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-client = { workspace = true }

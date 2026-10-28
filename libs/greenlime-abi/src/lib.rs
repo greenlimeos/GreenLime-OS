@@ -1,11 +1,14 @@
 //! GreenLime ABI v0.1 — shared by kernel + userspace.
 //! no_std. No kernel imports. Bump ABI_VERSION on wire change.
+//! (The M19 `app` module is a memory-mapped contract, not a wire change.)
 
 #![no_std]
 
 /// v3: OP_READDIR for directory listings.
-pub const ABI_VERSION: u32 = 6;
+/// v7: Rand + Now syscalls added (M20 — the TLS entropy + clock lane).
+pub const ABI_VERSION: u32 = 7;
 
+pub mod app;
 pub mod ipc;
 pub mod net;
 pub mod syscall;

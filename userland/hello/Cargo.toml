@@ -1,0 +1,12 @@
+[package]
+name = "greenlime-hello"
+version.workspace = true
+edition.workspace = true
+description = "THE .gle porting template (M17): a tiny window app packed by gle-pack"
+
+[[bin]]
+name = "greenlime-hello"
+path = "src/main.rs"
+
+[dependencies]
+greenlime-client = { workspace = true }

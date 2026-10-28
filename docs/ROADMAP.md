@@ -11,7 +11,9 @@ are the pre-1.0 groundwork (boot → memory → userspace → fonts → IPC →
 storage → window-server/compositor → identity hardening), kept here as
 history. The `v1.0 · M##` tags below are the 1.0 build order; **v1.1**
 adds M13 (SSE2 + fast compositor), M14 (writable FAT32) and the M14.5
-LimeDE rework — the current shipping look.
+LimeDE rework — the current shipping look. **v1.2** opens with M16 —
+the Files app reworked into a real Windows-Explorer-style explorer
+(places, LFN, Recycle Bin that survives reboots).
 
 Honest scope: Windows 11 = ~50M+ LOC, thousands of drivers, decades of compat.
 You beat it by starting tiny and never rewriting. Each milestone is bootable in QEMU.
@@ -175,7 +177,8 @@ You beat it by starting tiny and never rewriting. Each milestone is bootable in 
   NET_CONNECT (polls to ESTABLISHED, 8 s bound, abort+err on RST/deadline),
   NET_SEND (stream, polls out backpressure instead of failing), NET_RECV
   (pull model: request parks in the broker, the drain loop answers with
-  240 B chunks; peer FIN + drained → NET_EOF), NET_CLOSE (abort; no
+  up-to-MAX_PAYLOAD chunks (2048 B since M20 — a TLS handshake moves
+  kilobytes); peer FIN + drained → NET_EOF), NET_CLOSE (abort; no
   FIN-flush state machine this phase — a drained stream already saw its
   EOF), NET_PING (one ICMP echo through the broker-owned icmp socket,
   clients serialize). Client shell types: ephemeral ports 49200+,
@@ -604,14 +607,251 @@ a generated default asset in the same spirit.
   `[winsrv] start card open` / `[winsrv] start card closed` so dead
   clicks vs. open cards are distinguishable in serial forever.
 
-## After 1.1 — 1.2 candidates (no promises, rough order)
-- **M16 · `.gle` app format + EXEC** — the third-party app truck: a
-  lunchbox file (ELF payload + sticker header: name / version / icon /
-  requested caps), a `gle-pack` CLI, a `greenlime-app-template` repo, a
-  `greenlime-client` dev crate (open window / blit frame / read input),
-  `docs/GLE.md`, and the kernel-side EXEC syscall so a dropped
-  `name.gle` runs and shows up in the start card. Kernel keeps parsing
-  plain ELF — it unwraps the container, checks the caps, then execs.
+## v1.2 · M16 — Files rework (Windows-Explorer style)
+
+User directive: make the Files app a **real** explorer — sidebar places
+(Desktop / Documents / Downloads / Recycle Bin) like Windows File
+Explorer, beautiful, minimalistic, no bloat. The Files app must feel
+like the thing it's named after.
+
+- [x] **Files v2 as a system window** (kernel-side in `winsrv.rs`,
+  `FILES_ID=1` — not a userland WIN_BLIT client): full custom painter
+  `draw_files` — sidebar places card, breadcrumb + Back chip,
+  desktop-style icon grid (86×84 cells, folder glyphs, folders first),
+  footer status line (`N items` + selection size) with right-aligned
+  action chips (Delete / Restore / Empty appear per view). Place glyph
+  painters: `draw_desk`, `draw_doc`, `draw_dload`, `draw_bin`.
+- [x] **Places on the real disk** (`vfs::PLACES` + `ensure_places()` at
+  boot): the four explorer dirs are created on the FAT32 volume, so
+  they exist after every reboot; fresh-volume boots print
+  `[vfs] places: 4 new`, later boots print `0 new`. The Files window
+  opens at the ramfs root (`[files] show / items=4`).
+- [x] **Real long file names (LFN)** in FAT32 — both directions. Names
+  like `Recycle Bin` or `note.txt` now survive the disk byte-exactly
+  (UTF-16 entry chains above the 8.3 short entry, `SSSSSS~N` aliases
+  when the name is 8.3-impossible, checksum-validated sets; spec-exact
+  layout learned by byte-inspecting real volumes). The old reader
+  walked entry sets backwards and rejected every set, so every LFN'd
+  name showed as its alias; six boot generations had even rooted six
+  duplicate place sets into the disk root (`DOCUME~1`…). Details and
+  the on-disk layout live in `docs/STORAGE.md`.
+- [x] **Recycle Bin on the disk** (`vfs::trash` / `untrash` /
+  `empty_bin`): Delete moves the file into `/disk/Recycle Bin` and
+  writes an `<name>.orig` sidecar carrying the origin path (hidden
+  from the bin view); Restore reads it back and moves the file home;
+  Empty wipes both. Trashed files **survive reboots** — the user
+  verified this by hand, per the standing "no disk persistence test"
+  rule. Serial proofs: `[vfs] trash /a/b -> /c`, `[files] trash <name>
+  ok|refused`, `[vfs] restore <name> -> <path>`, `[files] restore
+  <name> ok`, `[vfs] bin emptied (N items)` + `[files] bin empty n=N`.
+- [x] **Keyboard + selection model**: click selects (exact lime wash:
+  grid cell `(62,75,39)`, sidebar active place row `(66,80,46)` — exact
+  `blend_px` values of LIME@56 over BG / sidebar), double-click
+  navigates in both panes, Back chip walks up, Del key trashes the
+  selection (a QA find: the bin's sidebar row didn't light active in
+  bin view — the `active` gate carried a stale `&& !bin_view`, fixed).
+- [x] **QA: `scripts/qmp_files_test.py`** — full explorer flow over QMP
+  on its OWN fresh volume (`dist/files-test-disk.img`; the human's
+  `dist/disk.img` is never touched): fresh-disk boot creates the 4
+  places → Files pin opens at ramfs root → Documents browsed empty → a
+  file is typed into the Terminal (`echo hi > /disk/Documents/note.txt`)
+  → re-browse shows it → lime selection + active-row pixel asserts →
+  Delete chip → bin view (`.orig` filtered, items=1) → Restore chip →
+  file back in Documents → Del-key round → Empty chip drains the
+  bin. **11/11 PASS** on the release ISO (exact-pixel selection +
+  active-row asserts included).
+  The QA campaign found two REAL kernel bugs (both fixed in the
+  build the suite passes on):
+  1. `files_open` never wrote `self.fpath` — the whole Files state
+     machine (active sidebar row, bin view + its Restore/Empty chips,
+     Back chip, trash/restore gating) read a stale `"/"` forever:
+     browsing LOOKED alive because the list follows the passed path
+     argument, while select/delete/restore state was dead. One-line
+     fix (`self.fpath = String::from(path)`), and the bin/trash
+     behavior the user had proven by hand now rests on real state.
+  2. The Del key was unreachable: Delete's make code is the EXTENDED
+     `E0 53`, and winsrv's E0 branch handled only the Windows key and
+     discarded everything else, while the `0x53` arm lived in the
+     plain-match path (where it would only ever fire for the numpad
+     "." key — a distinct key that must not trash anything). The arm
+     moved into the E0 branch; numpad "." restored to plain input.
+  Plus the earlier bin-active-row find (`&& !bin_view` stale gate).
+- [x] **M16.x — UI icons from icons8**: the last procedural glyphs are
+  gone. 14 raw straight-alpha RGBA blobs baked by
+  `scripts/bake-icons.py` from icons8 "fluency" PNGs (sources committed
+  in `assets/icons-src/`, blobs in `assets/icons/`); winsrv alpha-blits
+  them at their exact baked sizes — the kernel never decodes PNGs or
+  scales anything at runtime. Coverage: taskbar pins (Files/Terminal/
+  Settings 24px), start tiles (28px, Demo gets a `rocket`), Files
+  sidebar places (20px), grid (folder 30px / file 28px), and the start
+  card's power button gets the red icons8 `shutdown` icon (24px). All
+  channels clamped ≤238 (cursor-uniqueness invariant). Attribution:
+  "Icons by icons8" (README).
+- Exit: ✅ met — Files reads/drives like an explorer (places, LFN
+  names, trash → restore → empty end-to-end), `qmp_files_test` 11/11
+  green on the release ISO, and all prior suites re-run green on the
+  FINAL build: desktop OK, multitest 18/18, M15 21/21. Disk
+  persistence proven by the user's own reboots (explicitly excluded
+  from the automated suite, by user instruction).
+
+## M17 · `.gle` third-party apps + EXEC (v1.2 head)
+
+Goal: anyone hand-carrying an app should get it running without
+touching the kernel. The truck: a flat container law, a zero-dep
+packer, an in-tree dev template, kernel EXEC with validate-before-alloc
+ELF loading, and a plain-English spec doc.
+- [x] **Container format v1** (docs/GLE.md): 20-byte header + ASCII
+  sticker + baked 28x28 RGBA icon + static ET_EXEC ELF payload,
+  CRC-32'd over everything but the CRC field — exact-size container,
+  1 MiB cap. Kernel law: magic/version/flags/lengths/icon-widths/UTF-8
+  sticker/ASCII-namespace checks, then payload through the same ELF
+  validation boot images face.
+- [x] **EXEC, two doors, one law**: shell `exec` over the new
+  admin-gated `OP_EXEC=11` IPC (reply arg0 = task id); Files
+  double-click calls `vfs::exec_gle` kernel-internally (kernel tasks
+  share code). Refusals are serial lines, never panics. The scheduler
+  grew a `spawn_user_task_with(name, image, caps)` soft path — caps are
+  fixed by the CALLER (`USER_DEFAULT`), never from the sticker, so
+  calling your app `shell` buys nothing; slot bump 9 → 12 (ids ≤ 8
+  frozen, ABI-safe append).
+- [x] **ELF loader hardening split**: `validate()` (pure, refuses
+  malformed payloads pre-allocation) / `map()` (the only panicking path
+  = true OOM, like boot); `is_none_or` phdr math, entry-in-X-segment
+  membership demand (GLS-008 follow-on).
+- [x] **Dev toolkit**: `libs/greenlime-client` (Win::open/print/keys/
+  close over the raw ABI — no syscall knowledge needed);
+  `userland/hello` IS the porting template; `scripts/gle-pack.py`
+  (pack/inspect/extract/mkicon, stdlib-only PNG decode + resize +
+  alpha-clamp + CRC); `make hello-gle` packs `dist/hello.gle`;
+  `scripts/gle-selftest.sh` round-trips containers (mixed-filter PNG
+  decode, 56→28 resize, CRC tamper catches, magic/truncate
+  refusals, non-ASCII sticker refusals) — ALL GREEN.
+- [x] **The user found two kernel bugs by hand** ("double-clicked
+  hello.gle, nothing happened"): (1) the Files `.gle` arm compared the
+  name case-sensitively but `mcopy` of an 8.3 name stores HELLO.GLE —
+  case-folded now; (2) the double-click window was 25 ticks (250 ms) —
+  tighter than the OS-standard 500 ms humans aim for — widened to 45.
+  The user's follow-up session then proved the whole law live:
+  double-click ran the app, a second double-click ran a second
+  concurrent instance (cascade windows, one at 700,120 one at 700,160),
+  keyboard reached the focused app (`[user] [hello] got: h`), window
+  drag worked, ✕ + quit all exited clean. QA lesson encoded: `.gle`
+  app task ids are NOT fixed (slots recycle; init's boot-id corpse is
+  the first `hello` taker) — suites assert distinct ids + exact
+  `caps=0x0002`, never literal slot numbers.
+- [x] **Docs**: `docs/GLE.md` (3-step port guide, format table, kernel
+  check order, v1 limits), README apps bullet. Start-card dynamic tiles
+  deliberately deferred (top of After-1.2 below).
+
+## M18 · Right-click menus + Notepad + clean boot (v1.2.1 head)
+
+User ask, four features, one pass:
+- [x] **Context menus** (right click): winsrv tracks the right-button
+  edge (the tablet driver already masks bit 1 on BTN_RIGHT) and opens a
+  two-item popup — **New text file** + **Refresh** — anchored at the
+  cursor, clamped on-screen, painted above the start card. Zones: the
+  Files window body (a menu operates on the browsed dir; a ramfs view
+  refuses with an auto-browse to `/disk`) and the bare desktop (creates
+  in `/disk/Desktop`; Refresh = full-screen invalidate +
+  `[desktop] refresh`). Clicks route into the popup FIRST; outside
+  click = dismiss, never click-through. Non-Files windows eat
+  right-clicks silently for now.
+- [x] **Notepad, the .txt editor**: a new `userland/notepad` crate on
+  the M17 client library — `greenlime-client` grew an allocation-free
+  `fs` module (open/read/write/setsize/close + the handshake). Double-
+  clicking a `.txt` (and every New-text-file gesture) registers
+  `(task, path)` with vfs and spawns notepad with **CAP_DISK** — the
+  `OP_WRITE`/`OP_SETSIZE` gates widen from admin-only to
+  `admin || CAP_DISK` (reads were always open). The path arrives via
+  the new additive opcode **OP_TXT_TAKE = 12**, keyed by SENDER, so
+  concurrent editors never swap files. Save law: SETSIZE 0 + 960-byte
+  chunked writes (per-chunk `[vfs] wrote` proof line rides the shell
+  recipe) + `[notepad] saved N bytes -> path`.
+- [x] **No demo window at boot**: `spawn_all` now loads init + shell
+  only — a clean desktop. Demo stays launchable from its start-card
+  tile (respawned from the baked ELF). Slot-shift law (boot ids are the
+  ABI): **net 6→5, fuzz 7→6, wallpaper 8→7**; shell + demo track
+  `NET_TASK = 5`. Third-party slots drop to 3 concurrent apps (12-slot
+  table unchanged).
+- [x] **Kernel internals**: `vfs::new_txt_in(dir)` (free-name probe +
+  create inside one volume lock, `New file N.txt`, bins refuse),
+  `vfs::open_txt(path)` (the .txt twin of `exec_gle`: /disk file only,
+  ≤64 KiB, spawn caps caller-fixed), `vfs::has_disk` helper; files
+  window grows a `.txt` double-click arm next to the .gle one (bin
+  views allowed — editing a trashed text is harmless).
+
+## M20 · Real modern HTTPS (TLS 1.3) ✅ DONE
+
+**Goal:** `fetch https://...` from the shell with REAL certificate
+validation — webpki root-store chain checks, not a noop verifier.
+The OS version number stays v1.2.x; this work carries the M20 tag.
+
+- [x] **Kernel entropy + clock ABI.** New syscalls `Rand` (kernel ChaCha8
+  DRBG in `kernel/src/crypto.rs`, seeded at boot from the entropy pool)
+  and `Now` (RTC boot epoch + PIT uptime, seconds). ABI v7. Fuzz-gated
+  boot probe (`[user] [fuzz] rng probe: pairs=32/32 clock=...`).
+- [x] **The crypto lane as a vendored crate: `libs/greenlime-tls`.**
+  rustls 0.23.46 stable with `default-features = false` (std never
+  declared), with the RustCrypto crypto provider vendored in-tree
+  (github.com/RustCrypto/rustls-rustcrypto master, both LICENSE files
+  kept — attribution banner at the top of `lib.rs`). Every entropy call
+  goes through `Syscall::Rand`; wall clock through `Syscall::Now` wired
+  as rustls' `TimeProvider`. TLS 1.2 stays compiled OUT (the `tls12`
+  Cargo feature is declared empty only for check-cfg; enabling it fails
+  loudly). Builds zero-warning on the userland target.
+- [x] **The HTTPS lane (`fetch.rs`):** one TLS 1.3 GET per call over a
+  caller-supplied `TcpLink` (the shell owns the net-broker protocol),
+  driven through rustls' **unbuffered pump** — the no_std-native shape
+  (rustls' own `unbuffered-client` example, arm for arm). ALPN `http/1.1`,
+  request with `Accept-Encoding: identity` + `Connection: close`, header
+  stage parse (status line / code / Location), body streamed to the
+  caller's closure, rustls' webpki verifier over the vendored Mozilla
+  root set (`webpki-roots`). Errors quote the REAL verifier reason.
+- [x] **Shell wiring.** 4 MiB heap into the shell (same bss pattern as
+  wallpaper), `TcpLink` adapter over the broker protocol, scheme
+  dispatch in `fetch`: `https://...` → the TLS lane; `http://...` or a
+  bare host → the pre-M20 plain lane; IP literals refused on the https
+  lane (SNI needs a DNS name). Redirects chased ABOVE the lanes, max 5
+  hops: **http → https is allowed (the upgrade), https → http is
+  refused** (no downgrade). Proof line per hop:
+  `fetch: TLS1.3 HTTP/1.1 200 OK <bytes>B close_notify|tcp-fin`.
+- [x] **Broker recv payload 240 → 2048 B** (ABI v6 already allowed it):
+  a TLS certificate block needs kilobytes per hop, not 240.
+- [ ] **Known limitation (next):** no `Transfer-Encoding: chunked`
+  decoder — chunked bodies stream raw (hex sizes visible in the body
+  head; totals include the framing). Everything else (status parse,
+  validation, byte streaming) is exact. Live-found bug of the first
+  real run: the TLS lane's `Location` scanner compared a lowercased
+  header against the uppercase `Location:` needle — fixed (both sides
+  lowered), first proven by `fetch https://google.com` chasing to
+  `www.google.com` → 200 (89 KB body).
+- [x] **Acceptance — the human's QEMU windows are the ground truth
+  (release AND debug builds):** `fetch https://google.com` →
+  `TLS1.3 HTTP/1.1 301 Moved Permanently 851B tcp-fin` → redirect
+  chased after the `Location` fix (both sides lowered — the scanner
+  compared a lowercased header against the uppercase needle) → fresh
+  DNS + socket + a second webpki chain for `www.google.com` →
+  `TLS1.3 HTTP/1.1 200 OK 89572B tcp-fin` (25585B on debug). Zero
+  panics, clean desktop shutdown afterward. `fetch https://example.com`
+  → TLS1.3 200 + body + `close_notify` proven headless across runs
+  (`scripts/qmp_m20_tls_test.py`, case 1), and every chase event
+  verified in the suite's own serial log; the suite's offset logic
+  kept racing the already-completed events and was retired on the
+  human's call. Redirect pinning sanity: `example.com:80`'s fronts
+  flip between 301 and direct 200 (live-observed) — redirect cases pin
+  `google.com:80`, which always 301s (this required the plain lane's
+  staged header buffer to grow 384 → 1024 B: Google's ~600 B redirect
+  block overflowed the old one). The self-signed
+  (`self-signed.badssl.com`) refusal — the negative proof that the
+  validation is real — is enforced by the real rustls webpki verifier
+  (a noop verifier never shipped) and quotes its actual reason on the
+  console; catching it live remains the first candidate for a follow-up
+  session.
+
+
+- **start-card dynamic .gle tiles** — M17 shipped taskbar chips only;
+  the start card should list installed `.gle` apps as tiles (search +
+  launch), sorted by sticker name.
 - **virtio-gpu 2D driver** — QEMU's real paravirtual display device:
   dirty-rect flushes instead of full-frame presents, a hardware cursor
   plane (retires the hand-composited cursor), EDID / runtime resolution.
@@ -619,11 +859,11 @@ a generated default asset in the same spirit.
   rasterizer) exposed to apps like `WIN_BLIT` is: a real rotating cube.
 - **virgl / OpenGL passthrough** — long-term; needs a Mesa-class guest
   driver stack. Written down so nobody accidentalizes it.
-- **Browser ladder** — M17 mini browser (fetch → small HTML → layout →
+- **Browser ladder** — M18 mini browser (fetch → small HTML → layout →
   `WIN_BLIT` canvas, http-only at first) → QuickJS / JavaScriptCore port
   → WebKit-adapter engine port (Haiku's road). Chrome/Brave/Firefox
   *themselves* need a full GreenPOSIX floor first (mmap, threads+futex,
-  dynamic linking, gigabytes) — that's the M18–M20 class of work.
+  dynamic linking, gigabytes) — that's the M19–M22 class of work.
 
 ## After 1.0
 * aarch64 port (`arch/aarch64/`), UEFI self-host, package manager, POSIX shim,

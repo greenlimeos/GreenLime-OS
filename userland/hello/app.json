@@ -1,0 +1,9 @@
+{
+  "name": "hello",
+  "version": "1.0",
+  "author": "Denis",
+  "icon": "icon.png",
+  "gui": true,
+  "assets": ["assets/proof.txt", "assets/blob0.bin"],
+  "comment": "the .gle sticker; scripts/gle-pack.py packs this + the built greenlime-hello ELF into a runnable .gle. With \"assets\" listed the box is GLE v2: the blobs land in the task's asset window (manifest order = descriptor order); without them it stays the v1 lunchbox."
+}

@@ -316,6 +316,64 @@ pub fn spawn_kernel_task(name: &'static str, entry: unsafe extern "C" fn() -> !)
 /// Load a user ELF into a fresh address space + map its stack. Its kernel
 /// stack is primed to enter ring 3 through the user stub on first schedule.
 pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
+    // Caps are granted here by the kernel, once, by boot role: no runtime
+    // escalation API exists (hardening line, v1.0). Third-party .gle tasks
+    // must not ride this name table — `spawn_user_task_with` is THEIR path
+    // (vfs::exec_gle fixes the caps itself, spawned from runtime bytes).
+    let caps = match name {
+        "init" | "shell" => caps::USER_ADMIN,
+        "fuzz" => caps::USER_NONE, // deliberately unprivileged
+        // Wallpaper: may talk to winsrv's wall ops; needs no net, no kill.
+        "wallpaper" => caps::CAP_WALL,
+        _ => caps::USER_DEFAULT,
+    };
+    // Boot-time ELFs are build artifacts: a validation failure here is a
+    // build bug and stays a loud kernel panic.
+    spawn_user_task_with(name, image, caps).expect("[sched] boot user image rejected")
+}
+
+/// M17: spawn a THIRD-PARTY user task from runtime bytes (a .gle payload).
+/// Caps come from the CALLER (the vfs exec path computes the policy) so a
+/// header sticker can never wear a boot task's name and inherit its caps.
+/// Fails SOFT — no id burned, no page mapped — when the payload fails ELF
+/// validation or no task slot is free.
+pub fn spawn_user_task_with(
+    name: &'static str,
+    image: &[u8],
+    caps: u16,
+) -> Result<TaskId, &'static str> {
+    // Boot shape: no .gle assets — the window still maps (empty page).
+    spawn_user_task_ex(name, image, caps, &[])
+}
+
+/// The every-spawn form (M19): same spawn as [`spawn_user_task_with`],
+/// plus `assets` — the v2 .gle asset list that lands in the task's asset
+/// window (descriptor page + read-only blob mappings, greenlime_abi::app
+/// contract). An empty list is the boot shape: the window maps one shared
+/// empty descriptor page, so any client can probe it safely.
+pub fn spawn_user_task_ex(
+    name: &'static str,
+    image: &[u8],
+    caps: u16,
+    assets: &[&[u8]],
+) -> Result<TaskId, &'static str> {
+    // M17: structural ELF safety FIRST — pure checks, zero allocation —
+    // so a malformed payload never leaks an id, a frame, or a mailbox.
+    if let Err(e) = crate::userspace::elf::validate(image) {
+        return Err(e);
+    }
+    // Free-slot peek (freelist or a never-used monotonic id) — checked the
+    // same way the assert inside take_id would fail, so third-party exec
+    // returns a refusable error instead of panicking the whole kernel.
+    let slot_free = {
+        let _tasks = TASKS.lock();
+        // SAFETY: address-of-free-top read; pool discipline is table-locked.
+        let top = unsafe { addr_of_mut!(FREE_TOP).read() };
+        top != 0 || NEXT_ID.load(Ordering::SeqCst) < MAX_TASKS
+    };
+    if !slot_free {
+        return Err("[sched] no free task slot");
+    }
     // M15.1 slot reap: the id pick (freelist pop vs monotonic pass) happens
     // under the table lock, then the lock DROPS — the heavy work below
     // (ELF load + pmm allotment + page maps) must not hold TASKS, and the
@@ -333,7 +391,14 @@ pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
         crate::ipc::reset_port(id);
     }
     let hhdm = boot::hhdm_offset().expect("[sched] HHDM missing");
-    let loaded = crate::userspace::elf::load(image, hhdm);
+    // The image was validated above; map() can only fail out-of-memory.
+    let loaded = crate::userspace::elf::map(image, hhdm);
+    // The asset window: descriptor page for every task; non-empty asset
+    // lists (the v2 .gle exec lane) map their blobs too. Read-only, no
+    // execution, immutable — build or nothing runs.
+    unsafe {
+        crate::userspace::elf::map_assets(loaded.cr3, hhdm, assets);
+    }
     // Shared kernel MMIO (LAPIC) goes into every user table explicitly:
     // an AP timer tick under a user cr3 writes EOI, and a missing leaf
     // there is a supervisor fault. Belt-and-braces over the PML4 clone
@@ -396,15 +461,7 @@ pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
             task_returned_trap as *const () as usize as u64,
         )
     };
-    // Caps are granted here by the kernel, once: no runtime escalation API
-    // exists (hardening line, v1.0).
-    let user_caps = match name {
-        "init" | "shell" => caps::USER_ADMIN,
-        "fuzz" => caps::USER_NONE, // deliberately unprivileged
-        // Wallpaper: may talk to winsrv's wall ops; needs no net, no kill.
-        "wallpaper" => caps::CAP_WALL,
-        _ => caps::USER_DEFAULT,
-    };
+    let user_caps = caps; // caller-fixed (boot role or vfs exec policy)
     {
         let mut tasks = TASKS.lock();
         install(
@@ -434,7 +491,10 @@ pub fn spawn_user_task(name: &'static str, image: &[u8]) -> TaskId {
         "[sched] task {} stack {:#x} caps={:#06x}",
         id, stack_top, user_caps
     );
-    id
+    if !assets.is_empty() {
+        kprintln!("[sched] task {} asset window: {} blob(s)", id, assets.len());
+    }
+    Ok(id)
 }
 
 /// Effective caps of a task. Fail-closed: an unknown id has NONE.

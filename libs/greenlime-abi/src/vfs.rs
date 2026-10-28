@@ -36,5 +36,15 @@ pub const OP_MKDIR: u32 = 9;
 /// Truncate/extend the file at handle to arg1 bytes (disk only). Reply
 /// arg0 = resulting size. Extends are zero-filled; excess clusters free.
 pub const OP_SETSIZE: u32 = 10;
+// v1.2 (M17) — additive opcode: EXEC a third-party .gle app.
+/// Run a .gle container (payload = path, /disk/* only). Reply arg0 =
+/// new task id. Admin-gated server-side (kernel servers may also exec a
+/// .gle via the direct internal path — Files double-click).
+pub const OP_EXEC: u32 = 11;
+// v1.2.1 (M18) — additive opcode: the notepad handshake.
+/// Notepad collects the .txt file it was spawned for (payload = UTF-8
+/// path). CAP_DISK-gated server-side, and keyed by sender: nothing is
+/// answered unless winsrv registered a pending path for THIS task.
+pub const OP_TXT_TAKE: u32 = 12;
 
 pub const PING_MAGIC: u64 = 0x5049_4E47;

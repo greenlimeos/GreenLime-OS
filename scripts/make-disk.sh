@@ -11,8 +11,8 @@ if [ -f "$IMG" ]; then
   exit 0
 fi
 
-echo "[disk] creating 32MB FAT32 image..."
-dd if=/dev/zero of="$IMG" bs=1M count=32 status=none
+echo "[disk] creating 64MB FAT32 image (M19: room for v2 .gle containers)..."
+dd if=/dev/zero of="$IMG" bs=1M count=64 status=none
 mformat -i "$IMG" -F -v GREENLIME ::
 mcopy -s -i "$IMG" testdata/disk/* ::
 echo "[disk] contents:"

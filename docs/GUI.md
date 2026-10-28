@@ -21,8 +21,8 @@ fills). No bloat: no flyouts, no widgets, one card, one bar.
 | taskbar tint | `(20,22,27)` @205 | start card tint | `(18,20,26)` @216 |
 | card / bar hairline | `(56,60,70)` / `(56,58,66)` | search field fill | `(44,46,52)` |
 | hover lift / pressed fill | `(58,61,68)` / `(48,50,58)` | **accent (lime)** | `(170,232,64)` |
-| running (unfocused) underline | `(146,150,158)` | **Files azure** | `(76,148,244)` + `(122,180,250)` |
-| browser ball wedges | `(225,74,58)` / `(52,168,83)` / `(244,180,6)` / `(66,133,244)` | settings gear | `(158,163,172)` |
+| running (unfocused) underline | `(146,150,158)` | client-chip azure strip | `(122,180,250)` |
+| taskbar/menu/grid icons | **icons8 "fluency"** art, baked RGBA (`assets/icons`) | power button icon | icons8 `shutdown` (red) |
 | avatar ink on lime | `(30,36,18)` | cursor | `(240,240,240)` |
 
 Acrylic strengths (Q8): **BAR_A 205** (≈80%, taskbar), **PANEL_A 216**
@@ -69,8 +69,8 @@ guest-cursor position.
   `(cx−8, sh−10)` — **lime when focused, soft gray when running**;
   this pill is the pixel contract. The start button is a brand-lime
   **G** glyph (`draw_start_g`, 22 px em, ink ends ≤y≈782 so the
-  underline probes stay clean); pins draw the folder / terminal-square /
-  gear glyphs; a client button draws a mini rounded window with an
+  underline probes stay clean); pins draw the baked icons8 icons
+  (`folder` / `console` / `settings`, 24px exact blits); a client button draws a mini rounded window with an
   18×5 azure strip. Empty bar space clicks just close the card.
 * **Start card** — centered acrylic card `MENU_W 560 × MENU_H 300`
   floating `MENU_GAP 12` above the bar: `menu_rect = ((sw−560)/2,
@@ -85,10 +85,19 @@ guest-cursor position.
   **exited** it respawns it from the baked-in ELF and logs
   `[winsrv] launch Demo (respawned task 5)`, with the slot reap
   handing the demo right back its boot id — M15.1). Tiles hover-lift;
-  icons draw at 28px. Footer: hairline, a
+  icons draw at 28px — baked icons8 blobs (`folder` / `console` / Demo's
+  `rocket`, exact-size); the Settings glyph is the fluency **gear** cog
+  since v1.2.1 (the old `settings` art read Windows-logo adjacent — the
+  swap was chosen against `scripts/probe-gear.py`'s shape maps). Footer:
+  hairline, a
   lime avatar circle with a "G" + "GreenLime" label (inert), and the
   power button `power_rect = (mx+mw−60, my+MENU_H−54, 44,40)` =
-  (860,686) — logs `[winsrv] power`, no shutdown (kept on purpose).
+  (860,686) — the ORIGINAL in-tree power glyph (`power_24.rgba`, baked
+  by `scripts/bake-icons-original.py`; chrome must never be ambiguous
+  about its origin). The old button only logged `[winsrv] power` and
+  was kept open deliberately back then — it now powers off for REAL:
+  click → `[winsrv] shutdown` → ACPI S5 (PM1a control at I/O 0x604,
+  QEMU flavor), the VM exits cleanly.
   Clicks outside the card dismiss it; the left **Windows key (E0
   0x5B)** toggles it. The card flip prints on serial —
   `[winsrv] start card open` / `[winsrv] start card closed` — so a
@@ -99,11 +108,11 @@ guest-cursor position.
   right-aligned) — the old wifi/volume/battery glyphs are gone. The
   hover chip covers the whole zone, **highlight only — no flyout by
   design** (the v1.1 quick-settings panel is gone; "no bloat").
-* **Files** — explorer (`FILES_ID` reserved; demo client = id 2),
-  opens at (230,140) 540×420: dark body, `vfs::list_names` rows with
-  azure folder glyphs, click navigation with `../` pop, dead-path
-  guard; the title stays `Files - <path>` (the click parser reads it).
-  Opens ONLY from the pin/tile (never at boot).
+* **Files v2** — a real explorer (see "Files v2 (M16)" section below);
+  opens at `(280,110) 720×540` with sidebar places, breadcrumb, icon
+  grid and footer action chips. Title stays `Files - <path>` (files
+  navigation reads its own state; the click parser is geometry-driven,
+  no title parsing). Opens ONLY from the pin/tile (never at boot).
 * **Terminal**: unchanged contract — opens on demand (`menu_launch` →
   `ensure_terminal`), buffered early text, X closes, id 0 (`TERM_ID`).
 * **Settings** — now a real system window (`SETTINGS_ID`), not a
@@ -174,9 +183,90 @@ rely on every number above.
 * Windows: `TITLE_H 34` titlebar, body inset 8, radius 8 (square
   maximized); close `(x+w−26, y+4, 20,22)` (center `x+w−16, y+15`),
   maximize `(x+w−46, y+4, 20,22)`, grip 16px `(x+w−16, y+h−16)`.
-* System windows: Terminal (150,100,980,540), Files (230,140,540,420),
+* System windows: Terminal (150,100,980,540), Files (280,110,720,540),
   Settings (430,170,420,300); client windows keep the WIN_CREATE
   cascade geometry.
+
+## Files v2 (M16 — the Windows-Explorer-style explorer)
+
+The Files window is a **system window owned entirely by winsrv**
+(`FILES_ID=1`, custom painter `draw_files` — not a userland WIN_BLIT
+client). Sidebar places, breadcrumb, an icon grid, and a footer with
+state-aware action chips. Everything below is the exact-pixel /
+exact-geometry contract, at the default window rect (280,110,720,540).
+
+**Palette additions (win `winsrv.rs` consts)**: places/sidebar card
+`F_SIDEBAR (38,38,42)`, selection lift `F_SELECT_A = 56` (Q8) blended
+in LIME — grid cell selection wash `(62,75,39)` over the body
+`(32,32,32)`, sidebar active place row `(66,80,46)` over the card; Back
+chip + footer chips fill `SEARCH_BG (44,46,52)` hover `HOVER`.
+
+**Geometry (`files_geo(x,y,w,h)`, `bx=x+1, by=y+1+TITLE_H`,
+`bw=w−2`)**:
+
+* Sidebar card `(x+5, by+6, F_SIDE_W−10, bh−7)` = `(285,151,142,507)`
+  at default, radius 8, fill `F_SIDEBAR`; place rows
+  rows `(bx+9, by+14+36i, 134, 28)` for i=0..3 = Desktop /
+  Documents / Downloads / Recycle Bin (`F_PLACE_PATHS`, pitch
+  `F_ROW_H=36`); centers at the default rect: **(357,173 / 357,209 /
+  357,245 / 357,281)**. Active row = exact LIME wash + a 3px lime
+  left edge; hover = `HOVER@170`. Row glyphs `draw_desk` / `draw_folder` /
+  `draw_dload` / `draw_bin` at 20px (the same azure folder glyph as the
+  grid; desk = a little monitor, bin = a lidded trash can,
+  dload = a tray with a down arrow).
+* Breadcrumb strip `F_BREAD_H 40`: `< Back` chip `geo.back =
+  (bx+158, by+9, 62, 22)` (**(439,154)** at default) — dimmed at the
+  ramfs root (alpha 128, `SUB_FG` label; it IS clickable there but the
+  root has no parent so the handler no-ops); the current path paints
+  right of it in `SUB_FG`. Hairline under the whole strip.
+* Grid origin `(grid_x, grid_y) = (bx+F_SIDE_W+10, by+F_BREAD_H+13)` =
+  **(443,198)** at default; cells `F_CELL_W×F_CELL_H = 86×84` at
+  pitch-0 tiling down the grid width (`grid_w = bw−F_SIDE_W−20 = 546`;
+  cols = 546/86 = 6). Cell = icon (dir → icons8 `folder-invoices`
+  30px, file → icons8 `documents` 28px, exact-size blits) + name under
+  it, dirs first then names ASCII case-insensitive (the
+  `list_details` order: `bool` desc for dirs).
+  Single click selects (lime wash + name below), double-click (same
+  cell ≤25 ticks) navigates into a dir; clicking empty grid space
+  clears the selection. Selection wash probe `(451,206)` inside cell 0.
+* Footer strip `F_FOOT_H 30` (hairline y=619 at default): left
+  `"N items"` count in `SUB_FG`; when a file is selected a right-aligned
+  `"name (size)"` line in `SUB_FG` (size via `fmt_size`: B → KiB → MiB →
+  GiB); chips 20px tall, right-aligned with 6px gaps —
+  **Delete `(805,624,56,20)`**, **Restore `(867,624,64,20)`**,
+  **Empty `(937,624,56,20)`** (centers 833/899/965 at y 634). Chips are
+  state-aware: bin view shows Restore (enabled only with a selection) +
+  Empty; non-bin views with ≥1 disk file selected show Delete; ramfs
+  views show none (root is read-only there) and clicking a place with
+  no disk prints `[files] place unavailable (no disk)`.
+
+**Behavior contract**:
+
+* `files_open(path)` re-lists through `vfs::list_details` (names +
+  dir flag + sizes), filters `.orig` sidecars in the bin view,
+  sorts dirs-first, repopulates the window (console lines always empty
+  — the painter is custom) and prints the serial proof
+  **`[files] show <path> items=<n>`**. Every mutation refreshes the
+  cache through `files_open(fpath)` — VFS is never painted per-lap.
+* Sidebar rows navigate by place; breadcrumb Back pops to the parent;
+  double-click enters dirs; Del key trashes the selection the same way
+  the Delete chip does (`decode_key` arm keyed to the focused Files
+  window).
+* Delete = `vfs::trash(full_path)` → `**[files] trash <name> ok**` +
+  `[vfs] trash <src> -> <binpath>` (refused prints `ok`→`refused` and
+  keeps everything); bin view Delete is absent by design; ramfs-root
+  delete prints `[files] delete refused (ramfs: root only reads)`.
+* Restore = `vfs::untrash(name)` → `**[files] restore <name> ok**` +
+  `[vfs] restore <name> -> <orig path>` then re-shows the bin; Empty =
+  `vfs::empty_bin()` → `[vfs] bin emptied (N items)` +
+  **`[files] bin empty n=N`**. The `.orig` sidecar scheme that makes
+  all three work is `docs/STORAGE.md`.
+
+**Taskbar pin geometry** (boot cluster, nclient=1 → start 552, Files
+**(596,776)**, Terminal (640,776), Settings 684, demo client 728) —
+same pin slots as before; the Files pin opens `files_open("/")` and
+prints `[winsrv] launch Files` once (the pin focuses an already-open
+Files instead of duplicating).
 
 ## The compositor (damage rects + back buffer + acrylic)
 
@@ -343,6 +433,20 @@ disk.img is the lock):
 * `scripts/qmp_disk_test.py` — M14 phase 1 (echo>file / cat / mkdir /
   ls / rm + rm-refusal) and phase 2 **on the same disk.img after a
   full reboot** (fresh image first: `rm dist/disk.img && make disk`).
+* `scripts/qmp_files_test.py` — M16 explorer flow on its OWN fresh
+  32 MiB volume (`dist/files-test-disk.img`, dd+mformat+mcopy of
+  `testdata/disk` — the human's `dist/disk.img` is never touched):
+  boot creates the 4 places (`[vfs] places: 4 new`), Files pin → root
+  (`items=4`), Documents browsed empty, the file is typed
+  into the Terminal (`echo hi > /disk/Documents/note.txt`), re-browse →
+  `items=1`, exact-pixel selection asserts (cell wash `(62,75,39)` at
+  (451,206), Documents active row `(66,80,46)` at (298,209)), Delete
+  chip → trash proofs + `items=0`, bin view (bin row lime even inside
+  the bin — the M16 QA fix), Restore chip → file back home, Del-key
+  trash round, Empty chip → `[vfs] bin emptied (1 items)` +
+  `[files] bin empty n=1` + bin `items=0`. Counted serial checks +
+  `RESULT: PASS` line; screendump pixel probes ride the same helpers
+  as the desktop test.
 * `scripts/qmp_net_test.py` / `qmp_smp_test.py` / `qmp_input_test.py`
   — ring-3 net machine proof, DHCP+ICMP, SMP, and the cursor/keyboard
   regressions (cursor = the only ≥239 blob, moves exactly).
